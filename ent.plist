@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- 核心：允许 task_for_pid 获取任意进程的 task port，整个注入链路的开关 -->
+    <key>com.apple.system-task-ports</key>
+    <true/>
+
+    <!-- 允许调试器附加，便于排查 -->
+    <key>get-task-allow</key>
+    <true/>
+
+    <!-- 去掉沙盒限制。若加了这个导致安装失败或闪退，可先注释掉，仅保留上面两项再试 -->
+    <key>com.apple.private.security.no-sandbox</key>
+    <true/>
+</dict>
+</plist>
