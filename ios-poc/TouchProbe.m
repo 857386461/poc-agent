@@ -19,9 +19,10 @@
 #import <unistd.h>
 #import <string.h>
 #import <objc/runtime.h>
-#include <sys/codesign.h>
-
-// csops：查询进程代码签名状态（libsystem_kernel）
+// csops：查询进程代码签名状态（libsystem_kernel）。
+// 注意：iOS SDK 不提供 <sys/codesign.h>（那是 macOS 的头文件），
+// 因此常量与原型在此显式声明。CS_OPS_STATUS = 0。
+#define CS_OPS_STATUS 0
 extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 
 // ---------------------------------------------------------------------------
@@ -282,7 +283,7 @@ static void TP_EnvironmentInfo(void) {
 
     // 进程身份：是否被当作 platform binary
     uint32_t flags = 0;
-    int r = csops(getpid(), 0 /*CS_OPS_STATUS*/, &flags, sizeof(flags));
+    int r = csops(getpid(), CS_OPS_STATUS, &flags, sizeof(flags));
     TPLog([NSString stringWithFormat:@"  csops 返回    : %d, 进程 flags = 0x%08X", r, flags]);
 
     // 关键 flag 解读
