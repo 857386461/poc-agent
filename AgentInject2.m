@@ -495,22 +495,34 @@ static UIImage *AIShot_Layer(void) {
     } @catch (id e) { UIGraphicsEndImageContext(); return nil; }
 }
 
+// 注意：ARC 下【不能】把 Objective-C 对象放进 struct / 结构体数组
+// （"ARC forbids Objective-C objects in struct"）—— 所以用平行数组，不用结构体内嵌 NSString*
+static const int      kShotIdx[] = {1, 2, 3, 4};
+static const char    *kShotName[] = {"UIGetScreenImage", "_UICreateScreenUIImage",
+                                     "drawViewHierarchyInRect", "layer renderInContext"};
+
 static void AIShotMatrix(void) {
     AILog(@"==== [4] 截图矩阵 ====");
-    struct { int idx; NSString *n; UIImage *(*f)(void); } tab[] = {
-        {1, @"UIGetScreenImage",       AIShot_Private1},
-        {2, @"_UICreateScreenUIImage", AIShot_Private2},
-        {3, @"drawViewHierarchyInRect",AIShot_Hierarchy},
-        {4, @"layer renderInContext",  AIShot_Layer},
-    };
+    UIImage *(*fns[])(void) = {AIShot_Private1, AIShot_Private2, AIShot_Hierarchy, AIShot_Layer};
     for (int i = 0; i < 4; i++) {
         UIImage *im = nil;
-        @try { im = tab[i].f(); } @catch (NSException *e) { AILog(@"  [%@] 异常 %@", tab[i].n, e); }
+        @try { im = fns[i](); } @catch (NSException *e) { AILog(@"  [%s] 异常 %@", kShotName[i], e.reason); }
         CGSize sz = im ? im.size : CGSizeZero;
         NSData *png = (im && sz.width > 1) ? UIImagePNGRepresentation(im) : nil;
-        AILog(@"  [%d] %-26s -> %@ %.0fx%.0f %luB", tab[i].idx, tab[i].n.UTF8String,
+        AILog(@"  [%d] %-26s -> %@ %.0fx%.0f %luB", kShotIdx[i], kShotName[i],
               im ? @"有图" : @"空", sz.width, sz.height, (unsigned long)(png ? png.length : 0));
-        if (im && sz.width > 1 && !gBestShot) { gBestShot = tab[i].idx; AILog(@"     ↑ 选定为截图通道"); }
+        if (im && sz.width > 1 && !gBestShot) { gBestShot = kShotIdx[i]; AILog(@"     ↑ 选定为截图通道"); }
+    }
+}
+
+// 按编号取截图策略（供 /shot 指令复用）
+static UIImage *AIShotByBest(void) {
+    switch (gBestShot) {
+        case 1: return AIShot_Private1();
+        case 2: return AIShot_Private2();
+        case 3: return AIShot_Hierarchy();
+        case 4: return AIShot_Layer();
+        default: return nil;
     }
 }
 
@@ -577,9 +589,10 @@ static void AIEnv(void) {
     // 用 SecTask 读自身 entitlement
     void *hSec = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY);
     if (hSec) {
-        void *(*SecTaskCreateFromSelf)(CFAllocatorRef) = dlsym(hSec, "SecTaskCreateFromSelf");
+        void *(*SecTaskCreateFromSelf)(CFAllocatorRef) =
+            (void *(*)(CFAllocatorRef))dlsym(hSec, "SecTaskCreateFromSelf");
         CFTypeRef (*SecTaskCopyValueForEntitlement)(void *, CFStringRef, CFErrorRef *) =
-            dlsym(hSec, "SecTaskCopyValueForEntitlement");
+            (CFTypeRef (*)(void *, CFStringRef, CFErrorRef *))dlsym(hSec, "SecTaskCopyValueForEntitlement");
         if (SecTaskCreateFromSelf && SecTaskCopyValueForEntitlement) {
             void *task = SecTaskCreateFromSelf(kCFAllocatorDefault);
             if (task) {
@@ -666,11 +679,7 @@ static void AIExecCmd(NSDictionary *cmd) {
         if (!ok) { @try { ok = AITapInProcess(CGPointMake(x, y)); } @catch (id e) {} }
         AILog(@"  [cmd] tap (%.0f,%.0f) 通道%d -> %@", x, y, gBestTap, ok ? @"OK" : @"FAIL");
     } else if ([op isEqualToString:@"shot"]) {
-        UIImage *im = nil;
-        if (gBestShot == 1) im = AIShot_Private1();
-        else if (gBestShot == 2) im = AIShot_Private2();
-        else if (gBestShot == 3) im = AIShot_Hierarchy();
-        else if (gBestShot == 4) im = AIShot_Layer();
+        UIImage *im = AIShotByBest();
         NSData *png = im ? UIImagePNGRepresentation(im) : nil;
         NSString *b64 = png ? [png base64EncodedStringWithOptions:0] : @"";
         NSDictionary *rep = @{@"dev": gDevId, @"op": @"shot",
