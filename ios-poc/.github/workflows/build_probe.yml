@@ -1,0 +1,74 @@
+name: Build TouchProbe IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build TouchProbe IPA
+        run: |
+          chmod +x build_probe.sh
+          set -o pipefail
+          ./build_probe.sh 2>&1 | tee build_probe_output.txt
+          exit ${PIPESTATUS[0]}
+
+      - name: Dump entitlements of built app
+        if: always()
+        run: |
+          echo "=== 签名后 entitlements ===" | tee -a build_probe_output.txt
+          codesign -d --entitlements :- build/Payload/TouchProbe.app 2>&1 | tee -a build_probe_output.txt || true
+          echo "=== IPA 内容 ===" | tee -a build_probe_output.txt
+          unzip -l build/TouchProbe-C.ipa 2>&1 | tee -a build_probe_output.txt || true
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TouchProbe
+          path: build/TouchProbe-C.ipa
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="probelog-${{ github.run_number }}"
+          gh release create "$TAG" build_probe_output.txt \
+            --title "Probe log $TAG" \
+            --notes "TouchProbe 编译失败日志" || \
+          gh release upload "$TAG" build_probe_output.txt --clobber || true
+
+      - name: Create Release with direct download link
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="probe-${{ github.run_number }}"
+          gh release create "$TAG" build/TouchProbe-C.ipa \
+            --title "TouchProbe $TAG" \
+            --notes "触控注入能力探针。TrollStore 安装时请勾选 Install as System App。" || \
+          gh release upload "$TAG" build/TouchProbe-C.ipa --clobber
+
+      - name: Print direct links
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="probe-${{ github.run_number }}"
+          REPO="${GITHUB_REPOSITORY}"
+          echo "=================== 直链 ==================="
+          echo "https://github.com/${REPO}/releases/download/${TAG}/TouchProbe-C.ipa"
+          echo "============================================"
