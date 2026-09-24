@@ -807,14 +807,28 @@ static void AINotifyCb(CFNotificationCenterRef c, void *o, CFStringRef n,
     });
 }
 
-__attribute__((constructor))
-static void AIEntry(void) {
+// ---------------------------------------------------------------------------
+// 15. 入口：constructor + ObjC +load 双保险
+//
+//  ★ 重要发现（本机实测）：用 Xcode 26 SDK 编译出来的 dylib 里【没有】
+//    传统的 __DATA,__mod_init_func section —— constructor 被编码进了
+//    __TEXT,__init_offsets（新的静态初始化偏移机制），只有新版 dyld 认。
+//    一旦目标进程/注入器不吃这一套，constructor 就永远不会被调用，
+//    表现就是「注入成功、App 正常、但什么都没发生」。
+//    → 所以额外加一个 ObjC 类的 +load：它由 libobjc 保证调用，
+//      不依赖任何 dyld 新特性，是更可靠的入口。
+// ---------------------------------------------------------------------------
+static BOOL gInstalled = NO;
+
+static void AIInstall(void) {
+    if (gInstalled) return;
+    gInstalled = YES;
     if (!gLog) { gLog = [NSMutableString new]; gLogLock = [NSLock new]; }
-    AILog(@"constructor enter pid=%d", getpid());
+    AILog(@"install enter pid=%d", getpid());
 
     // 路线 1：监听 App 启动完成再延迟 6 秒（避开 App 自己做初始化，避免闪退）
     // 注意：这里用字符串字面量而不是 UIApplicationDidFinishLaunchingNotification 常量
-    // —— constructor 早于 UIKit 完成初始化，直接引用 UIKit 常量有触发过早初始化的风险。
+    // —— 入口早于 UIKit 完成初始化，直接引用 UIKit 常量有触发过早初始化的风险。
     CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(),
                                     NULL,
                                     AINotifyCb,
@@ -827,3 +841,12 @@ static void AIEntry(void) {
         @try { AIBoot(); } @catch (NSException *e) { NSLog(@"[AI2] boot2 ex %@", e); }
     });
 }
+
+__attribute__((constructor))
+static void AIEntry(void) { AIInstall(); }
+
+@interface AIBootLoader : NSObject
+@end
+@implementation AIBootLoader
++ (void)load { AIInstall(); }
+@end
