@@ -5,6 +5,7 @@
 # 产物：build/PoCAgent.ipa  —— 用 TrollStore 安装
 #
 set -euo pipefail
+set -x
 
 cd "$(dirname "$0")"
 
@@ -14,6 +15,11 @@ MIN_OS="15.0"
 
 echo "==> SDK: ${SDK_PATH}"
 echo "==> CC : ${CC}"
+
+if [ -z "${SDK_PATH}" ] || [ ! -d "${SDK_PATH}" ]; then
+    echo "!! iphoneos SDK 路径无效" >&2
+    exit 1
+fi
 
 rm -rf build
 APP_DIR="build/Payload/PoCAgent.app"
