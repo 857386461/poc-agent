@@ -87,6 +87,7 @@ static NSString *gBundleId = @"?";
 static NSString *gDevId    = @"?";
 static NSString *gBase     = nil;   // 控制服务器地址（可运行时覆盖）
 static BOOL gBooted = NO;
+static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的（排障用）
 
 // ---------------------------------------------------------------------------
 // 2. HID 私有符号（全部 dlsym，不做链接期依赖）
@@ -265,7 +266,11 @@ static void AISetupMonitor(CFRunLoopRef rl) {
 // ---------------------------------------------------------------------------
 static IMP gOrigSendEvent = NULL;
 
+static BOOL gHooked = NO;
+
 static void AIHookSendEvent(void) {
+    // 必须去重：重复 hook 会让 gOrigSendEvent 变成我们自己的 block → 无限递归 → 崩
+    if (gHooked) return;
     Class c = NSClassFromString(@"UIApplication");
     if (!c) return;
     Method m = class_getInstanceMethod(c, @selector(sendEvent:));
@@ -275,10 +280,39 @@ static void AIHookSendEvent(void) {
     SEL sel = @selector(sendEvent:);
     IMP newImp = imp_implementationWithBlock(^(id me, UIEvent *ev) {
         __sync_fetch_and_add(&gSendEventHits, 1);
+        // ★ 兜底触发：只要 dylib 被加载，用户一碰屏幕就一定会启动自检。
+        //   不依赖 constructor / +load / 通知 / 定时器任何一条路径。
+        if (!gBooted) {
+            static BOOL scheduled = NO;
+            if (!scheduled) {
+                scheduled = YES;
+                gBootSrc = @"触摸(sendEvent hook)";
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    @try { AIBoot(); } @catch (NSException *e) { NSLog(@"[AI2] touch-boot ex %@", e); }
+                });
+            }
+        }
         ((void (*)(id, SEL, id))gOrigSendEvent)(me, sel, ev);
     });
     method_setImplementation(m, newImp);
+    gHooked = YES;
     AILog(@"  hook -[UIApplication sendEvent:] -> %@", gOrigSendEvent ? @"OK" : @"FAIL");
+}
+
+// UIApplication 类可能还没加载，轮询等它出现再 hook
+static void AIHookWhenReady(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        static int tries = 0;
+        Class c = NSClassFromString(@"UIApplication");
+        if (!c || !class_getInstanceMethod(c, @selector(sendEvent:))) {
+            if (tries++ < 60) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(500 * NSEC_PER_MSEC)),
+                               dispatch_get_main_queue(), ^{ AIHookWhenReady(); });
+            }
+            return;
+        }
+        @try { AIHookSendEvent(); } @catch (NSException *e) {}
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -724,35 +758,95 @@ static void AINetLoop(void) {
 // ---------------------------------------------------------------------------
 // 13. 盖屏报告
 // ---------------------------------------------------------------------------
-static void AIShowOverlay(void) {
-    if (gIsSpringBoard) { AILog(@"SpringBoard 进程，跳过盖屏（避免影响系统 UI）"); return; }
+// 复制按钮的 target：把整份报告塞进系统剪贴板，用户直接粘贴回来，
+// 不用手打、也不依赖截图能不能传过来。
+@interface AIReportTarget : NSObject
+@end
+@implementation AIReportTarget
+- (void)copyReport:(id)sender {
+    @try {
+        [gLogLock lock]; NSString *t = [gLog copy]; [gLogLock unlock];
+        [UIPasteboard generalPasteboard].string = t;
+        AILog(@"报告已复制到剪贴板（%lu 字符）", (unsigned long)t.length);
+        // 复制完给个视觉反馈
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"已复制"
+                                                                       message:[NSString stringWithFormat:@"%lu 字符，去聊天里长按粘贴", (unsigned long)t.length]
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            @try {
+                UIViewController *root = gOverlayWindow ? gOverlayWindow.rootViewController : nil;
+                if (root) [root presentViewController:ac animated:YES completion:nil];
+            } @catch (NSException *e) {}
+        });
+    } @catch (NSException *e) { AILog(@"复制异常 %@", e); }
+}
+@end
+static AIReportTarget *gRT = nil;
+
+// ★ 关键修复：UIWindow 必须用 static 强引用持有。
+//   上一版它是局部变量，makeKeyAndVisible 后 ARC 立刻释放，窗口活不下来
+//   —— 这就是「注入了但什么都没出现」最可能的原因。
+static UIWindow *gOverlayWindow = nil;
+
+static void AIShowOverlayText(NSString *txt, BOOL done) {
+    if (gIsSpringBoard) { AILog(@"SpringBoard 进程，跳过盖屏"); return; }
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            UIWindow *ow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-            ow.windowLevel = UIWindowLevelStatusBar + 100;
-            ow.backgroundColor = [UIColor blackColor];
-            ow.userInteractionEnabled = YES;
+            CGRect f = [UIScreen mainScreen].bounds;
+            if (!gOverlayWindow) {
+                gOverlayWindow = [[UIWindow alloc] initWithFrame:f];
+                gOverlayWindow.windowLevel = UIWindowLevelStatusBar + 100;
+                gOverlayWindow.backgroundColor = [UIColor blackColor];
+            }
+            gOverlayWindow.frame = f;
 
-            UIScrollView *sv = [[UIScrollView alloc] initWithFrame:ow.bounds];
+            UIView *root = [[UIView alloc] initWithFrame:f];
+            root.backgroundColor = [UIColor blackColor];
+
+            // 顶部条
+            if (done) {
+                if (!gRT) gRT = [AIReportTarget new];
+                UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+                b.frame = CGRectMake(8, 2, 150, 40);
+                b.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
+                [b setTitle:@"📋 复制报告" forState:UIControlStateNormal];
+                [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+                b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+                [b addTarget:gRT action:@selector(copyReport:) forControlEvents:UIControlEventTouchUpInside];
+                [root addSubview:b];
+            } else {
+                UILabel *h = [[UILabel alloc] initWithFrame:CGRectMake(8, 2, f.size.width - 16, 40)];
+                h.textColor = [UIColor yellowColor];
+                h.font = [UIFont boldSystemFontOfSize:13];
+                h.text = @"AgentInject2 已加载 · 正在自检…";
+                [root addSubview:h];
+            }
+
+            UIScrollView *sv = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 44, f.size.width, f.size.height - 44)];
             sv.backgroundColor = [UIColor blackColor];
-
-            [gLogLock lock]; NSString *txt = [gLog copy]; [gLogLock unlock];
-            UILabel *lb = [[UILabel alloc] initWithFrame:CGRectMake(8, 8, ow.bounds.size.width - 16, 0)];
+            UILabel *lb = [[UILabel alloc] initWithFrame:CGRectMake(8, 8, f.size.width - 16, 0)];
             lb.numberOfLines = 0;
-            lb.font = [UIFont fontWithName:@"Menlo" size:9] ?: [UIFont systemFontOfSize:9];
-            lb.textColor = [UIColor greenColor];
+            lb.font = [UIFont fontWithName:@"Menlo" size:9] ?: [UIFont systemFontOfSize:10];
+            lb.textColor = done ? [UIColor greenColor] : [UIColor yellowColor];
             lb.text = txt;
             [lb sizeToFit];
-            sv.contentSize = CGSizeMake(ow.bounds.size.width, lb.bounds.size.height + 40);
+            sv.contentSize = CGSizeMake(f.size.width, lb.bounds.size.height + 60);
             [sv addSubview:lb];
+            [root addSubview:sv];
 
             UIViewController *vc = [UIViewController new];
-            vc.view = sv;
-            ow.rootViewController = vc;
-            [ow makeKeyAndVisible];
-            AILog(@"盖屏已显示（%lu 字符）", (unsigned long)txt.length);
+            vc.view = root;
+            gOverlayWindow.rootViewController = vc;
+            [gOverlayWindow makeKeyAndVisible];
+            AILog(@"盖屏已刷新（%lu 字符, done=%d）", (unsigned long)txt.length, done);
         } @catch (NSException *e) { AILog(@"盖屏异常 %@", e); }
     });
+}
+
+static void AIShowOverlay(void) {
+    [gLogLock lock]; NSString *txt = [gLog copy]; [gLogLock unlock];
+    AIShowOverlayText(txt, YES);
 }
 
 // ---------------------------------------------------------------------------
@@ -762,6 +856,10 @@ static void AIBoot(void) {
     if (gBooted) return;
     gBooted = YES;
     AILog(@"########## AgentInject2 boot ##########");
+    AILog(@"boot 触发来源: %@", gBootSrc);
+    // 一进来就先盖一层「已加载」，让你立刻能确认 dylib 到底跑没跑；
+    // 自检跑完再刷新成完整报告（带复制按钮）。
+    AIShowOverlayText(@"AgentInject2 已加载 ✓\n正在自检，请稍候…", NO);
 
     @try { AIEnv(); }          @catch (NSException *e) { AILog(@"env 异常 %@", e); }
     @try { AIHookSendEvent(); } @catch (NSException *e) { AILog(@"hook 异常 %@", e); }
@@ -803,6 +901,7 @@ static void AINotifyCb(CFNotificationCenterRef c, void *o, CFStringRef n,
     (void)c; (void)o; (void)n; (void)obj; (void)ui;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        if (!gBooted) gBootSrc = @"通知(didFinishLaunching+6s)";
         @try { AIBoot(); } @catch (NSException *e) { NSLog(@"[AI2] boot ex %@", e); }
     });
 }
@@ -824,7 +923,18 @@ static void AIInstall(void) {
     if (gInstalled) return;
     gInstalled = YES;
     if (!gLog) { gLog = [NSMutableString new]; gLogLock = [NSLock new]; }
+    if ([gBootSrc isEqualToString:@"?"]) gBootSrc = @"load/constructor";
     AILog(@"install enter pid=%d", getpid());
+
+    // 落一个「已加载」标记文件，用于判断 dylib 到底有没有被 dyld 装载
+    @try {
+        NSString *mk = [NSString stringWithFormat:@"AgentInject2 loaded pid=%d at %@\n", getpid(), [NSDate date]];
+        [mk writeToFile:@"/var/mobile/agent_inject2_installed.txt" atomically:YES
+              encoding:NSUTF8StringEncoding error:nil];
+    } @catch (NSException *e) {}
+
+    // 尽早 hook sendEvent：只要 dylib 装进来了，用户一碰屏幕就一定会启动自检
+    AIHookWhenReady();
 
     // 路线 1：监听 App 启动完成再延迟 6 秒（避开 App 自己做初始化，避免闪退）
     // 注意：这里用字符串字面量而不是 UIApplicationDidFinishLaunchingNotification 常量
@@ -838,6 +948,7 @@ static void AIInstall(void) {
     // 路线 2：兜底，8 秒后无论如何跑一次（有些 App 不发送通知 / TrollFools 注入时机晚）
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        if (!gBooted) gBootSrc = @"定时器(8s)";
         @try { AIBoot(); } @catch (NSException *e) { NSLog(@"[AI2] boot2 ex %@", e); }
     });
 }
