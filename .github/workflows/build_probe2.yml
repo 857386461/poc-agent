@@ -1,4 +1,4 @@
-name: Build AgentProbe IPA (v2)
+name: Build AgentProbe IPA (v3)
 
 on:
   workflow_dispatch:
@@ -45,9 +45,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="probe2log-${{ github.run_number }}"
+          TAG="probe3log-${{ github.run_number }}"
           gh release create "$TAG" build_probe2_output.txt \
-            --title "Probe2 log $TAG" \
+            --title "Probe3 log $TAG" \
             --notes "AgentProbe 编译失败日志" || \
           gh release upload "$TAG" build_probe2_output.txt --clobber || true
 
@@ -56,7 +56,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="probe2-${{ github.run_number }}"
+          TAG="probe3-${{ github.run_number }}"
           gh release create "$TAG" ios-poc/build/AgentProbe-D.ipa \
             --title "AgentProbe $TAG" \
             --notes "模拟点击 + 截图 + 权限自证 能力探针。TrollStore 安装。" || \
@@ -67,7 +67,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="probe2-${{ github.run_number }}"
+          TAG="probe3-${{ github.run_number }}"
           REPO="${GITHUB_REPOSITORY}"
           echo "=================== 直链 ==================="
           echo "https://github.com/${REPO}/releases/download/${TAG}/AgentProbe-D.ipa"

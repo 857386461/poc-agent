@@ -42,6 +42,10 @@ echo "==> 编译 AgentProbe"
     -framework Foundation \
     -framework CoreGraphics \
     -framework CoreFoundation \
+    -framework ReplayKit \
+    -framework CoreImage \
+    -framework CoreMedia \
+    -framework CoreVideo \
     -o "${APP_DIR}/AgentProbe" \
     AgentProbe.m
 

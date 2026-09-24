@@ -32,6 +32,8 @@
 //
 
 #import <UIKit/UIKit.h>
+#import <ReplayKit/ReplayKit.h>
+#import <CoreImage/CoreImage.h>
 #import <mach/mach.h>
 #import <mach/mach_time.h>
 #import <dlfcn.h>
@@ -297,12 +299,19 @@ static IOHIDEventRef TP_MakeTouchEvent(double x, double y, TPPhase phase) {
     if (!hand) return NULL;
     gSetInt(hand, kFieldDigitizerIsDisplayIntegrated, 1);
 
+    // ★ 修正（v2 三路全灭的直接原因之一）：
+    //   严格照 KIF（PTFakeTouch/addition/IOHIDEvent+KIF.m）的 eventMask：
+    //     Moved      → kIOHIDDigitizerEventPosition (0x4)
+    //     Began/Ended→ kIOHIDDigitizerEventRange|kIOHIDDigitizerEventTouch (0x3)
+    //   v2 把 Began 写成 Range|Touch|Position|Start(0x107)、End 写成 Stop(0x8)，
+    //   系统会判成非法事件直接丢弃。
+    //   另：range/touch 两个布尔参数在 KIF 里都传 isTouching（Ended 时为 0）。
     uint32_t mask;
-    int touching;
+    uint32_t touching;
     switch (phase) {
-        case TPPhaseBegin: mask = kMaskRange | kMaskTouch | kMaskPosition | kMaskStart; touching = 1; break;
-        case TPPhaseMove:  mask = kMaskPosition;                                        touching = 1; break;
-        default:           mask = kMaskStop;                                            touching = 0; break;
+        case TPPhaseBegin: mask = kMaskRange | kMaskTouch; touching = 1; break;
+        case TPPhaseMove:  mask = kMaskPosition;           touching = 1; break;
+        default:           mask = kMaskRange | kMaskTouch; touching = 0; break;
     }
 
     IOHIDEventRef finger = gCreateFingerQ(kCFAllocatorDefault, ts,
@@ -394,12 +403,23 @@ static BOOL TP_Dispatch_Enqueue(IOHIDEventRef ev) {
 // ---------------------------------------------------------------------------
 // 点一下，然后看计数器是否 +1
 // ---------------------------------------------------------------------------
+// ★ 修正（v2 三路全灭的直接原因之二）：
+//   v2 在**后台线程**投递触摸事件，而 UIKit 的事件派发必须在**主线程**。
+//   这里用「泵 runloop」代替 usleep —— 不能用 sleep，否则事件永远没机会被处理。
+static void TPPump(double seconds) {
+    NSDate *end = [NSDate dateWithTimeIntervalSinceNow:seconds];
+    while ([end timeIntervalSinceNow] > 0) {
+        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                 beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    }
+}
+
 static BOOL TP_TapAndVerify(CGPoint pt, NSString *pathName, int which) {
     NSInteger before = gCatcherHits;
 
     IOHIDEventRef down = TP_MakeTouchEvent(pt.x, pt.y, TPPhaseBegin);
     if (!down) { TPLog([NSString stringWithFormat:@"  [%@] 事件构造失败（down=NULL）", pathName]); return NO; }
-    usleep(40000);
+    TPPump(0.04);
     IOHIDEventRef up = TP_MakeTouchEvent(pt.x, pt.y, TPPhaseEnd);
 
     BOOL sent = NO;
@@ -408,7 +428,7 @@ static BOOL TP_TapAndVerify(CGPoint pt, NSString *pathName, int which) {
         case 2: sent = TP_Dispatch_FullClient(down);   break;
         case 3: sent = TP_Dispatch_Enqueue(down);      break;
     }
-    usleep(60000);
+    TPPump(0.06);
     if (up) {
         switch (which) {
             case 1: TP_Dispatch_SimpleClient(up); break;
@@ -419,8 +439,8 @@ static BOOL TP_TapAndVerify(CGPoint pt, NSString *pathName, int which) {
     }
     CFRelease(down);
 
-    // 等事件跑完一圈
-    for (int i = 0; i < 12 && gCatcherHits == before; i++) usleep(50000);
+    // 等事件跑完一圈（泵 runloop，让 UIKit 真正处理这次触摸）
+    for (int i = 0; i < 12 && gCatcherHits == before; i++) TPPump(0.05);
 
     BOOL hit = (gCatcherHits > before);
     TPLog([NSString stringWithFormat:@"  [%@] 投递%@ → 计数器 %ld → %ld  %@",
@@ -444,9 +464,9 @@ static void TP_TapMatrix(void) {
     gCatcherHits = 0;
 
     BOOL h1 = TP_TapAndVerify(pt, @"通路1 SimpleClient全局投递", 1);
-    usleep(200000);
+    TPPump(0.2);
     BOOL h2 = TP_TapAndVerify(pt, @"通路2 完整Client全局投递", 2);
-    usleep(200000);
+    TPPump(0.2);
     BOOL h3 = TP_TapAndVerify(pt, @"通路3 _enqueueHIDEvent(对照组/自己点自己)", 3);
 
     TPHeader(@"C3. 点击结论");
@@ -484,14 +504,14 @@ static void TP_HomeGestureTest(void) {
 
     IOHIDEventRef d = TP_MakeTouchEvent(x, y0, TPPhaseBegin);
     if (d) { TP_Dispatch_SimpleClient(d); TP_Dispatch_FullClient(d); CFRelease(d); }
-    usleep(30000);
+    TPPump(0.03);
 
     const int steps = 8;
     for (int i = 1; i <= steps; i++) {
         double y = y0 + (y1 - y0) * ((double)i / steps);
         IOHIDEventRef m = TP_MakeTouchEvent(x, y, TPPhaseMove);
         if (m) { TP_Dispatch_SimpleClient(m); TP_Dispatch_FullClient(m); CFRelease(m); }
-        usleep(12000);
+        TPPump(0.012);
     }
     IOHIDEventRef u = TP_MakeTouchEvent(x, y1, TPPhaseEnd);
     if (u) { TP_Dispatch_SimpleClient(u); TP_Dispatch_FullClient(u); CFRelease(u); }
@@ -566,6 +586,7 @@ static UIImage *TP_TryScreenshot(void) {
 // 把截图弹出来给用户看一眼（最直观的证明）
 @interface TPShotViewController : UIViewController
 @property (nonatomic, strong) UIImage *img;
+@property (nonatomic, copy)   NSString *tag;
 @end
 
 @implementation TPShotViewController
@@ -582,8 +603,8 @@ static UIImage *TP_TryScreenshot(void) {
     UILabel *lb = [[UILabel alloc] initWithFrame:CGRectMake(8, 24, W - 16, 30)];
     lb.textColor = [UIColor whiteColor];
     lb.font = [UIFont boldSystemFontOfSize:15];
-    lb.text = [NSString stringWithFormat:@"截图成功  %.0f x %.0f  亮度 %.0f",
-               self.img.size.width, self.img.size.height, TP_MeanLuminance(self.img)];
+    lb.text = [NSString stringWithFormat:@"%@ 截图  %.0f x %.0f  亮度 %.0f",
+               self.tag ?: @"", self.img.size.width, self.img.size.height, TP_MeanLuminance(self.img)];
     [self.view addSubview:lb];
 
     UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -596,6 +617,62 @@ static UIImage *TP_TryScreenshot(void) {
 }
 - (void)dismissSelf { [self dismissViewControllerAnimated:YES completion:nil]; }
 @end
+
+// ---------------------------------------------------------------------------
+// E. ReplayKit 全屏抓帧（★ 公开 API，不需要任何特权 entitlement）
+//    意义：这是「AI 看见手机画面」的关键 —— ReplayKit 抓的是**整个屏幕**，
+//    包含其它 App 的画面（游戏）。这意味着哪怕不注入游戏，也能"看"到游戏。
+// ---------------------------------------------------------------------------
+static UIViewController *gShotPresenter = nil;
+
+static void TP_ShowShot(UIImage *img, NSString *tag) {
+    if (!img) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *p = gShotPresenter ?: [UIApplication sharedApplication].keyWindow.rootViewController;
+        if (!p) return;
+        TPShotViewController *vc = [[TPShotViewController alloc] init];
+        vc.img = img;
+        vc.tag = tag;
+        [p presentViewController:vc animated:YES completion:nil];
+    });
+}
+
+static void TP_TestReplayKit(void) {
+    TPHeader(@"E. ReplayKit 全屏抓帧（公开 API，不需要任何特权）");
+    if (@available(iOS 11.0, *)) {
+        RPScreenRecorder *rec = [RPScreenRecorder sharedRecorder];
+        TPLog([NSString stringWithFormat:@"  isAvailable=%d  isRecording=%d",
+               (int)rec.isAvailable, (int)rec.isRecording]);
+        __block BOOL got = NO;
+        [rec startCaptureWithHandler:^(CMSampleBufferRef sampleBuffer,
+                                       RPSampleBufferType bufferType, NSError *error) {
+            if (bufferType != RPSampleBufferTypeVideo || got) return;
+            got = YES;
+            CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
+            if (!pb) { TPLog(@"  视频帧里没有 pixelBuffer"); return; }
+            size_t w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb);
+            UIImage *img = nil;
+            @try {
+                CIImage *ci = [CIImage imageWithCVPixelBuffer:pb];
+                CIContext *ctx = [CIContext contextWithOptions:nil];
+                CGImageRef cg = [ctx createCGImage:ci fromRect:CGRectMake(0, 0, w, h)];
+                if (cg) { img = [UIImage imageWithCGImage:cg]; CFRelease(cg); }
+            } @catch (NSException *e) {
+                TPLog([NSString stringWithFormat:@"  转图异常: %@", e.reason]);
+            }
+            TPLog([NSString stringWithFormat:@"  ✅ 收到视频帧 %zux%zu → UIImage %@",
+                   w, h, img ? @"非空" : @"空"]);
+            [rec stopCaptureWithHandler:^(NSError *e) {}];
+            if (img) TP_ShowShot(img, @"ReplayKit");
+            else TPLog(@"  ❌ 帧拿到了但转图失败");
+        } completionHandler:^(NSError *error) {
+            if (error) TPLog([NSString stringWithFormat:@"  startCapture 失败: %@", error.localizedDescription]);
+            else TPLog(@"  startCapture 已启动（如弹出「允许录制屏幕」，请点允许）");
+        }];
+    } else {
+        TPLog(@"  ReplayKit 需要 iOS 11+");
+    }
+}
 
 // ===========================================================================
 // 五、UI
@@ -720,7 +797,7 @@ static UIImage *TP_TryScreenshot(void) {
 - (void)runAll {
     TPLog(@"");
     TPLog(@"##################################################");
-    TPLog(@"   自动操作能力探针 v2   AgentProbe");
+    TPLog(@"   自动操作能力探针 v3   AgentProbe");
     TPLog(@"##################################################");
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         TPLog([NSString stringWithFormat:@"  系统版本: %@   机型: %@   pid: %d",
@@ -731,23 +808,32 @@ static UIImage *TP_TryScreenshot(void) {
         TP_SandboxCheck();
         TP_TaskPortSweep();
         TP_LoadHIDSymbols();
-        TP_TapMatrix();
-        TP_HomeGestureTest();
 
-        TPLog(@"");
-        TPLog(@"探针跑完。下一步：点「📷 截图测试」。");
-        TPLog(@"##################################################");
+        // ★ v3：触摸与手势必须在主线程投递 + 泵 runloop
+        dispatch_async(dispatch_get_main_queue(), ^{
+            TP_TapMatrix();
+            TP_HomeGestureTest();
+
+            TPLog(@"");
+            TPLog(@"探针跑完。3 秒后自动测 ReplayKit 全屏抓帧（也可随时点「📷 截图测试」）。");
+            TPLog(@"##################################################");
+
+            __weak typeof(self) ws = self;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ [ws doShot]; });
+        });
     });
 }
 
 - (void)doShot {
+    if (!gShotPresenter) gShotPresenter = self;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        // D：两条旧私有路（已知会失败，保留作对照）
         UIImage *img = TP_TryScreenshot();
-        if (!img) return;
+        if (img) { TP_ShowShot(img, @"私有API"); return; }
+        // E：ReplayKit 公开 API，抓整个屏幕
         dispatch_async(dispatch_get_main_queue(), ^{
-            TPShotViewController *vc = [[TPShotViewController alloc] init];
-            vc.img = img;
-            [self presentViewController:vc animated:YES completion:nil];
+            TP_TestReplayKit();
         });
     });
 }
