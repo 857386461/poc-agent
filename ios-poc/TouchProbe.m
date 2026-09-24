@@ -449,3 +449,13 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
 }
 
 @end
+
+// ---------------------------------------------------------------------------
+// 入口
+// ---------------------------------------------------------------------------
+
+int main(int argc, char *argv[]) {
+    @autoreleasepool {
+        return UIApplicationMain(argc, argv, nil, NSStringFromClass([TPAppDelegate class]));
+    }
+}
