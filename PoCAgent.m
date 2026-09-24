@@ -11,15 +11,43 @@
 
 #import <UIKit/UIKit.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
+#import <mach/vm_param.h>
 #import <mach/error.h>
 #import <unistd.h>
 #import <string.h>
 
-// 部分 iOS SDK 未公开声明 task_for_pid，这里显式声明（签名与 XNU 内核一致）
+// 新版 iOS SDK 的 mach/mach_vm.h 内含 #error 占位（Apple 从未在 iOS 上公开它），
+// 因此不 import 该头文件，改为显式声明所用函数；
+// 所需类型（mach_vm_address_t / mach_vm_size_t / vm_map_t / vm_offset_t /
+// mach_msg_type_number_t）均定义于公开的 mach/vm_types.h、mach/mach_types.h，
+// 由 <mach/mach.h> 间接引入。符号本体位于 libsystem_kernel.dylib。
+// 注意：签名必须与 XNU 实现完全一致。
+
+// task_for_pid / mach_vm_* 均为跨进程特权接口，
+// 需配合 ent.plist 中的 task-ports / get-task-allow entitlement 使用
 extern kern_return_t task_for_pid(mach_port_name_t target_tport,
                                   int              pid,
                                   mach_port_name_t *t);
+
+extern kern_return_t mach_vm_allocate(vm_map_t           target,
+                                      mach_vm_address_t  *address,
+                                      mach_vm_size_t     size,
+                                      int                flags);
+
+extern kern_return_t mach_vm_write(vm_map_t              target_task,
+                                   mach_vm_address_t     address,
+                                   vm_offset_t           data,
+                                   mach_msg_type_number_t dataCnt);
+
+extern kern_return_t mach_vm_read_overwrite(vm_map_t          target_task,
+                                            mach_vm_address_t address,
+                                            mach_vm_size_t    size,
+                                            mach_vm_address_t data,
+                                            mach_vm_size_t    *outsize);
+
+extern kern_return_t mach_vm_deallocate(vm_map_t          target_task,
+                                        mach_vm_address_t address,
+                                        mach_vm_size_t    size);
 
 static UITextView      *gLogView = nil;
 static NSMutableString *gLog     = nil;
