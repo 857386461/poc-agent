@@ -796,6 +796,17 @@ static void AIBoot(void) {
     });
 }
 
+// CFNotificationCenterAddObserver 只接受【函数指针】(CFNotificationCallback)，
+// 不能传 block —— 传 block 会报 incompatible type 编译错误。
+static void AINotifyCb(CFNotificationCenterRef c, void *o, CFStringRef n,
+                       const void *obj, CFDictionaryRef ui) {
+    (void)c; (void)o; (void)n; (void)obj; (void)ui;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @try { AIBoot(); } @catch (NSException *e) { NSLog(@"[AI2] boot ex %@", e); }
+    });
+}
+
 __attribute__((constructor))
 static void AIEntry(void) {
     if (!gLog) { gLog = [NSMutableString new]; gLogLock = [NSLock new]; }
@@ -806,12 +817,7 @@ static void AIEntry(void) {
     // —— constructor 早于 UIKit 完成初始化，直接引用 UIKit 常量有触发过早初始化的风险。
     CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(),
                                     NULL,
-                                    ^(CFNotificationCenterRef c, void *o, CFStringRef n, const void *obj, CFDictionaryRef ui) {
-                                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
-                                                       dispatch_get_main_queue(), ^{
-                                            @try { AIBoot(); } @catch (NSException *e) { NSLog(@"[AI2] boot ex %@", e); }
-                                        });
-                                    },
+                                    AINotifyCb,
                                     CFSTR("UIApplicationDidFinishLaunchingNotification"),
                                     NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
