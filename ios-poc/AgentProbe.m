@@ -327,8 +327,10 @@ static IOHIDEventRef TP_MakeTouchEvent(double x, double y, TPPhase phase) {
 // ---------------------------------------------------------------------------
 static UILabel         *gCatcherLabel = nil;
 static NSInteger        gCatcherHits  = 0;
-static CGPoint          gCatcherLast  = CGPointZero;
-static CGPoint          gCatcherViewCenter = CGPointZero;
+// 注意：CGPointZero 不是编译期常量，不能用作 static 的初始化器（会报
+// "initializer element is not a compile-time constant"）—— 用聚合初始化写死。
+static CGPoint          gCatcherLast  = {0.0, 0.0};
+static CGPoint          gCatcherViewCenter = {0.0, 0.0};
 static UIView          *gCatcher = nil;
 
 @interface TPCatcherView : UIView
