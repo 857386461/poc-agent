@@ -447,6 +447,177 @@ static BOOL AITapInProcess(CGPoint pt) {
 }
 
 // ---------------------------------------------------------------------------
+// 7b. 伪造 Touch/Event + 直接分发
+//
+//  iOS 16.1.2 实测：UITouch 的私有构造 selector（initAtPoint:inWindow: 等）
+//  全部不存在 → 走「先构造真 UITouch 再 sendEvent」这条路是死路。
+//  但 UITouch / UIEvent 本身是普通 ObjC 类，可以【子类化并覆盖 getter】，
+//  然后直接调用目标 view 的 touchesBegan:/touchesEnded: —— 自己完成 hit-test
+//  和分发，完全不依赖任何私有构造 API。
+//  对 Unity / Cocos 这类游戏，它们的触摸入口就是 UnityView 的 touchesBegan，
+//  所以直接调它就能把触摸喂进去。
+// ---------------------------------------------------------------------------
+@interface AIFakeTouch : UITouch
+@property (nonatomic, assign) CGPoint       aiPoint;   // 相对于 aiView 的坐标
+@property (nonatomic, weak)   UIView       *aiView;
+@property (nonatomic, assign) UITouchPhase  aiPhase;
+@property (nonatomic, assign) NSTimeInterval aiTime;
+@end
+
+@implementation AIFakeTouch
+- (CGPoint)locationInView:(UIView *)v {
+    if (!v || v == self.aiView) return self.aiPoint;
+    return [self.aiView convertPoint:self.aiPoint toView:v];
+}
+- (CGPoint)previousLocationInView:(UIView *)v { return [self locationInView:v]; }
+- (UITouchPhase)phase       { return self.aiPhase; }
+- (UIView *)view            { return self.aiView; }
+- (UIWindow *)window        { return self.aiView.window; }
+- (NSTimeInterval)timestamp { return self.aiTime; }
+- (NSUInteger)tapCount      { return 1; }
+- (UITouchType)type         { return UITouchTypeDirect; }
+- (CGFloat)force            { return 1.0; }
+- (CGFloat)majorRadius      { return 5.0; }
+- (CGFloat)minorRadius      { return 5.0; }
+@end
+
+@interface AIFakeEvent : UIEvent
+@property (nonatomic, strong) NSSet         *aiTouches;
+@property (nonatomic, assign) NSTimeInterval aiTime;
+@end
+
+@implementation AIFakeEvent
+- (NSSet *)allTouches                       { return self.aiTouches; }
+- (NSSet *)touchesForView:(UIView *)v       { return self.aiTouches; }
+- (NSSet *)touchesForWindow:(UIWindow *)w   { return self.aiTouches; }
+- (UIEventType)type                         { return UIEventTypeTouches; }
+- (UIEventSubtype)subtype                   { return UIEventSubtypeNone; }
+- (NSTimeInterval)timestamp                 { return self.aiTime; }
+@end
+
+// 直接把触摸喂给指定 view（绕过 UIKit 分发）
+static BOOL AIDispatchFakeToView(UIView *target, CGPoint ptInTarget) {
+    if (!target) return NO;
+    AIFakeTouch *t = [AIFakeTouch new];
+    t.aiPoint = ptInTarget;
+    t.aiView  = target;
+    t.aiTime  = [[NSDate date] timeIntervalSince1970];
+
+    AIFakeEvent *ev = [AIFakeEvent new];
+    NSSet *one = [NSSet setWithObject:t];
+    ev.aiTouches = one;
+    ev.aiTime    = t.aiTime;
+
+    @try {
+        t.aiPhase = UITouchPhaseBegan;
+        [target touchesBegan:one withEvent:ev];
+        t.aiPhase = UITouchPhaseMoved;
+        [target touchesMoved:one withEvent:ev];
+        t.aiPhase = UITouchPhaseEnded;
+        [target touchesEnded:one withEvent:ev];
+        return YES;
+    } @catch (NSException *ex) {
+        AILog(@"  分发异常: %@", ex.reason);
+        return NO;
+    }
+}
+
+// 自己 hit-test + 分发（验证能否自动定位到正确的 view）
+static UIView *AIHitTestIn(UIView *root, CGPoint ptInRoot) {
+    @try { return [root hitTest:ptInRoot withEvent:nil]; } @catch (NSException *e) { return nil; }
+}
+
+static BOOL AIFakeTapAtWindowPoint(CGPoint pt) {
+    UIApplication *app = [UIApplication sharedApplication];
+    UIWindow *w = nil;
+    for (UIWindow *it in app.windows) {
+        if (it == gOverlayWindow) continue;      // 跳过我们自己盖的屏
+        if (it.hidden) continue;
+        w = it; break;
+    }
+    if (!w) w = gOverlayWindow;
+    if (!w) return NO;
+    UIView *target = AIHitTestIn(w, pt);
+    if (!target) { AILog(@"  hitTest 未命中任何 view"); return NO; }
+    CGPoint local = [w convertPoint:pt toView:target];
+    AILog(@"  hitTest 命中: %@ (%.0f,%.0f)", NSStringFromClass([target class]), local.x, local.y);
+    return AIDispatchFakeToView(target, local);
+}
+
+// --- 闭环自证用的测试视图 ---
+static int gFakeHits = 0;
+@interface AITestView : UIView
+@end
+@implementation AITestView
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    gFakeHits++;
+    AILog(@"  ★★ AITestView 收到 touchesBegan（第 %d 次）", gFakeHits);
+}
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    AILog(@"  ★★ AITestView 收到 touchesEnded");
+}
+@end
+
+static void AIFakeTapTest(void) {
+    AILog(@"==== [3c] 伪造 Touch/Event 直接分发（闭环自证） ====");
+    UIView *host = gOverlayWindow ? gOverlayWindow.rootViewController.view : nil;
+    if (!host) { AILog(@"  没有宿主 view"); return; }
+
+    AITestView *tv = [[AITestView alloc] initWithFrame:CGRectMake(20, 200, 140, 90)];
+    tv.backgroundColor = [UIColor blueColor];
+    tv.userInteractionEnabled = YES;
+    [host addSubview:tv];
+    [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
+
+    // 步骤 1：直接喂给测试 view，验证伪造对象本身可用
+    int h0 = gFakeHits;
+    BOOL ok1 = AIDispatchFakeToView(tv, CGPointMake(70, 45));
+    AILog(@"  [1] 直接分发到 AITestView -> %@  计数器+%d", ok1 ? @"已投递" : @"失败", gFakeHits - h0);
+
+    // 步骤 2：走 hit-test 自动定位（用测试 view 中心的屏幕坐标）
+    int h1 = gFakeHits;
+    CGRect r = [tv convertRect:tv.bounds toView:nil];
+    BOOL ok2 = AIFakeTapAtWindowPoint(CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)));
+    AILog(@"  [2] 经 hitTest 自动定位分发 -> %@  计数器+%d", ok2 ? @"已投递" : @"失败", gFakeHits - h1);
+
+    if (gFakeHits > 0 && gBestTap == 0) {
+        gBestTap = 4;   // 4 = 伪造对象直接分发
+        AILog(@"  ↑ 选定为点击通道：伪造 Touch/Event 直接分发");
+    }
+    [tv removeFromSuperview];
+}
+
+// --- dump UITouch / UIEvent 的真实方法名：找出本系统真正的构造入口 ---
+static void AIDumpTouchAPI(void) {
+    AILog(@"==== [3a] UITouch / UIEvent 方法名 dump ====");
+    struct { Class c; const char *n; } tgt[] = {
+        { [UITouch class], "UITouch" },
+        { [UIEvent class],  "UIEvent" },
+    };
+    for (int k = 0; k < 2; k++) {
+        unsigned int n = 0;
+        Method *ms = class_copyMethodList(tgt[k].c, &n);
+        AILog(@"  %s 共 %u 个实例方法，含关键词的:", tgt[k].n, n);
+        int shown = 0;
+        for (unsigned int i = 0; i < n && shown < 40; i++) {
+            SEL sel = method_getName(ms[i]);
+            const char *nm = sel_getName(sel);
+            unsigned na = method_getNumberOfArguments(ms[i]);
+            BOOL interesting = (strstr(nm, "init") || strstr(nm, "Point") || strstr(nm, "point")
+                                || strstr(nm, "Window") || strstr(nm, "window")
+                                || strstr(nm, "location") || strstr(nm, "Location")
+                                || strstr(nm, "Touch") || strstr(nm, "touch")
+                                || strstr(nm, "Event") || strstr(nm, "event"));
+            if (interesting) {
+                AILog(@"    -[%s %s]  (%u 参数)", tgt[k].n, nm, na);
+                shown++;
+            }
+        }
+        free(ms);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 8. HID 自检矩阵
 // ---------------------------------------------------------------------------
 static void AIPump(CFRunLoopRef rl, double sec) {
@@ -946,7 +1117,7 @@ static void AIBoot(void) {
         @try { AIHidMatrix(rl); }    @catch (NSException *e) { AILog(@"matrix 异常 %@", e); }
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            @try { AIControlProbe(); } @catch (NSException *e) { AILog(@"control 异常 %@", e); }
+            @try { AIDumpTouchAPI(); } @catch (NSException *e) { AILog(@"dump 异常 %@", e); }
             // 进程内 UIKit 路线补测
             @try {
                 AILog(@"==== [3b] 进程内 UIKit 合成 ====");
@@ -957,6 +1128,8 @@ static void AIBoot(void) {
                 AILog(@"  AITapInProcess -> %@ sendEvent+%d", ok ? @"已投递" : @"失败", gSendEventHits - s0);
                 if (gSendEventHits - s0 > 0 && gBestTap == 0) { gBestTap = 2; AILog(@"  ↑ 选定为进程内 UIKit 通道"); }
             } @catch (NSException *e) { AILog(@"inproc 异常 %@", e); }
+            @try { AIFakeTapTest(); } @catch (NSException *e) { AILog(@"faketap 异常 %@", e); }
+            @try { AIControlProbe(); } @catch (NSException *e) { AILog(@"control 异常 %@", e); }
             @try { AIShotMatrix(); } @catch (NSException *e) { AILog(@"shot 异常 %@", e); }
             @try { AINetLoop(); }    @catch (NSException *e) { AILog(@"net 异常 %@", e); }
 
