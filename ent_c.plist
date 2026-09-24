@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- 跨进程 task port（完整版） -->
+    <key>com.apple.system-task-ports</key>
+    <true/>
+
+    <!-- 只读 task port 通道（AMFI 检查更宽松，iOS 14+） -->
+    <key>com.apple.system-task-ports.read</key>
+    <true/>
+
+    <!-- 允许调试器附加 -->
+    <key>get-task-allow</key>
+    <true/>
+
+    <!-- 无沙盒：仅 TrollStore 的 System App 安装方式支持 -->
+    <key>com.apple.private.security.no-sandbox</key>
+    <true/>
+
+    <!-- 平台应用身份：现代 iOS 上 task_for_pid 的关键门槛 -->
+    <key>platform-application</key>
+    <true/>
+
+    <!-- 跳过库校验，避免权限组合下动态库加载被拦 -->
+    <key>com.apple.private.skip-library-validation</key>
+    <true/>
+</dict>

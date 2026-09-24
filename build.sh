@@ -5,6 +5,7 @@
 # 产物：
 #   build/PoCAgent.ipa    —— ent.plist   （含 no-sandbox，需 Install as System App）
 #   build/PoCAgent-B.ipa  —— ent_b.plist （无 no-sandbox，普通安装可启动）
+#   build/PoCAgent-C.ipa  —— ent_c.plist （完整组合：+platform-application 等）
 #
 set -euo pipefail
 set -x
@@ -59,6 +60,7 @@ build_variant() {
 
 build_variant ent.plist ""
 build_variant ent_b.plist "-B"
+build_variant ent_c.plist "-C"
 
 ls -l build/*.ipa
 echo ""
