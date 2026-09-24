@@ -34,6 +34,9 @@
 #import <mach/mach_time.h>
 #import <unistd.h>
 #import <sys/sysctl.h>
+#include <string.h>
+#include <stdlib.h>
+#include <math.h>
 
 // ---------------------------------------------------------------------------
 // 0. 日志：同时进内存缓冲 / NSLog / 文件
@@ -88,6 +91,12 @@ static NSString *gDevId    = @"?";
 static NSString *gBase     = nil;   // 控制服务器地址（可运行时覆盖）
 static BOOL gBooted = NO;
 static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的（排障用）
+
+// 盖屏窗口。必须是 static 强引用，否则 ARC 会在函数返回时把它释放掉，
+// 表现就是"注入成功但屏幕上什么都没有"（v2 踩过的坑）。
+// 同时它必须在文件靠前的位置声明 —— v3 的伪造 Touch 分发代码（约 530 行）
+// 会用到它，声明放在 13 节会导致 "use of undeclared identifier"。
+static UIWindow *gOverlayWindow = nil;
 
 // 前向声明：sendEvent hook 里要在定义之前调用 AIBoot
 static void AIBoot(void);
@@ -964,8 +973,6 @@ static void AINetLoop(void) {
 // ---------------------------------------------------------------------------
 // 13. 盖屏报告
 // ---------------------------------------------------------------------------
-static UIWindow *gOverlayWindow = nil;
-
 // 复制按钮的 target：把整份报告塞进系统剪贴板，用户直接粘贴回来，
 // 不用手打、也不依赖截图能不能传过来。
 @interface AIReportTarget : NSObject
