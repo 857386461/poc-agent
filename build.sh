@@ -34,6 +34,7 @@ echo "==> 编译 PoCAgent"
     -O0 \
     -framework UIKit \
     -framework Foundation \
+    -framework CoreGraphics \
     -o "${APP_DIR}/PoCAgent" \
     PoCAgent.m
 
