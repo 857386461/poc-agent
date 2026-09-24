@@ -367,11 +367,11 @@ static void TP_RunAll(void) {
     //      导致按钮点击区域被压成 0 —— 表现为「点了没反应」。
     //      另外把按钮放在最上层（最后添加），避免被其他视图盖住。
     // ------------------------------------------------------------------
-    CGRect screen = [UIScreen mainScreen].bounds;
+    CGSize screen = [UIScreen mainScreen].bounds.size;   // bounds 是 CGRect，取 .size
     CGFloat W = screen.width;
     CGFloat H = screen.height;
     CGFloat pad = 10.0;
-    BOOL isPad = (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad);
+    BOOL isPad = ([[UIDevice currentDevice] userInterfaceIdiom] == UIUserInterfaceIdiomPad);
 
     if (isPad) {
         // iPad 上给个居中卡片，避免元素被拉得过宽
