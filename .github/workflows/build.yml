@@ -21,7 +21,20 @@ jobs:
       - name: Build IPA
         run: |
           chmod +x build.sh
-          ./build.sh
+          set -o pipefail
+          ./build.sh 2>&1 | tee build_output.txt
+          exit ${PIPESTATUS[0]}
+
+      - name: Upload build log on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="logs-${{ github.run_number }}"
+          gh release create "$TAG" build_output.txt \
+            --title "Build log $TAG" \
+            --notes "编译失败时的完整日志，供远程分析" || \
+          gh release upload "$TAG" build_output.txt --clobber || true
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
