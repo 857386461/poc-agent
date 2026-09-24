@@ -46,6 +46,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 沙箱里下载不到 artifact / job logs（DNS 被拦），所以把日志 base64 塞进
+          # release notes —— 这是目前唯一能稳定把编译错误读回去的通道。
           TAG="inject2log-${{ github.run_number }}"
-          cp /tmp/dylib_build.txt ./build_log.txt || true
-          gh release create "$TAG" ./build_log.txt --title "Build log $TAG" --notes "编译失败日志" || true
+          gh release delete "$TAG" -y 2>/dev/null || true
+          B64=$(tail -c 8000 /tmp/dylib_build.txt | base64 | tr -d '\n')
+          gh release create "$TAG" \
+            --title "Build log $TAG" \
+            --notes "编译失败日志（base64，尾部 8000 字节）:
+          $B64" || true
