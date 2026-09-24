@@ -20,24 +20,24 @@ jobs:
 
       - name: Build TouchProbe IPA
         run: |
-          chmod +x build_probe.sh
+          chmod +x ios-poc/build_probe.sh
           set -o pipefail
-          ./build_probe.sh 2>&1 | tee build_probe_output.txt
+          ./ios-poc/build_probe.sh 2>&1 | tee build_probe_output.txt
           exit ${PIPESTATUS[0]}
 
       - name: Dump entitlements of built app
         if: always()
         run: |
-          echo "=== 签名后 entitlements ===" | tee -a build_probe_output.txt
-          codesign -d --entitlements :- build/Payload/TouchProbe.app 2>&1 | tee -a build_probe_output.txt || true
-          echo "=== IPA 内容 ===" | tee -a build_probe_output.txt
-          unzip -l build/TouchProbe-C.ipa 2>&1 | tee -a build_probe_output.txt || true
+          echo "=== 签名后 entitlements ==="
+          codesign -d --entitlements :- ios-poc/build/Payload/TouchProbe.app 2>&1 || true
+          echo "=== IPA 内容 ==="
+          unzip -l ios-poc/build/TouchProbe-C.ipa 2>&1 || true
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: TouchProbe
-          path: build/TouchProbe-C.ipa
+          path: ios-poc/build/TouchProbe-C.ipa
           if-no-files-found: error
 
       - name: Upload build log on failure
@@ -57,10 +57,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="probe-${{ github.run_number }}"
-          gh release create "$TAG" build/TouchProbe-C.ipa \
+          gh release create "$TAG" ios-poc/build/TouchProbe-C.ipa \
             --title "TouchProbe $TAG" \
             --notes "触控注入能力探针。TrollStore 安装时请勾选 Install as System App。" || \
-          gh release upload "$TAG" build/TouchProbe-C.ipa --clobber
+          gh release upload "$TAG" ios-poc/build/TouchProbe-C.ipa --clobber
 
       - name: Print direct links
         if: success()
