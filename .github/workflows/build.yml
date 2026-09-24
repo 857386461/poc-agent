@@ -25,6 +25,15 @@ jobs:
           ./build.sh 2>&1 | tee build_output.txt
           exit ${PIPESTATUS[0]}
 
+      - name: Upload IPA artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: PoCAgent-both
+          path: |
+            build/PoCAgent.ipa
+            build/PoCAgent-B.ipa
+          if-no-files-found: error
+
       - name: Upload build log on failure
         if: failure()
         env:
@@ -36,27 +45,21 @@ jobs:
             --notes "编译失败时的完整日志，供远程分析" || \
           gh release upload "$TAG" build_output.txt --clobber || true
 
-      - name: Upload IPA artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: PoCAgent.ipa
-          path: build/PoCAgent.ipa
-          if-no-files-found: error
-
       # 生成公开直链：手机 Safari 打开后可直接分享到 TrollStore 安装
-      - name: Create Release with direct download link
+      - name: Create Release with direct download links
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="build-${{ github.run_number }}"
-          gh release create "$TAG" build/PoCAgent.ipa \
+          gh release create "$TAG" build/PoCAgent.ipa build/PoCAgent-B.ipa \
             --title "PoCAgent $TAG" \
-            --notes "自动构建产物。手机 Safari 打开下方 IPA 直链，选择分享到 TrollStore 即可安装。" || \
-          gh release upload "$TAG" build/PoCAgent.ipa --clobber
+            --notes "自动构建产物。PoCAgent.ipa=含no-sandbox(需Install as System App)；PoCAgent-B.ipa=无no-sandbox(普通安装可启动)。" || \
+          gh release upload "$TAG" build/PoCAgent.ipa build/PoCAgent-B.ipa --clobber
 
-      - name: Print direct link
+      - name: Print direct links
         run: |
           echo "===== IPA 下载直链 ====="
-          echo "https://github.com/${{ github.repository }}/releases/download/build-${{ github.run_number }}/PoCAgent.ipa"
+          echo "A版(含no-sandbox): https://github.com/${{ github.repository }}/releases/download/build-${{ github.run_number }}/PoCAgent.ipa"
+          echo "B版(无no-sandbox): https://github.com/${{ github.repository }}/releases/download/build-${{ github.run_number }}/PoCAgent-B.ipa"
           echo ""
           echo "（也可以在本页底部 Artifacts 区域下载）"
