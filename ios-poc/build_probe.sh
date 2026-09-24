@@ -7,7 +7,10 @@
 set -euo pipefail
 set -x
 
-cd "$(dirname "$0")"
+# 切换到脚本所在目录（workflow 可能从仓库根目录调用）
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "${SCRIPT_DIR}"
+echo "==> 工作目录: $(pwd)"
 
 SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
 CC="$(xcrun --sdk iphoneos --find clang)"
