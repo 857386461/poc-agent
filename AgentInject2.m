@@ -245,7 +245,30 @@ static void *gMonClient = NULL;
 
 static void AISetupMonitor(CFRunLoopRef rl) {
     AILog(@"==== [2] HID monitor 回环 ====");
-    if (!gClientType || !gSetCb || !gSchedule) { AILog(@"  符号不全，跳过 monitor"); return; }
+
+    // iOS 16.1.2 实测：IOHIDEventSystemClientSetEventCallback 不导出。
+    // 这里扫描一批候选名，找出本系统真正可用的回调注册 API —— 这本身就是要的答案之一。
+    const char *cands[] = {
+        "IOHIDEventSystemClientSetEventCallback",
+        "IOHIDEventSystemClientSetEventCallbackWithType",
+        "IOHIDEventSystemClientRegisterEventCallback",
+        "_IOHIDEventSystemClientSetEventCallback",
+        "IOHIDEventSystemClientSetEventCallbackAndDispatchQueue",
+        "IOHIDEventSystemClientSetDispatchQueue",   // 2 参，不能当回调 setter 用，只探测
+    };
+    const char *used = NULL;
+    for (int i = 0; i < 6; i++) {
+        void *q = dlsym(RTLD_DEFAULT, cands[i]);
+        AILog(@"  候选 %-52s -> %@", cands[i], q ? @"命中" : @"—");
+        if (q && !used && i != 5) { gSetCb = (F_SetCb)q; used = cands[i]; }
+    }
+    if (!used) {
+        AILog(@"  无可用回调注册 API → monitor 判据不可用，只剩 sendEvent hook 判据");
+        return;
+    }
+    AILog(@"  采用回调 API: %s", used);
+
+    if (!gClientType || !gSchedule) { AILog(@"  client/schedule 符号不全，跳过 monitor"); return; }
     @try {
         gMonClient = gClientType(kCFAllocatorDefault, 2 /*Monitor*/, NULL);
         AILog(@"  CreateWithType(Monitor) -> %@", gMonClient ? @"OK" : @"NULL");
@@ -471,7 +494,7 @@ static void AIHidMatrix(CFRunLoopRef rl) {
                     if (gSetSender) @try { gSetSender(ev, 0x4001ULL); } @catch (id e) {}
                     gDispatch(cl[ci].client, ev);
                     CFRelease(ev);
-                    AIPump(rl, 0.12);
+                    AIPump(rl, 0.25);
                 }
             } @catch (NSException *e) { AILog(@"  [%s/%s] 异常 %@", cl[ci].name, fn[form], e); }
             int dm = gMonHits - m0, ds = gSendEventHits - s0;
@@ -483,6 +506,15 @@ static void AIHidMatrix(CFRunLoopRef rl) {
                 gBestTapForm = form;
             }
         }
+    }
+    // 统一复查：所有组合发完之后再等 1.5s，防止「事件延迟到达」被判成失败
+    int sAll = gSendEventHits, mAll = gMonHits;
+    AIPump(rl, 1.5);
+    AILog(@"  【统一复查】全部发完后再等 1.5s: sendEvent %d→%d (+%d), monitor %d→%d (+%d)",
+          sAll, gSendEventHits, gSendEventHits - sAll, mAll, gMonHits, gMonHits - mAll);
+    if (gSendEventHits - sAll > 0 && !gBestClient) {
+        gBestClient = cl[0].client; gBestTap = 1;
+        AILog(@"     ↑ 复查阶段才收到，说明事件有延迟：HID 通道实际可用");
     }
     AILog(@"  屏幕 %.0fx%.0f scale=%.1f 测试点(%.0f,%.0f)", scr.width, scr.height, scale, sx, sy);
 }
@@ -768,6 +800,18 @@ static UIWindow *gOverlayWindow = nil;
 @interface AIReportTarget : NSObject
 @end
 @implementation AIReportTarget
+- (void)copyTail:(id)sender {
+    @try {
+        [gLogLock lock]; NSString *t = [gLog copy]; [gLogLock unlock];
+        NSArray *lines = [t componentsSeparatedByString:@"\n"];
+        NSArray *tail = ([lines count] > 25) ? [lines subarrayWithRange:NSMakeRange([lines count] - 25, 25)] : lines;
+        NSString *short1 = [NSString stringWithFormat:@"AI2 结论 tap=%d shot=%d se=%d mon=%d\n---\n%@",
+                            gBestTap, gBestShot, gSendEventHits, gMonHits,
+                            [tail componentsJoinedByString:@"\n"]];
+        [UIPasteboard generalPasteboard].string = short1;
+        AILog(@"已复制结论（%lu 字符）", (unsigned long)short1.length);
+    } @catch (NSException *e) { AILog(@"复制异常 %@", e); }
+}
 - (void)copyReport:(id)sender {
     @try {
         [gLogLock lock]; NSString *t = [gLog copy]; [gLogLock unlock];
@@ -793,7 +837,7 @@ static AIReportTarget *gRT = nil;
 //   上一版它是局部变量，makeKeyAndVisible 后 ARC 立刻释放，窗口活不下来
 //   —— 这就是「注入了但什么都没出现」最可能的原因。
 
-static void AIShowOverlayText(NSString *txt, BOOL done) {
+static void AIShowOverlayText(NSString *txt, BOOL done, NSString *banner) {
     if (gIsSpringBoard) { AILog(@"SpringBoard 进程，跳过盖屏"); return; }
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
@@ -808,26 +852,50 @@ static void AIShowOverlayText(NSString *txt, BOOL done) {
             UIView *root = [[UIView alloc] initWithFrame:f];
             root.backgroundColor = [UIColor blackColor];
 
-            // 顶部条
+            CGFloat top = 44;
+            if (banner) {
+                // 结论横幅：放最顶部，大字，一眼能看到，不用滚
+                UILabel *bl = [[UILabel alloc] initWithFrame:CGRectMake(6, 2, f.size.width - 12, 40)];
+                bl.textColor = [UIColor whiteColor];
+                bl.backgroundColor = [UIColor redColor];
+                bl.font = [UIFont boldSystemFontOfSize:15];
+                bl.textAlignment = NSTextAlignmentCenter;
+                bl.numberOfLines = 2;
+                bl.text = banner;
+                [root addSubview:bl];
+                top = 46;
+            }
+
             if (done) {
                 if (!gRT) gRT = [AIReportTarget new];
-                UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-                b.frame = CGRectMake(8, 2, 150, 40);
-                b.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
-                [b setTitle:@"📋 复制报告" forState:UIControlStateNormal];
-                [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-                b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-                [b addTarget:gRT action:@selector(copyReport:) forControlEvents:UIControlEventTouchUpInside];
-                [root addSubview:b];
+                UIButton *b1 = [UIButton buttonWithType:UIButtonTypeSystem];
+                b1.frame = CGRectMake(6, top, 150, 38);
+                b1.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
+                [b1 setTitle:@"复制结论(短)" forState:UIControlStateNormal];
+                [b1 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+                b1.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+                [b1 addTarget:gRT action:@selector(copyTail:) forControlEvents:UIControlEventTouchUpInside];
+                [root addSubview:b1];
+
+                UIButton *b2 = [UIButton buttonWithType:UIButtonTypeSystem];
+                b2.frame = CGRectMake(162, top, 150, 38);
+                b2.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
+                [b2 setTitle:@"复制全文(长)" forState:UIControlStateNormal];
+                [b2 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+                b2.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+                [b2 addTarget:gRT action:@selector(copyReport:) forControlEvents:UIControlEventTouchUpInside];
+                [root addSubview:b2];
+                top += 42;
             } else {
-                UILabel *h = [[UILabel alloc] initWithFrame:CGRectMake(8, 2, f.size.width - 16, 40)];
+                UILabel *h = [[UILabel alloc] initWithFrame:CGRectMake(8, top, f.size.width - 16, 36)];
                 h.textColor = [UIColor yellowColor];
                 h.font = [UIFont boldSystemFontOfSize:13];
                 h.text = @"AgentInject2 已加载 · 正在自检…";
                 [root addSubview:h];
+                top += 40;
             }
 
-            UIScrollView *sv = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 44, f.size.width, f.size.height - 44)];
+            UIScrollView *sv = [[UIScrollView alloc] initWithFrame:CGRectMake(0, top, f.size.width, f.size.height - top)];
             sv.backgroundColor = [UIColor blackColor];
             UILabel *lb = [[UILabel alloc] initWithFrame:CGRectMake(8, 8, f.size.width - 16, 0)];
             lb.numberOfLines = 0;
@@ -850,7 +918,9 @@ static void AIShowOverlayText(NSString *txt, BOOL done) {
 
 static void AIShowOverlay(void) {
     [gLogLock lock]; NSString *txt = [gLog copy]; [gLogLock unlock];
-    AIShowOverlayText(txt, YES);
+    NSString *banner = [NSString stringWithFormat:@"AI2 结论 tap=%d shot=%d se=%d mon=%d",
+                        gBestTap, gBestShot, gSendEventHits, gMonHits];
+    AIShowOverlayText(txt, YES, banner);
 }
 
 // ---------------------------------------------------------------------------
@@ -863,7 +933,7 @@ static void AIBoot(void) {
     AILog(@"boot 触发来源: %@", gBootSrc);
     // 一进来就先盖一层「已加载」，让你立刻能确认 dylib 到底跑没跑；
     // 自检跑完再刷新成完整报告（带复制按钮）。
-    AIShowOverlayText(@"AgentInject2 已加载 ✓\n正在自检，请稍候…", NO);
+    AIShowOverlayText(@"AgentInject2 已加载 ✓\n正在自检，请稍候…", NO, nil);
 
     @try { AIEnv(); }          @catch (NSException *e) { AILog(@"env 异常 %@", e); }
     @try { AIHookSendEvent(); } @catch (NSException *e) { AILog(@"hook 异常 %@", e); }
@@ -883,7 +953,7 @@ static void AIBoot(void) {
                 int s0 = gSendEventHits;
                 CGSize s = [UIScreen mainScreen].bounds.size;
                 BOOL ok = AITapInProcess(CGPointMake(s.width * 0.5, s.height * 0.5));
-                usleep(200000);
+                usleep(500000);
                 AILog(@"  AITapInProcess -> %@ sendEvent+%d", ok ? @"已投递" : @"失败", gSendEventHits - s0);
                 if (gSendEventHits - s0 > 0 && gBestTap == 0) { gBestTap = 2; AILog(@"  ↑ 选定为进程内 UIKit 通道"); }
             } @catch (NSException *e) { AILog(@"inproc 异常 %@", e); }
