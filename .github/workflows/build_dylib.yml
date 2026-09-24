@@ -3,6 +3,11 @@ name: Build AgentInject dylib
 on:
   workflow_dispatch:
 
+# 必须显式声明：GITHUB_TOKEN 默认是只读，否则 gh release create 会失败
+# （老坑：产物编译 OK 但发布失败，而 artifact 在沙箱里从 Azure blob 下载不到）
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-latest
