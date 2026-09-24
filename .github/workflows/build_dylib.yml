@@ -1,0 +1,46 @@
+name: Build AgentInject dylib
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build dylib
+        id: b
+        run: |
+          set -o pipefail
+          chmod +x ios-poc/build_dylib.sh
+          bash ios-poc/build_dylib.sh 2>&1 | tee /tmp/dylib_build.txt
+          echo "BUILD_OK_MARK=$(grep -c BUILD_OK /tmp/dylib_build.txt)" >> $GITHUB_OUTPUT
+
+      - name: Upload dylib
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AgentInject.dylib
+          path: ios-poc/build/AgentInject.dylib
+
+      - name: Publish release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="dylib-${{ github.run_number }}"
+          gh release create "$TAG" \
+            ios-poc/build/AgentInject.dylib \
+            ios-poc/build/AgentInject.zip \
+            --title "AgentInject dylib $TAG" \
+            --notes "TrollFools 注入用：下载 AgentInject.zip → 解压出 AgentInject.dylib → TrollFools 选择 App 注入"
+
+      - name: Upload build log on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="dyliblog-${{ github.run_number }}"
+          cp /tmp/dylib_build.txt ./build_log.txt || true
+          gh release create "$TAG" ./build_log.txt --title "Build log $TAG" --notes "编译失败日志" || true
