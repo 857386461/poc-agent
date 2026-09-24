@@ -29,8 +29,9 @@ mkdir -p build
 build_variant() {
     local ENT="$1"
     local SUFFIX="$2"
-    local APP_DIR="build/Payload${SUFFIX}/PoCAgent.app"
+    local APP_DIR="build/Payload/PoCAgent.app"
 
+    rm -rf build/Payload
     mkdir -p "${APP_DIR}"
 
     echo "==> 编译 PoCAgent${SUFFIX}"
@@ -52,8 +53,8 @@ build_variant() {
     echo "==> 签名（entitlements: ${ENT}）"
     codesign -f -s - --entitlements "${ENT}" "${APP_DIR}"
 
-    echo "==> 打包 PoCAgent${SUFFIX}.ipa"
-    ( cd "build/Payload${SUFFIX}" && zip -qry "../PoCAgent${SUFFIX}.ipa" PoCAgent.app )
+    echo "==> 打包 PoCAgent${SUFFIX}.ipa（保留 Payload/ 前缀）"
+    ( cd build && zip -qry "PoCAgent${SUFFIX}.ipa" Payload )
 }
 
 build_variant ent.plist ""
