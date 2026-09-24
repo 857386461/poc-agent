@@ -89,6 +89,9 @@ static NSString *gBase     = nil;   // 控制服务器地址（可运行时覆�
 static BOOL gBooted = NO;
 static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的（排障用）
 
+// 前向声明：sendEvent hook 里要在定义之前调用 AIBoot
+static void AIBoot(void);
+
 // ---------------------------------------------------------------------------
 // 2. HID 私有符号（全部 dlsym，不做链接期依赖）
 // ---------------------------------------------------------------------------
@@ -758,6 +761,8 @@ static void AINetLoop(void) {
 // ---------------------------------------------------------------------------
 // 13. 盖屏报告
 // ---------------------------------------------------------------------------
+static UIWindow *gOverlayWindow = nil;
+
 // 复制按钮的 target：把整份报告塞进系统剪贴板，用户直接粘贴回来，
 // 不用手打、也不依赖截图能不能传过来。
 @interface AIReportTarget : NSObject
@@ -787,7 +792,6 @@ static AIReportTarget *gRT = nil;
 // ★ 关键修复：UIWindow 必须用 static 强引用持有。
 //   上一版它是局部变量，makeKeyAndVisible 后 ARC 立刻释放，窗口活不下来
 //   —— 这就是「注入了但什么都没出现」最可能的原因。
-static UIWindow *gOverlayWindow = nil;
 
 static void AIShowOverlayText(NSString *txt, BOOL done) {
     if (gIsSpringBoard) { AILog(@"SpringBoard 进程，跳过盖屏"); return; }
