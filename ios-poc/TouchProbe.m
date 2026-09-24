@@ -35,6 +35,7 @@ static NSMutableString *gLog     = nil;
 static void TPLog(NSString *line) {
     NSLog(@"[PROBE] %@", line);
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (!gLog) gLog = [NSMutableString string];   // 惰性初始化（向 nil append 是静默 no-op，日志会无声丢失）
         @synchronized (gLog) {
             [gLog appendString:line];
             [gLog appendString:@"\n"];
