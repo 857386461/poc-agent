@@ -1,0 +1,51 @@
+name: Build AgentInject2 dylib
+
+on:
+  workflow_dispatch:
+
+# 必须显式声明：GITHUB_TOKEN 默认是只读，否则 gh release create 会失败
+# （老坑：产物编译 OK 但发布失败，而 artifact 在沙箱里从 Azure blob 下载不到）
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build dylib
+        id: b
+        run: |
+          set -o pipefail
+          chmod +x build_inject2.sh
+          bash build_inject2.sh 2>&1 | tee /tmp/dylib_build.txt
+          echo "BUILD_OK_MARK=$(grep -c BUILD_OK /tmp/dylib_build.txt)" >> $GITHUB_OUTPUT
+
+      - name: Upload dylib
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AgentInject2.dylib
+          path: build/AgentInject2.dylib
+
+      - name: Publish release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="inject2-${{ github.run_number }}"
+          gh release create "$TAG" \
+            build/AgentInject2.dylib \
+            build/AgentInject2.zip \
+            --title "AgentInject2 dylib $TAG" \
+            --notes "TrollFools 注入用：下载 AgentInject2.zip → 解压出 .dylib → TrollFools 选择 App 注入 → 打开 App 等 8 秒 → 看盖屏自检报告"
+
+      - name: Upload build log on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="inject2log-${{ github.run_number }}"
+          cp /tmp/dylib_build.txt ./build_log.txt || true
+          gh release create "$TAG" ./build_log.txt --title "Build log $TAG" --notes "编译失败日志" || true

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- 允许获取其他进程的 task port：整个注入链路的核心 -->
+    <key>com.apple.system-task-ports</key>
+    <true/>
+
+    <!-- 允许调试器附加，便于排查 -->
+    <key>get-task-allow</key>
+    <true/>
+</dict>
+</plist>

@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- ===== 以下为 ent_c 原样保留（PoCAgent C 版已验证可用） ===== -->
+    <key>com.apple.system-task-ports</key>
+    <true/>
+    <key>com.apple.system-task-ports.read</key>
+    <true/>
+    <key>get-task-allow</key>
+    <true/>
+    <key>com.apple.private.security.no-sandbox</key>
+    <true/>
+    <key>platform-application</key>
+    <true/>
+    <key>com.apple.private.skip-library-validation</key>
+    <true/>
+
+    <!-- ===== 以下为 ent_d 新增（针对「模拟点击 + 截图」） ===== -->
+
+    <!-- 1. 无沙盒 + platform-application 组合下，访问自己的数据容器需要这个
+           （TrollStore 官方 README 明确点名） -->
+    <key>com.apple.private.security.storage.AppDataContainers</key>
+    <true/>
+
+    <!-- 2. HID 事件投递：让 IOHIDEventSystemClientDispatchEvent 真正生效 -->
+    <key>com.apple.private.hid.client.event-dispatch</key>
+    <true/>
+
+    <!-- 3. HID 事件监听（后续做「读取真实触摸/按键」时用） -->
+    <key>com.apple.private.hid.client.event-monitor</key>
+    <true/>
+
+    <!-- 4. platform-application 会让 IOKit 收得更紧，官方建议为每个
+           需要访问的 IOKit user client class 申请例外 -->
+    <key>com.apple.security.exception.iokit-user-client-class</key>
+    <array>
+        <string>IOHIDLibUserClient</string>
+        <string>IOHIDEventServiceUserClient</string>
+        <string>AppleHIDEventService</string>
+    </array>
+
+    <!-- 5. 后续「让手机自己打开目标 App」需要 -->
+    <key>com.apple.springboard.launchapplications</key>
+    <true/>
+</dict>
+
+</plist>
