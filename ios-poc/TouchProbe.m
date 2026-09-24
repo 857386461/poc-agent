@@ -361,60 +361,120 @@ static void TP_RunAll(void) {
     self.title = @"Touch Probe";
     self.view.backgroundColor = [UIColor systemBackgroundColor];
 
-    gLogView = [[UITextView alloc] initWithFrame:CGRectZero];
-    gLogView.font = [UIFont monospacedSystemFontOfSize:10.0 weight:UIFontWeightRegular];
-    gLogView.editable = NO;
-    gLogView.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:gLogView];
+    // ------------------------------------------------------------------
+    // 布局策略：全部用 frame 手工摆放，完全避开 Auto Layout。
+    // 原因：上一版用约束且按钮缺高度约束，在部分机型上会产生约束冲突，
+    //      导致按钮点击区域被压成 0 —— 表现为「点了没反应」。
+    //      另外把按钮放在最上层（最后添加），避免被其他视图盖住。
+    // ------------------------------------------------------------------
+    CGRect screen = [UIScreen mainScreen].bounds;
+    CGFloat W = screen.width;
+    CGFloat H = screen.height;
+    CGFloat pad = 10.0;
+    BOOL isPad = (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad);
 
-    // 对照组视图：铺满下半屏，探测真实触摸是否到达
-    gProbeView = [[TPProbeView alloc] initWithFrame:CGRectZero];
-    gProbeView.backgroundColor = [UIColor colorWithRed:0.12 green:0.30 blue:0.55 alpha:1.0];
-    gProbeView.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:gProbeView];
+    if (isPad) {
+        // iPad 上给个居中卡片，避免元素被拉得过宽
+        W = MIN(screen.width, 560.0);
+        pad = (screen.width - W) / 2.0;
+    }
 
-    UILabel *hint = [[UILabel alloc] initWithFrame:CGRectZero];
-    hint.text = @"蓝色区域 = 触摸对照区（真实触摸会打印坐标）";
-    hint.font = [UIFont systemFontOfSize:11.0];
-    hint.textColor = [UIColor whiteColor];
-    hint.translatesAutoresizingMaskIntoConstraints = NO;
-    [gProbeView addSubview:hint];
+    CGFloat btnH = 50.0;
+    CGFloat y = 44.0 + 20.0;           // 导航栏 + 间距
+    CGFloat probeH = 150.0;
 
+    // 1) 按钮（最先创建、最后置顶）
     UIButton *runButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [runButton setTitle:@"开始探针" forState:UIControlStateNormal];
-    runButton.titleLabel.font = [UIFont boldSystemFontOfSize:16.0];
-    runButton.translatesAutoresizingMaskIntoConstraints = NO;
+    runButton.frame = CGRectMake(pad, y, W - pad * 2.0, btnH);
+    [runButton setTitle:@"▶  开始探针" forState:UIControlStateNormal];
+    runButton.titleLabel.font = [UIFont boldSystemFontOfSize:18.0];
+    runButton.backgroundColor = [UIColor colorWithRed:0.0 green:0.478 blue:1.0 alpha:1.0];
+    [runButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    runButton.layer.cornerRadius = 10.0;
+    runButton.tag = 9001;
     [runButton addTarget:self action:@selector(runProbe) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:runButton];
 
-    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
-    [NSLayoutConstraint activateConstraints:@[
-        [runButton.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8.0],
-        [runButton.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+    y = CGRectGetMaxY(runButton.frame) + 10.0;
 
-        [gLogView.topAnchor constraintEqualToAnchor:runButton.bottomAnchor constant:8.0],
-        [gLogView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:8.0],
-        [gLogView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-8.0],
-        [gLogView.heightAnchor constraintEqualToConstant:340.0],
+    // 2) 日志视图
+    CGFloat logH = H - y - probeH - pad - 20.0;
+    if (logH < 160.0) logH = 160.0;
+    gLogView = [[UITextView alloc] initWithFrame:CGRectMake(pad, y, W - pad * 2.0, logH)];
+    gLogView.font = [UIFont monospacedSystemFontOfSize:10.0 weight:UIFontWeightRegular];
+    gLogView.editable = NO;
+    gLogView.backgroundColor = [UIColor colorWithRed:0.96 green:0.96 blue:0.97 alpha:1.0];
+    gLogView.layer.cornerRadius = 8.0;
+    gLogView.textContainerInset = UIEdgeInsetsMake(8, 8, 8, 8);
+    [self.view addSubview:gLogView];
 
-        [gProbeView.topAnchor constraintEqualToAnchor:gLogView.bottomAnchor constant:8.0],
-        [gProbeView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:8.0],
-        [gProbeView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-8.0],
-        [gProbeView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-8.0],
+    y = CGRectGetMaxY(gLogView.frame) + 10.0;
 
-        [hint.centerXAnchor constraintEqualToAnchor:gProbeView.centerXAnchor],
-        [hint.centerYAnchor constraintEqualToAnchor:gProbeView.centerYAnchor],
-    ]];
+    // 3) 触摸对照区
+    CGFloat probeActualH = H - y - pad - 24.0;
+    if (probeActualH < 80.0) probeActualH = 80.0;
+    gProbeView = [[TPProbeView alloc] initWithFrame:CGRectMake(pad, y, W - pad * 2.0, probeActualH)];
+    gProbeView.backgroundColor = [UIColor colorWithRed:0.12 green:0.30 blue:0.55 alpha:1.0];
+    gProbeView.layer.cornerRadius = 8.0;
+    [self.view addSubview:gProbeView];
+
+    UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, gProbeView.frame.size.width, 40.0)];
+    hint.text = @"蓝色区域 = 触摸对照区\n手指点它，日志会打印坐标";
+    hint.numberOfLines = 2;
+    hint.textAlignment = NSTextAlignmentCenter;
+    hint.font = [UIFont systemFontOfSize:11.0];
+    hint.textColor = [UIColor whiteColor];
+    hint.center = CGPointMake(gProbeView.frame.size.width / 2.0,
+                              gProbeView.frame.size.height / 2.0);
+    [gProbeView addSubview:hint];
+
+    // 4) 把按钮提到最上层，确保一定可点
+    [self.view bringSubviewToFront:runButton];
 
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(runProbe)
                                                  name:@"TPRunNotification"
                                                object:nil];
 
-    TPLog(@"就绪。点『开始探针』，或用 touchprobe://run 唤起。");
+    TPLog(@"就绪。点上方蓝色按钮『开始探针』，或用 touchprobe://run 唤起。");
+    TPLog([NSString stringWithFormat:@"屏幕 %.0f x %.0f，按钮位于 (%.0f, %.0f, %.0f x %.0f)",
+           W, H, runButton.frame.origin.x, runButton.frame.origin.y,
+           runButton.frame.size.width, runButton.frame.size.height]);
+
+    // ------------------------------------------------------------------
+    // 兜底 1：整屏长按手势 —— 即使按钮点不动，长按屏幕任意处也能触发
+    // ------------------------------------------------------------------
+    UILongPressGestureRecognizer *lp =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleLongPress:)];
+    lp.minimumPressDuration = 0.6;
+    lp.cancelsTouchesInView = NO;
+    [self.view addGestureRecognizer:lp];
+
+    // ------------------------------------------------------------------
+    // 兜底 2：启动后自动执行一次（等 1.2s 让界面显示出来）
+    // ------------------------------------------------------------------
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        TPLog(@"〔自动执行〕启动后自动运行探针，无需点击。");
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            TP_RunAll();
+        });
+    });
+}
+
+- (void)handleLongPress:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    TPLog(@"");
+    TPLog(@"■ 长按手势触发探针（按钮兜底通道）");
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        TP_RunAll();
+    });
 }
 
 - (void)runProbe {
+    // 立即给反馈：能打出这行说明按钮事件成功触达
+    TPLog(@"");
+    TPLog(@"■ 按钮已响应（事件触达正常），开始执行探针…");
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         TP_RunAll();
     });
