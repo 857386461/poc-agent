@@ -106,7 +106,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v14";
+static NSString * const kAIVer = @"v15";
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -844,6 +844,201 @@ static UIWindow *AIHostWindow(void) {
         if (w.rootViewController && w.rootViewController.view.window == w) return w;
     }
     return fallback ?: gOverlayWindow;
+}
+
+// ---------------------------------------------------------------------------
+// 7e. v15：rows / pick / picktxt —— 专治「表格行点不动」
+//
+//   v14 的 tapui 只对 UIControl 有效。但微信「发现」页每一行是 UITableViewCell，
+//   点击靠的是 UITableViewDelegate 的 tableView:didSelectRowAtIndexPath:，
+//   父链上一个 UIControl 都没有 —— tapui 直接哑火，界面纹丝不动（实测确认）。
+//   三条新指令把"看行"和"点行"补齐：
+//     rows    —— 列出屏幕上所有表格的可见行：行号、文本、【屏幕中心点】
+//                （有了它就不用再逐个 probe 猜坐标了）
+//     pick    —— 给屏幕坐标，找到那一行，直接调 delegate 的 didSelectRowAtIndexPath:
+//     picktxt —— 给文本，找到含该文本的行并选中（最省事，一步到位）
+// ---------------------------------------------------------------------------
+
+// 递归收集 view 里的可见文本（标签/输入框），用来判断这一行是不是我要找的
+static void AICollectTexts(UIView *v, NSMutableArray *a, int depth, int maxDepth) {
+    if (!v || depth > maxDepth || !v.window) return;
+    @try {
+        NSString *t = nil;
+        if ([v isKindOfClass:[UILabel class]])          t = ((UILabel *)v).text;
+        else if ([v isKindOfClass:[UITextView class]])  t = ((UITextView *)v).text;
+        else if ([v isKindOfClass:[UITextField class]]) t = ((UITextField *)v).text;
+        if (t.length) [a addObject:t];
+        for (UIView *s in v.subviews) AICollectTexts(s, a, depth + 1, maxDepth);
+    } @catch (id e) {}
+}
+
+static NSString *AITextsOf(UIView *v) {
+    NSMutableArray *a = [NSMutableArray array];
+    AICollectTexts(v, a, 0, 6);
+    return [a componentsJoinedByString:@" | "];
+}
+
+static void AIFindTVRec(UIView *v, NSMutableArray *out, int depth) {
+    if (!v || depth > 12) return;
+    @try {
+        if ([v isKindOfClass:[UITableView class]] && ![out containsObject:v]) [out addObject:v];
+        for (UIView *s in v.subviews) AIFindTVRec(s, out, depth + 1);
+    } @catch (id e) {}
+}
+
+static NSArray *AIVisibleTableViews(void) {
+    NSMutableArray *out = [NSMutableArray array];
+    for (UIWindow *w in AIAllWindows()) {
+        if (w == gOverlayWindow || w == gHudWindow) continue;
+        AIFindTVRec(w, out, 0);
+    }
+    return out;
+}
+
+// 【选中某一行】—— 表格行不是 UIControl，只能走 delegate
+static NSDictionary *AIPickCellIn(UITableViewCell *cell, NSMutableDictionary *d) {
+    d[@"cell"]      = NSStringFromClass([cell class]);
+    d[@"cellFrame"] = NSStringFromCGRect([cell convertRect:cell.bounds toView:nil]);
+    d[@"cellText"]  = AITextsOf(cell);
+
+    // 1) 找这块 cell 属于哪个 tableView
+    UITableView *tv = nil;
+    UIView *p = cell.superview; int up = 0;
+    while (p && up < 15) {
+        if ([p isKindOfClass:[UITableView class]]) { tv = (UITableView *)p; break; }
+        p = p.superview; up++;
+    }
+    if (!tv) {   // 兜底：微信有些容器把 cell 挂在别的层级下，全局扫一遍
+        for (UITableView *t in AIVisibleTableViews()) {
+            if ([[t visibleCells] containsObject:cell]) { tv = t; break; }
+        }
+    }
+    if (!tv) { d[@"ok"] = @NO; d[@"err"] = @"找不到 cell 所属的 TableView"; return d; }
+    d[@"tv"] = NSStringFromClass([tv class]);
+
+    // 2) 拿 indexPath
+    NSIndexPath *ip = nil;
+    @try { ip = [tv indexPathForCell:cell]; } @catch (id e) {}
+    if (!ip) { d[@"ok"] = @NO; d[@"err"] = @"indexPathForCell 返回 nil"; return d; }
+    d[@"row"] = @(ip.row); d[@"section"] = @(ip.section);
+
+    // 3) 调 delegate 的 didSelectRowAtIndexPath:（这才是"点中这一行"的真正入口）
+    id dlg = nil;
+    @try { dlg = tv.delegate; } @catch (id e) {}
+    d[@"delegate"] = dlg ? NSStringFromClass([dlg class]) : @"(nil)";
+
+    SEL sel = @selector(tableView:didSelectRowAtIndexPath:);
+    BOOL called = NO;
+    if (dlg && [dlg respondsToSelector:sel]) {
+        @try {
+            NSMethodSignature *sig = [dlg methodSignatureForSelector:sel];
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            inv.selector = sel;
+            __unsafe_unretained UITableView *tvArg = tv;
+            __unsafe_unretained NSIndexPath *ipArg = ip;
+            [inv setArgument:&tvArg atIndex:2];
+            [inv setArgument:&ipArg atIndex:3];
+            [inv invokeWithTarget:dlg];
+            called = YES;
+        } @catch (NSException *e) { d[@"invokeErr"] = e.reason ?: @"?"; }
+    }
+    if (!called) {   // 兜底：少数页面靠 selectRow 自己转发
+        @try {
+            [tv selectRowAtIndexPath:ip animated:NO scrollPosition:UITableViewScrollPositionNone];
+            called = YES;
+            d[@"how"] = @"selectRowAtIndexPath 兜底";
+        } @catch (id e) {}
+    }
+    if (!d[@"how"]) d[@"how"] = called ? @"delegate didSelectRowAtIndexPath" : @"两种都没调到";
+    d[@"ok"] = @(called);
+    return d;
+}
+
+// 按屏幕坐标选中一行（父链上有 UIControl 就沿用 v14 的 sendActions）
+static NSDictionary *AIPickAt(CGPoint pt) {
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"pt"] = [NSString stringWithFormat:@"(%.0f,%.0f)", pt.x, pt.y];
+    UIWindow *w = AIHostWindow();
+    if (!w) { d[@"ok"] = @NO; d[@"err"] = @"无 window"; return d; }
+    id hit = nil;
+    @try { hit = [w hitTest:pt withEvent:nil]; } @catch (id e) {}
+    UIView *v = (UIView *)hit;
+    if (!v) { d[@"ok"] = @NO; d[@"err"] = @"hitTest nil"; return d; }
+    d[@"hit"] = NSStringFromClass([v class]);
+
+    UIControl *c = nil; UIView *p = v; int up = 0;
+    while (p && up < 12) {
+        if ([p isKindOfClass:[UIControl class]]) { c = (UIControl *)p; break; }
+        p = p.superview; up++;
+    }
+    if (c) {   // 按钮场景：沿用 v14 已验证可靠的路子
+        int a0 = gActionHits;
+        @try { [c sendActionsForControlEvents:UIControlEventTouchUpInside]; } @catch (id e) {}
+        d[@"how"] = @"UIControl sendActions";
+        d[@"ctrl"] = NSStringFromClass([c class]);
+        d[@"dact"] = @(gActionHits - a0);
+        d[@"ok"]   = @(gActionHits - a0 > 0);
+        return d;
+    }
+
+    UITableViewCell *cell = nil; p = v; up = 0;
+    while (p && up < 12) {
+        if ([p isKindOfClass:[UITableViewCell class]]) { cell = (UITableViewCell *)p; break; }
+        p = p.superview; up++;
+    }
+    if (!cell) { d[@"ok"] = @NO; d[@"err"] = @"这条父链上既无 UIControl 也无 Cell"; return d; }
+    return AIPickCellIn(cell, d);
+}
+
+// 列出屏幕上所有可见表格行（含文本和屏幕中心点）——省掉逐个 probe 的往返
+static NSString *AIRowsInfo(void) {
+    NSMutableArray *lines = [NSMutableArray array];
+    for (UITableView *tv in AIVisibleTableViews()) {
+        NSArray *cells = nil;
+        @try { cells = [tv visibleCells]; } @catch (id e) {}
+        if (!cells.count) continue;
+        cells = [cells sortedArrayUsingComparator:^NSComparisonResult(UIView *a, UIView *b) {
+            CGFloat ya = CGRectGetMinY([a convertRect:a.bounds toView:nil]);
+            CGFloat yb = CGRectGetMinY([b convertRect:b.bounds toView:nil]);
+            if (ya < yb) return NSOrderedAscending;
+            if (ya > yb) return NSOrderedDescending;
+            return NSOrderedSame;
+        }];
+        [lines addObject:[NSString stringWithFormat:@"=== %@ (%lu 行可见) ===",
+                          NSStringFromClass([tv class]), (unsigned long)cells.count]];
+        for (UITableViewCell *c in cells) {
+            CGRect f = [c convertRect:c.bounds toView:nil];
+            NSIndexPath *ip = nil;
+            @try { ip = [tv indexPathForCell:c]; } @catch (id e) {}
+            [lines addObject:[NSString stringWithFormat:@"r%ld 中心(%.0f,%.0f) 框%@ 文本:%@",
+                              (long)(ip ? ip.row : -1),
+                              CGRectGetMidX(f), CGRectGetMidY(f),
+                              NSStringFromCGRect(f), AITextsOf(c)]];
+        }
+    }
+    return lines.count ? [lines componentsJoinedByString:@"\n"] : @"(屏幕上没有可见表格行)";
+}
+
+// 按文本选中一行：找到含该文本的最靠上的行
+static NSDictionary *AIPickByText(NSString *kw) {
+    NSMutableArray *cands = [NSMutableArray array];
+    for (UITableView *tv in AIVisibleTableViews()) {
+        for (UITableViewCell *c in [tv visibleCells]) {
+            NSString *t = AITextsOf(c);
+            if (t && [t rangeOfString:kw options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                if (![cands containsObject:c]) [cands addObject:c];
+            }
+        }
+    }
+    if (!cands.count) return @{@"ok": @NO, @"err": [@"没找到含文本的行: " stringByAppendingString:kw], @"cands": @0};
+    UITableViewCell *best = nil; CGFloat by = 1e9;
+    for (UITableViewCell *c in cands) {
+        CGFloat y = CGRectGetMinY([c convertRect:c.bounds toView:nil]);
+        if (y < by) { by = y; best = c; }
+    }
+    NSMutableDictionary *d = [AIPickCellIn(best, [NSMutableDictionary dictionary]) mutableCopy];
+    d[@"cands"] = @(cands.count);
+    return d;
 }
 
 // 诊断：把所有 window / scene 打出来，一眼看出到底有没有 App 自己的窗口
@@ -1847,6 +2042,26 @@ static void AIExecCmd(NSDictionary *cmd) {
         AILog(@"  [cmd] tapui (%.0f,%.0f) -> %@ %@", x, y, ok ? @"OK" : @"FAIL", desc ?: @"");
         AIReportDict(@{@"op": @"tapui", @"ok": @(ok), @"x": @(x), @"y": @(y),
                        @"desc": desc ?: @"", @"act": @(gActionHits)});
+    } else if ([op isEqualToString:@"rows"]) {
+        // v15：一眼看清屏幕上有哪些表格行 + 每行的屏幕中心点
+        __block NSString *s = @"(none)";
+        AIMainSync(^{ @try { s = AIRowsInfo(); } @catch (id e) {} });
+        AIReportDict(@{@"op": @"rows", @"ok": @YES, @"text": s});
+        AILog(@"  [cmd] rows -> %lu 行", (unsigned long)[s componentsSeparatedByString:@"\n"].count);
+    } else if ([op isEqualToString:@"pick"]) {
+        // v15：按坐标选中一行（表格行走 delegate，按钮走 sendActions）
+        CGFloat x = [cmd[@"x"] floatValue], y = [cmd[@"y"] floatValue];
+        __block NSDictionary *d = nil;
+        AIMainSync(^{ @try { d = AIPickAt(CGPointMake(x, y)); } @catch (id e) {} });
+        AILog(@"  [cmd] pick (%.0f,%.0f) -> %@", x, y, d);
+        AIReportDict(@{@"op": @"pick", @"x": @(x), @"y": @(y), @"info": d ?: @{@"err": @"pick 返回 nil"}});
+    } else if ([op isEqualToString:@"picktxt"]) {
+        // v15：按文本选中一行 —— 走位最省事的一条指令
+        NSString *kw = cmd[@"text"] ?: @"";
+        __block NSDictionary *d = nil;
+        AIMainSync(^{ @try { d = AIPickByText(kw); } @catch (id e) {} });
+        AILog(@"  [cmd] picktxt '%@' -> %@", kw, d);
+        AIReportDict(@{@"op": @"picktxt", @"text": kw, @"info": d ?: @{@"err": @"picktxt 返回 nil"}});
     } else if ([op isEqualToString:@"diag"]) {
         NSString *s = AINetDiag();
         gDiagText = s;
