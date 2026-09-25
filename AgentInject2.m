@@ -142,6 +142,10 @@ static void AIToast(NSString *txt);
 static void AISetHudVisible(BOOL vis);
 static void AIHudApply(void);
 static NSString *AITcpTest(const char *host, int port, double tmoSec);  // AINetLoop(~1656) 在定义(~1938)之前就要用
+// 这个坑已经栽了 4 次（v3/v5/v13x2）：C99 不允许隐式声明，
+// 在本文件里任何「定义在后面的 static 函数」被提前调用，都得在这里补一行声明。
+static void AISleep(double sec);                        // 7c 段在它定义之前调用
+static BOOL AIDispatchFakeViaSendEvent(CGPoint pt, int steps, double dt);
 
 // ---------------------------------------------------------------------------
 // 2. HID 私有符号（全部 dlsym，不做链接期依赖）
