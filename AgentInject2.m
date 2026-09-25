@@ -104,6 +104,8 @@ static UIWindow *gOverlayWindow = nil;
 
 // 前向声明：sendEvent hook 里要在定义之前调用 AIBoot
 static void AIBoot(void);
+// AITapInProcess（约 430 行）在 AIHostWindow 定义（约 580 行）之前就要用它
+static UIWindow *AIHostWindow(void);
 
 // ---------------------------------------------------------------------------
 // 2. HID 私有符号（全部 dlsym，不做链接期依赖）
