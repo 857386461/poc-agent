@@ -37,8 +37,12 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 
@@ -102,7 +106,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v11";
+static NSString * const kAIVer = @"v12";
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -1644,6 +1648,18 @@ static void AINetLoop(void) {
     if (gNetStarted) return;    // 幂等：早期先起一次网络，后面再调不会重复启动
     gNetStarted = YES;
     AILog(@"==== [6] 控制通道 ====");
+
+    // 开机先做一次裸 TCP 探测，结论直接写到状态条上 —— 不用等用户点任何按钮。
+    // 这样即使 NSURLSession 全程 -1009，我也能立刻知道 TCP 层到底通不通。
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            NSString *t1 = AITcpTest("49.233.240.214", 443, 6.0);
+            NSString *t2 = AITcpTest("220.181.38.148", 443, 6.0);
+            gDiagText = [NSString stringWithFormat:@"⓪裸TCP 中继%@ 百度%@", t1, t2];
+            AILog(@"  [0c] 裸 TCP 探测: 中继(%@) 百度(%@)", t1, t2);
+            AIHudApply();
+        }
+    });
     @try { AIStartServer(); AISleep(0.6); } @catch (NSException *e) { AILog(@"  服务启动异常 %@", e); }  // 等端口真正 bind 上再打印
     gBase = AIBase();
     gActiveBase = gBase;
@@ -1905,11 +1921,66 @@ static void AIToast(NSString *txt) {
                    dispatch_get_main_queue(), ^{ gToastText = nil; AIHudApply(); });
 }
 
-// 网络自检：四个目标各打一次，把结果写进 gDiagText 直接画在屏幕顶端。
+// ---------------------------------------------------------------------------
+// v12：原始 BSD socket 连通性测试
+//
+//   为什么必须有这个：真机实测所有 NSURLSession 请求都返回 -1009
+//   （"The Internet connection appears to be offline"），但这句话太笼统了 ——
+//   它既可能是「真的没网」，也可能是「沙箱不让这个 App 联网」，
+//   还可能是「只有 CFNetwork 被拦，裸 socket 反而能通」。
+//
+//   下面的测试用 connect() 直接连 IP:443，绕开 CFNetwork / TLS / ATS / 代理，
+//   只看 TCP 层能不能出去。三种结果对应三种完全不同的病因：
+//     ✅ TCP 能连上     -> 网络没问题，是 CFNetwork/ATS 被拦 -> 换裸 socket 发 HTTP 就完事
+//     ❌ 报 ERRNODEV/ENETDOWN -> 系统确实认为无网（或该 App 被禁网）
+//     ❌ 报 EHOSTUNREACH/ETIMEDOUT -> 网络可达但被中间设备阻断（热点限制/运营商）
+// ---------------------------------------------------------------------------
+static NSString *AITcpTest(const char *host, int port, double tmoSec) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return [NSString stringWithFormat:@"socket()=%d(%s)", errno, strerror(errno)];
+
+    // 非阻塞 + select 超时，避免卡死主线程
+    int fl = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port   = htons((uint16_t)port);
+    inet_pton(AF_INET, host, &a.sin_addr);
+
+    int r = connect(fd, (struct sockaddr *)&a, sizeof(a));
+    int saved = errno;
+    if (r == 0) { close(fd); return @"✅TCP已连"; }
+
+    if (saved == EINPROGRESS) {
+        fd_set wf; FD_ZERO(&wf); FD_SET(fd, &wf);
+        struct timeval tv; tv.tv_sec = (long)tmoSec; tv.tv_usec = 0;
+        int sel = select(fd + 1, NULL, &wf, NULL, &tv);
+        if (sel > 0) {
+            int soerr = 0; socklen_t l = sizeof(soerr);
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &l);
+            close(fd);
+            if (soerr == 0) return @"✅TCP已连";
+            return [NSString stringWithFormat:@"❌%d(%s)", soerr, strerror(soerr)];
+        }
+        close(fd);
+        return sel == 0 ? @"❌超时" : [NSString stringWithFormat:@"❌select=%d(%s)", errno, strerror(errno)];
+    }
+    close(fd);
+    return [NSString stringWithFormat:@"❌%d(%s)", saved, strerror(saved)];
+}
+
+// 网络自检：五个目标各打一次，把结果写进 gDiagText 直接画在屏幕顶端。
 // 这样「到底是一点网都没有、还是只有我们这个域名不通、还是 DNS 挂了」一目了然。
 static NSString *AINetDiag(void) {
     NSMutableString *s = [NSMutableString string];
     NSData *out = nil; NSError *e = nil; NSInteger code = 0; NSTimeInterval ms = 0;
+
+    // 0) 裸 socket：绕开 CFNetwork，只看 TCP 层
+    NSString *t1 = AITcpTest("49.233.240.214", 443, 6.0);
+    NSString *t2 = AITcpTest("220.181.38.148", 443, 6.0);   // 百度，对照组
+    [s appendFormat:@"⓪裸TCP 中继%@ 百度%@\n", t1, t2];
 
     // 1) 对照组：苹果官网。这个都不通 = 手机压根没网
     BOOL ok1 = AIHttpEx(@"https://www.apple.com/library/test/success.html", nil, 10.0,
