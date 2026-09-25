@@ -106,7 +106,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v12";
+static NSString * const kAIVer = @"v13";
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -547,8 +547,17 @@ static BOOL AITapInProcess(CGPoint pt) {
 @end
 
 @implementation AIFakeTouch
+// ★ v13：走 sendEvent 路径时 aiView 是 nil（UIKit 自己决定发给谁）。
+//   此时 aiPoint 存的是【window 坐标】，用它往目标 view 换算。
 - (CGPoint)locationInView:(UIView *)v {
-    if (!v || v == self.aiView) return self.aiPoint;
+    if (!v) return self.aiPoint;
+    if (!self.aiView) {
+        // aiPoint 是 window 坐标 —— 从 window 换算到 v
+        UIWindow *win = self.aiWindow ?: v.window;
+        if (win && v != win) return [win convertPoint:self.aiPoint toView:v];
+        return self.aiPoint;
+    }
+    if (v == self.aiView) return self.aiPoint;
     return [self.aiView convertPoint:self.aiPoint toView:v];
 }
 - (CGPoint)previousLocationInView:(UIView *)v          { return [self locationInView:v]; }
@@ -614,6 +623,95 @@ static BOOL AIDispatchFakeToView(UIView *target, CGPoint ptInTarget) {
         AILog(@"  分发异常: %@", ex.reason);
         return NO;
     }
+}
+
+// ---------------------------------------------------------------------------
+// 7c. v13：走 UIApplication.sendEvent: 的「正规」伪造触摸
+//
+//   为什么必须这么改（v12 的致命缺陷）：
+//     v12 是 hitTest 找到目标 view 后【直接调它的 touchesBegan:】。
+//     这跳过了 UIKit 完整的事件链路：
+//         UIApplication.sendEvent: → UIWindow.sendEvent:
+//           → hitTest → 【手势识别器链】 → 才轮到 view.touchesBegan:
+//     后果（真机上实测到的）：
+//       · 计数 se（sendEvent hook）永远是 0 —— 事件根本没经过 sendEvent
+//       · 微信 TabBar 点击无效、视图树 227 行一行不变
+//       · 只有那些「自己在 touchesBegan 里写逻辑」的视图（如自建的测试 view、
+//         以及部分游戏引擎的 UnityView）才有反应
+//
+//   正确做法：把伪造的 UIEvent 交给 UIApplication.sendEvent:，
+//   让 UIKit 自己去 hitTest、自己走手势识别、自己决定发给谁。
+//   这样 UITabBar / UIControl / 手势 才能正常响应。
+//
+//   注意：AIFakeTouch / AIFakeEvent 这两个子类不用改 —— 它们的 getter 覆盖
+//   本来就是完整的，UIKit 内部也是通过这些 getter 读值的。
+// ---------------------------------------------------------------------------
+static BOOL AISendFakeEventToApp(AIFakeTouch *t, AIFakeEvent *ev) {
+    UIApplication *app = [UIApplication sharedApplication];
+    if (!app) { AILog(@"    ❌ 无 UIApplication"); return NO; }
+    @try {
+        // 优先走 hook 前的原始实现，避免我们自己的 hook 递归。
+        // IMP 是函数指针不是对象，必须强转成正确签名再调。
+        if (gOrigSendEvent) {
+            ((void (*)(id, SEL, id))gOrigSendEvent)(app, @selector(sendEvent:), ev);
+            __sync_fetch_and_add(&gSendEventHits, 1);   // 手工补计数：绕过了 hook 自己
+            return YES;
+        }
+        [app sendEvent:ev];
+        return YES;
+    } @catch (NSException *e) {
+        AILog(@"    ❌ sendEvent 异常: %@", e.reason);
+        return NO;
+    }
+}
+
+// dt：给 UIKit 处理每一拍的时间，单位秒（必须泵 runloop，不能用 usleep —— 
+//     在后台线程 usleep 会让主线程没机会跑，事件永远不被处理）
+static BOOL AIDispatchFakeViaSendEvent(CGPoint screenPt, int steps, double dt) {
+    UIWindow *w = AIHostWindow();
+    if (!w) { AILog(@"    ❌ 无可用 window"); return NO; }
+
+    // 坐标一律用【window 坐标系】（sendEvent 之后 UIKit 自己按各 view 换算）
+    CGPoint p0 = screenPt;
+    if (w.bounds.size.height > 0 && screenPt.y <= w.bounds.size.height) p0 = screenPt;  // 已是 window 坐标
+
+    int seBefore = gSendEventHits;
+    int actBefore = gActionHits;
+
+    AIFakeTouch *t = [AIFakeTouch new];
+    t.aiWindow = w;
+    t.aiView   = nil;
+    t.aiTime   = [[NSDate date] timeIntervalSince1970];
+
+    AIFakeEvent *ev = [AIFakeEvent new];
+    NSSet *one = [NSSet setWithObject:t];
+    ev.aiTouches = one;
+    ev.aiTime    = t.aiTime;
+
+    // —— Began ——
+    t.aiPoint = p0;
+    t.aiPhase = UITouchPhaseBegan;
+    if (!AISendFakeEventToApp(t, ev)) return NO;
+    AISleep(dt);
+
+    // —— Moved（中间过程；很多手势识别器要求有移动轨迹才会触发）——
+    for (int i = 1; i <= steps; i++) {
+        t.aiPoint = p0;                 // 点击不位移，但补 Moved 让识别器「活」起来
+        t.aiPhase = UITouchPhaseMoved;
+        AISendFakeEventToApp(t, ev);
+        AISleep(dt);
+    }
+
+    // —— Ended ——
+    t.aiPoint = p0;
+    t.aiPhase = UITouchPhaseEnded;
+    AISendFakeEventToApp(t, ev);
+    AISleep(dt);
+
+    int dse = gSendEventHits - seBefore;
+    int dact = gActionHits - actBefore;
+    AILog(@"    sendEvent 路径: 进入 sendEvent %+d 次, sendAction %+d 次", dse, dact);
+    return (dse > 0);
 }
 
 // 让 runloop 转一会儿，给 UIKit 处理触摸的机会（别用 usleep 卡死主线程）
@@ -775,6 +873,20 @@ static BOOL AIFakeSwipe(CGPoint a, CGPoint b, int steps, double dur) {
 static void AIMainSync(void (^b)(void)) {
     if ([NSThread isMainThread]) b();
     else dispatch_sync(dispatch_get_main_queue(), b);
+}
+
+// 前向声明：AIDispatchFakeViaSendEvent 定义在 7c（~600 行），
+// 而 AIMainSyncBool 用在 AIExecCmd（~1600 行）—— 顺序没问题，
+// 但 AIMainSync 定义在 7b（~620 行）之后，这里补声明以防顺序调整。
+static BOOL AIMainSyncBool(BOOL (^b)(void));
+
+// 同上，但要拿回一个 BOOL 返回值（dispatch_sync 的 block 不能直接 return）
+static BOOL AIMainSyncBool(BOOL (^b)(void)) {
+    __block BOOL r = NO;
+    void (^w)(void) = ^{ r = b(); };
+    if ([NSThread isMainThread]) w();
+    else dispatch_sync(dispatch_get_main_queue(), w);
+    return r;
 }
 
 // --- 闭环自证用的测试视图 ---
@@ -1569,10 +1681,21 @@ static void AIExecCmd(NSDictionary *cmd) {
                 ok = YES;
             } @catch (id e) {}
         }
+        // ★ v13：优先走 sendEvent 正规链路（UIKit 自己 hitTest + 手势识别）。
+        //   旧路径（直接调 view.touchesBegan:）只对「自己处理触摸的 view」有效，
+        //   对 UITabBar / UIControl / 手势识别完全无效 —— 真机已验证。
+        BOOL viaSend = NO;
+        if (!ok) {
+            @try { viaSend = AIMainSyncBool(^{ return AIDispatchFakeViaSendEvent(CGPointMake(x, y), 2, 0.03); }); }
+            @catch (id e) {}
+        }
         if (!ok && gBestTap == 4) { @try { ok = AIFakeTapAtWindowPoint(CGPointMake(x, y)); } @catch (id e) {} }
         if (!ok) { @try { ok = AITapInProcess(CGPointMake(x, y)); } @catch (id e) {} }
-        AILog(@"  [cmd] tap (%.0f,%.0f) 通道%d -> %@", x, y, gBestTap, ok ? @"OK" : @"FAIL");
-        AIReportDict(@{@"op": @"tap", @"ok": @(ok), @"x": @(x), @"y": @(y), @"chan": @(gBestTap)});
+        AILog(@"  [cmd] tap (%.0f,%.0f) 通道%d -> %@ (正规路径:%@)",
+              x, y, gBestTap, ok ? @"OK" : @"FAIL", viaSend ? @"成功" : @"未确认");
+        AIReportDict(@{@"op": @"tap", @"ok": @(ok), @"viaSendEvent": @(viaSend),
+                       @"se": @(gSendEventHits), @"act": @(gActionHits),
+                       @"x": @(x), @"y": @(y), @"chan": @(gBestTap)});
     } else if ([op isEqualToString:@"shot"]) {
         UIImage *im = AIShotByBest();
         NSData *png = im ? UIImagePNGRepresentation(im) : nil;
