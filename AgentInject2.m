@@ -102,7 +102,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v10";
+static NSString * const kAIVer = @"v11";
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -1638,7 +1638,11 @@ static void AIHudTickLoop(void) {
     });
 }
 
+static BOOL gNetStarted = NO;
+
 static void AINetLoop(void) {
+    if (gNetStarted) return;    // 幂等：早期先起一次网络，后面再调不会重复启动
+    gNetStarted = YES;
     AILog(@"==== [6] 控制通道 ====");
     @try { AIStartServer(); AISleep(0.6); } @catch (NSException *e) { AILog(@"  服务启动异常 %@", e); }  // 等端口真正 bind 上再打印
     gBase = AIBase();
@@ -1682,12 +1686,16 @@ static void AINetLoop(void) {
                                        &d, &pe, NULL, NULL);
                     if (ok) {
                         gPollOK++; failRun = 0;
-                        if (gPollOK == 1) AILog(@"  ✅ 首次轮询成功，已上线 -> %@", gActiveBase);
+                        if (gPollOK == 1) {
+                            AILog(@"  ✅ 首次轮询成功，已上线 -> %@", gActiveBase);
+                            AIShowOverlay();     // 立刻把结论刷到盖屏上，不用用户做任何操作
+                        }
                     } else {
                         gPollErr++; failRun++;
                         gLastErrCode = pe ? pe.code : -999;
                         gLastErrText = pe.localizedDescription;
                         AILog(@"  ⚠️ 轮询失败: %@ (code=%ld)", pe.localizedDescription, (long)gLastErrCode);
+                        if (gPollErr == 1 || gPollErr == 3) AIShowOverlay();   // 首败/三败时刷一次盖屏，别让用户看旧快照
                         // 域名连续挂 4 次 -> 切 IP 直连兜底（DNS 被污染时救命）
                         if (failRun >= 4 && ![gActiveBase hasPrefix:@"https://4"]) {
                             gActiveBase = @"https://49.233.240.214";
@@ -2130,6 +2138,9 @@ static void AIBoot(void) {
     AIShowOverlayText(@"AgentInject2 已加载 ✓\n正在自检，请稍候…", NO, nil);
 
     @try { AIEnv(); }          @catch (NSException *e) { AILog(@"env 异常 %@", e); }
+    // ★ 网络尽早起来：放在耗时的 HID 矩阵测试之前。
+    //   不然一旦某个自检环节卡住/崩了，就永远走不到联网，我这边只能看到「设备不上线」。
+    @try { AINetLoop(); }      @catch (NSException *e) { AILog(@"net 异常 %@", e); }
     @try { AIDumpWindows(); }  @catch (NSException *e) { AILog(@"win 异常 %@", e); }
     @try { AIHookSendEvent(); } @catch (NSException *e) { AILog(@"hook 异常 %@", e); }
     @try { AIHookSendAction(); } @catch (NSException *e) { AILog(@"hookAction 异常 %@", e); }
