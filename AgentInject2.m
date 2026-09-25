@@ -141,6 +141,7 @@ static NSString *AINetDiag(void);           // AIExecCmd（~1500 行）在它的
 static void AIToast(NSString *txt);
 static void AISetHudVisible(BOOL vis);
 static void AIHudApply(void);
+static NSString *AITcpTest(const char *host, int port, double tmoSec);  // AINetLoop(~1656) 在定义(~1938)之前就要用
 
 // ---------------------------------------------------------------------------
 // 2. HID 私有符号（全部 dlsym，不做链接期依赖）
