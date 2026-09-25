@@ -1146,6 +1146,30 @@ static NSData *AIHttp(NSString *urlStr, NSData *body, NSTimeInterval tmo) {
     return out;
 }
 
+// 带 NSError 的版本：网络失败时必须能看到具体原因（DNS / TLS / 超时 / ATS），
+// 否则只能看到"设备没上线"，根本没法排查。
+static NSData *AIHttpErr(NSString *urlStr, NSData *body, NSTimeInterval tmo, NSError **errOut) {
+    NSURL *u = [NSURL URLWithString:urlStr];
+    if (!u) { if (errOut) *errOut = [NSError errorWithDomain:@"AI" code:-1
+                                     userInfo:@{NSLocalizedDescriptionKey: @"URL 非法"}]; return nil; }
+    NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:u
+                                                     cachePolicy:NSURLRequestReloadIgnoringCacheData
+                                                 timeoutInterval:tmo];
+    if (body) { rq.HTTPMethod = @"POST"; rq.HTTPBody = body;
+                [rq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"]; }
+    __block NSData *out = nil;
+    __block NSError *err = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    NSURLSession *s = [NSURLSession sharedSession];
+    NSURLSessionDataTask *t = [s dataTaskWithRequest:rq completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        out = d; err = e; dispatch_semaphore_signal(sem);
+    }];
+    [t resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)((tmo + 2.0) * NSEC_PER_SEC)));
+    if (errOut) *errOut = err;
+    return out;
+}
+
 static NSString *AIBase(void) {
     // 运行时可覆盖：把控制服务器地址写进任一文件
     NSString *cands[] = {
@@ -1416,7 +1440,11 @@ static void AIReportDict(NSDictionary *d) {
     m[@"ts"]  = @((long long)[[NSDate date] timeIntervalSince1970]);
     NSData *bd = [NSJSONSerialization dataWithJSONObject:m options:0 error:nil];
     if (!bd) return;
-    @try { AIHttp([gBase stringByAppendingString:@"/report"], bd, 15.0); } @catch (id e) {}
+    @try {
+        NSError *e = nil;
+        AIHttpErr([gBase stringByAppendingString:@"/report"], bd, 15.0, &e);
+        if (e) AILog(@"  ⚠️ 上报失败(%@): %@", m[@"op"], e.localizedDescription);
+    } @catch (id e) {}
 }
 
 static void AIExecCmd(NSDictionary *cmd) {
@@ -1504,7 +1532,7 @@ static void AINetLoop(void) {
         AIReportDict(@{@"op": @"hello", @"proc": gProcName, @"bundle": gBundleId,
                        @"pid": @(getpid()), @"tap": @(gBestTap), @"shot": @(gBestShot),
                        @"tvhits": @(gTargetHits), @"act": @(gActionHits)});
-        AILog(@"  已向中继报到 dev=%@", gDevId);
+        AILog(@"  已向中继报到 dev=%@  中继=%@", gDevId, gBase);
     });
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
         int round = 0;
@@ -1512,7 +1540,9 @@ static void AINetLoop(void) {
             @autoreleasepool {
                 @try {
                     NSString *u = [gBase stringByAppendingFormat:@"/poll?dev=%@", gDevId];
-                    NSData *d = AIHttp(u, nil, 8.0);
+                    NSError *pe = nil;
+                    NSData *d = AIHttpErr(u, nil, 8.0, &pe);
+                    if (pe) AILog(@"  ⚠️ 轮询失败: %@ (code=%ld)", pe.localizedDescription, (long)pe.code);
                     if (d.length) {
                         id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
                         if ([j isKindOfClass:[NSDictionary class]]) AIExecCmd(j);
@@ -1540,6 +1570,18 @@ static void AINetLoop(void) {
 @end
 @implementation AIReportTarget
 - (void)testTapButton:(id)sender  { AITestTapButton(); }
+- (void)pingNow:(id)sender {
+    AILog(@"==== [8] 手动上报 ====");
+    AILog(@"  中继=%@ dev=%@", gBase, gDevId);
+    NSError *e = nil;
+    NSData *r = AIHttpErr([gBase stringByAppendingFormat:@"/poll?dev=%@", gDevId], nil, 10.0, &e);
+    if (e) { AILog(@"  ❌ 轮询失败: %@ (code=%ld)", e.localizedDescription, (long)e.code); }
+    else   { AILog(@"  ✅ 轮询成功，收到 %lu 字节", (unsigned long)(r ? r.length : 0)); }
+    AIReportDict(@{@"op": @"status", @"ok": @YES, @"proc": gProcName, @"bundle": gBundleId,
+                   @"tap": @(gBestTap), @"shot": @(gBestShot), @"act": @(gActionHits)});
+    AILog(@"  已上报 status，看上面有没有 ⚠️ 上报失败");
+    AIShowOverlay();
+}
 - (void)testTapCenter:(id)sender  {
     CGSize sc = [UIScreen mainScreen].bounds.size;
     AITestTapAt(CGPointMake(sc.width * 0.5, sc.height * 0.5), @"屏幕中心");
@@ -1653,6 +1695,13 @@ static void AIShowOverlayText(NSString *txt, BOOL done, NSString *banner) {
                 [b5 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
                 b5.titleLabel.font = [UIFont boldSystemFontOfSize:14];
                 [b5 addTarget:gRT action:@selector(testTapCenter:) forControlEvents:UIControlEventTouchUpInside];
+                UIButton *b6 = [UIButton buttonWithType:UIButtonTypeSystem];
+                b6.frame = CGRectMake(162, top, 150, 38);
+                b6.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
+                [b6 setTitle:@"▶ 立即上报状态(让我看到你)" forState:UIControlStateNormal];
+                [b6 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+                b6.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+                [b6 addTarget:gRT action:@selector(pingNow:) forControlEvents:UIControlEventTouchUpInside];
                 [root addSubview:b2];
                 top += 42;
             } else {
