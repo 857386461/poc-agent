@@ -83,6 +83,8 @@ static void AIWriteReport(void) {
 static volatile int32_t gMonHits      = 0;   // HID monitor client 收到的事件数
 static volatile int32_t gSendEventHits = 0;  // -[UIApplication sendEvent:] 命中数
 static volatile int32_t gControlHits   = 0;  // UIControl 触发数
+static volatile int32_t gActionHits    = 0;  // -[UIApplication sendAction:...] 命中数（按钮真被按的铁证）
+static NSString *gLastAction  = nil;   // 最后一次命中的 action 描述
 
 static int  gBestTap   = 0;   // 0=无 1=HID 2=进程内UIKit 3=UIControl
 static int  gBestTapForm = 0; // HID 事件形态：0=复合 1=裸18参 2=裸老10参
@@ -107,6 +109,9 @@ static void AIBoot(void);
 // AITapInProcess（约 430 行）在 AIHostWindow 定义（约 580 行）之前就要用它
 static UIWindow *AIHostWindow(void);
 static void AISetOverlayVisible(BOOL vis);   // 盖屏按钮在它的定义之前就要用
+static void AIShowOverlay(void);            // 盖屏按钮回调里要刷新报告
+static void AITestTapAt(CGPoint pt, NSString *desc);
+static void AITestTapButton(void);
 
 // ---------------------------------------------------------------------------
 // 2. HID 私有符号（全部 dlsym，不做链接期依赖）
@@ -309,6 +314,38 @@ static void AISetupMonitor(CFRunLoopRef rl) {
 static IMP gOrigSendEvent = NULL;
 
 static BOOL gHooked = NO;
+
+// 【铁证判据】touchesBegan 被调用 ≠ 按钮真的被按了。
+// UIControl 的事件最终都走 -[UIApplication sendAction:to:from:forEvent:]，
+// 这个被调用了，才说明按钮的 target-action 真的执行了。
+static BOOL (*gOrigSendAction)(id, SEL, SEL, id, id, UIEvent *) = NULL;
+
+static BOOL AIHookedSendAction(id self, SEL _cmd, SEL action, id target, id sender, UIEvent *ev) {
+    if (action && target) {
+        __sync_fetch_and_add(&gActionHits, 1);
+        gLastAction = [NSString stringWithFormat:@"%@ %@",
+                       NSStringFromClass([sender class]), NSStringFromSelector(action)];
+    }
+    if (gOrigSendAction) return gOrigSendAction(self, _cmd, action, target, sender, ev);
+    return NO;
+}
+
+static void AIHookSendAction(void) {
+    static BOOL hooked = NO;
+    if (hooked) return;
+    Class c = NSClassFromString(@"UIApplication");
+    if (!c) return;
+    SEL sel = @selector(sendAction:to:from:forEvent:);
+    Method m = class_getInstanceMethod(c, sel);
+    if (!m) return;
+    IMP orig = method_getImplementation(m);
+    if (!orig || orig == (IMP)AIHookedSendAction) return;
+    class_addMethod(c, sel, orig, method_getTypeEncoding(m));
+    gOrigSendAction = (BOOL (*)(id, SEL, SEL, id, id, UIEvent *))orig;
+    method_setImplementation(class_getInstanceMethod(c, sel), (IMP)AIHookedSendAction);
+    hooked = YES;
+    AILog(@"  hook -[UIApplication sendAction:...] -> OK");
+}
 
 static void AIHookSendEvent(void) {
     // 必须去重：重复 hook 会让 gOrigSendEvent 变成我们自己的 block → 无限递归 → 崩
@@ -1235,7 +1272,7 @@ static void AIServeFd(int fd) {
                      @"dev": gDevId, @"pid": @(getpid()),
                      @"tap": @(gBestTap), @"shot": @(gBestShot),
                      @"mon": @(gMonHits), @"se": @(gSendEventHits),
-                     @"targetViewHits": @(gTargetHits),
+                     @"targetViewHits": @(gTargetHits), @"actionHits": @(gActionHits),
                      @"overlay": gOverlayWindow && !gOverlayWindow.hidden ? @"on" : @"off",
                      @"port": @(gSrvPort), @"ip": gSrvIp ?: @""});
         return;
@@ -1448,6 +1485,11 @@ static void AINetLoop(void) {
 @interface AIReportTarget : NSObject
 @end
 @implementation AIReportTarget
+- (void)testTapButton:(id)sender  { AITestTapButton(); }
+- (void)testTapCenter:(id)sender  {
+    CGSize sc = [UIScreen mainScreen].bounds.size;
+    AITestTapAt(CGPointMake(sc.width * 0.5, sc.height * 0.5), @"屏幕中心");
+}
 - (void)toggleOverlay:(id)sender {
     BOOL nowVisible = gOverlayWindow ? !gOverlayWindow.hidden : NO;
     AISetOverlayVisible(!nowVisible);   // 可见就收起，收起就放回
@@ -1457,8 +1499,8 @@ static void AINetLoop(void) {
         [gLogLock lock]; NSString *t = [gLog copy]; [gLogLock unlock];
         NSArray *lines = [t componentsSeparatedByString:@"\n"];
         NSArray *tail = ([lines count] > 25) ? [lines subarrayWithRange:NSMakeRange([lines count] - 25, 25)] : lines;
-        NSString *short1 = [NSString stringWithFormat:@"AI2 结论 tap=%d shot=%d se=%d mon=%d tvhits=%d\n---\n%@",
-                            gBestTap, gBestShot, gSendEventHits, gMonHits, gTargetHits,
+        NSString *short1 = [NSString stringWithFormat:@"AI2 结论 tap=%d shot=%d se=%d tvhits=%d act=%d\n---\n%@",
+                            gBestTap, gBestShot, gSendEventHits, gTargetHits, gActionHits,
                             [tail componentsJoinedByString:@"\n"]];
         [UIPasteboard generalPasteboard].string = short1;
         AILog(@"已复制结论（%lu 字符）", (unsigned long)short1.length);
@@ -1543,6 +1585,20 @@ static void AIShowOverlayText(NSString *txt, BOOL done, NSString *banner) {
                 [b3 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
                 b3.titleLabel.font = [UIFont boldSystemFontOfSize:14];
                 [b3 addTarget:gRT action:@selector(toggleOverlay:) forControlEvents:UIControlEventTouchUpInside];
+                UIButton *b4 = [UIButton buttonWithType:UIButtonTypeSystem];
+                b4.frame = CGRectMake(162, top, 150, 38);
+                b4.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
+                [b4 setTitle:@"▶ 实测:点App第一个按钮" forState:UIControlStateNormal];
+                [b4 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+                b4.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+                [b4 addTarget:gRT action:@selector(testTapButton:) forControlEvents:UIControlEventTouchUpInside];
+                UIButton *b5 = [UIButton buttonWithType:UIButtonTypeSystem];
+                b5.frame = CGRectMake(162, top, 150, 38);
+                b5.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
+                [b5 setTitle:@"▶ 实测:点屏幕中心" forState:UIControlStateNormal];
+                [b5 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+                b5.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+                [b5 addTarget:gRT action:@selector(testTapCenter:) forControlEvents:UIControlEventTouchUpInside];
                 [root addSubview:b2];
                 top += 42;
             } else {
@@ -1575,10 +1631,65 @@ static void AIShowOverlayText(NSString *txt, BOOL done, NSString *banner) {
     });
 }
 
+// 找到 App 里第一个可见、可交互的 UIButton，返回它的屏幕中心坐标
+static BOOL AIFindFirstButton(CGPoint *outPt, NSString **outDesc) {
+    UIWindow *w = AIHostWindow();
+    if (!w) return NO;
+    NSMutableArray *q = [NSMutableArray arrayWithObject:(w.rootViewController.view ?: w)];
+    int guard = 0;
+    while (q.count && guard++ < 4000) {
+        UIView *v = q.firstObject;
+        [q removeObjectAtIndex:0];
+        if (!v || v.hidden || v.alpha < 0.05) continue;
+        if ([v isKindOfClass:[UIButton class]] && v.userInteractionEnabled) {
+            CGRect r = [v convertRect:v.bounds toView:nil];
+            CGPoint c = CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r));
+            if (outPt) *outPt = c;
+            if (outDesc) *outDesc = [NSString stringWithFormat:@"UIButton(%@) 屏幕中心(%.0f,%.0f)",
+                                     NSStringFromClass([v class]), c.x, c.y];
+            return YES;
+        }
+        for (UIView *sub in v.subviews) [q addObject:sub];
+    }
+    return NO;
+}
+
+// 【一键实测】在 App 内完成整个闭环，不需要电脑、不需要第二台设备。
+// 主线程上：收起盖屏（露出 App） -> 等一拍 -> 发点击 -> 等一拍 -> 记录 -> 恢复盖屏刷新报告。
+static void AITestTapAt(CGPoint pt, NSString *desc) {
+    AILog(@"==== [7] 真实点击实测 %@ ====", desc ?: @"");
+    int a0 = gActionHits;
+    int t0 = gTargetHits;
+
+    BOOL hadOverlay = (gOverlayWindow && !gOverlayWindow.hidden);
+    if (hadOverlay) { gOverlayWindow.hidden = YES; AISleep(0.5); }
+
+    AILog(@"  盖屏已收起，点 (%.0f,%.0f)", pt.x, pt.y);
+    BOOL ok = AIFakeTapAtWindowPoint(pt);
+    AISleep(0.5);
+
+    AILog(@"  投递=%@   ★控件事件 sendAction +%d (%@)   touchesBegan +%d",
+          ok ? @"已投递" : @"失败", gActionHits - a0, gLastAction ?: @"-", gTargetHits - t0);
+
+    if (hadOverlay) {
+        gOverlayWindow.hidden = NO;
+        [gOverlayWindow makeKeyAndVisible];
+        AISleep(0.2);
+        AIShowOverlay();
+    }
+}
+
+static void AITestTapButton(void) {
+    CGPoint pt = CGPointZero;
+    NSString *desc = nil;
+    if (!AIFindFirstButton(&pt, &desc)) { AILog(@"  没找到可点的 UIButton"); AIShowOverlay(); return; }
+    AITestTapAt(pt, desc);
+}
+
 static void AIShowOverlay(void) {
     [gLogLock lock]; NSString *txt = [gLog copy]; [gLogLock unlock];
-    NSString *banner = [NSString stringWithFormat:@"AI2 结论 tap=%d shot=%d se=%d mon=%d tvhits=%d",
-                        gBestTap, gBestShot, gSendEventHits, gMonHits, gTargetHits];
+    NSString *banner = [NSString stringWithFormat:@"AI2 结论 tap=%d shot=%d se=%d tvhits=%d act=%d",
+                        gBestTap, gBestShot, gSendEventHits, gTargetHits, gActionHits];
     AIShowOverlayText(txt, YES, banner);
 }
 
@@ -1608,6 +1719,7 @@ static void AIBoot(void) {
     @try { AIEnv(); }          @catch (NSException *e) { AILog(@"env 异常 %@", e); }
     @try { AIDumpWindows(); }  @catch (NSException *e) { AILog(@"win 异常 %@", e); }
     @try { AIHookSendEvent(); } @catch (NSException *e) { AILog(@"hook 异常 %@", e); }
+    @try { AIHookSendAction(); } @catch (NSException *e) { AILog(@"hookAction 异常 %@", e); }
     @try { AILoadHID(); }      @catch (NSException *e) { AILog(@"loadHID 异常 %@", e); }
 
     // HID 测试必须在有 runloop 的线程上（monitor 回调靠它）
@@ -1634,8 +1746,8 @@ static void AIBoot(void) {
             @try { AIShotMatrix(); } @catch (NSException *e) { AILog(@"shot 异常 %@", e); }
             @try { AINetLoop(); }    @catch (NSException *e) { AILog(@"net 异常 %@", e); }
 
-            AILog(@"########## 结论: tap=%d shot=%d mon=%d se=%d tvhits=%d ##########",
-                  gBestTap, gBestShot, gMonHits, gSendEventHits, gTargetHits);
+            AILog(@"########## 结论: tap=%d shot=%d mon=%d se=%d tvhits=%d act=%d ##########",
+                  gBestTap, gBestShot, gMonHits, gSendEventHits, gTargetHits, gActionHits);
             if (gSrvPort) AILog(@"########## 控制: http://%@:%d/status ##########", gSrvIp ?: @"?", gSrvPort);
             @try { AIWriteReport(); } @catch (NSException *e) {}
             @try { AIShowOverlay(); } @catch (NSException *e) {}
