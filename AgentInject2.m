@@ -98,6 +98,24 @@ static NSString *gBase     = nil;   // 控制服务器地址（可运行时覆�
 static BOOL gBooted = NO;
 static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的（排障用）
 
+// ---- v10 网络可观测性 ----
+// 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
+// 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
+// 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
+static NSString * const kAIVer = @"v10";
+static volatile int32_t gPollOK = 0, gPollErr = 0;
+static volatile int32_t gRepOK  = 0, gRepErr  = 0;
+static volatile int32_t gCmdGot = 0;
+static long             gLastErrCode = 0;
+static NSString        *gLastErrText = nil;
+static NSString        *gToastText   = nil;   // 我从中继下发的一句话
+static NSString        *gDiagText    = nil;   // 网络自检结果
+static UIWindow        *gHudWindow   = nil;   // 顶端常驻状态条（独立于盖屏，收起盖屏也还在）
+static UILabel         *gHudLabel    = nil;
+static BOOL             gHudWanted   = YES;
+static NSString        *gActiveBase  = nil;   // 当前实际在用的中继地址（可能是 IP 兜底）
+static UIBackgroundTaskIdentifier gBgTask = UIBackgroundTaskInvalid;
+
 // 盖屏窗口。必须是 static 强引用，否则 ARC 会在函数返回时把它释放掉，
 // 表现就是"注入成功但屏幕上什么都没有"（v2 踩过的坑）。
 // 同时它必须在文件靠前的位置声明 —— v3 的伪造 Touch 分发代码（约 530 行）
@@ -112,6 +130,10 @@ static void AISetOverlayVisible(BOOL vis);   // 盖屏按钮在它的定义之�
 static void AIShowOverlay(void);            // 盖屏按钮回调里要刷新报告
 static void AITestTapAt(CGPoint pt, NSString *desc);
 static void AITestTapButton(void);
+static NSString *AINetDiag(void);           // AIExecCmd（~1500 行）在它的定义之前就要用
+static void AIToast(NSString *txt);
+static void AISetHudVisible(BOOL vis);
+static void AIHudApply(void);
 
 // ---------------------------------------------------------------------------
 // 2. HID 私有符号（全部 dlsym，不做链接期依赖）
@@ -624,6 +646,7 @@ static UIWindow *AIHostWindow(void) {
     UIWindow *fallback = nil;
     for (UIWindow *w in AIAllWindows()) {
         if (w == gOverlayWindow) continue;
+        if (w == gHudWindow) continue;          // v10 顶端状态条，别让它冒充 App 窗口
         NSString *cn = NSStringFromClass([w class]);
         if ([cn rangeOfString:@"TextEffects"].location != NSNotFound) continue;
         if ([cn rangeOfString:@"RemoteKeyboard"].location != NSNotFound) continue;
@@ -1170,6 +1193,69 @@ static NSData *AIHttpErr(NSString *urlStr, NSData *body, NSTimeInterval tmo, NSE
     return out;
 }
 
+// 信任任意证书的 session delegate —— 只给「IP 直连兜底」用。
+// 直连 49.233.x.x 时证书 CN 是 *.workbuddy.host，跟 IP 对不上，系统必然拒绝握手；
+// 我们自己接管校验才发得出去。主链路始终是带校验的域名 HTTPS，不受影响。
+@interface AITrustDelegate : NSObject <NSURLSessionDelegate>
+@end
+@implementation AITrustDelegate
+- (void)URLSession:(NSURLSession *)session
+didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
+ completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredential *))completionHandler {
+    if ([challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodServerTrust]
+        && challenge.protectionSpace.serverTrust) {
+        completionHandler(NSURLSessionAuthChallengeUseCredential,
+                          [NSURLCredential credentialForTrust:challenge.protectionSpace.serverTrust]);
+        return;
+    }
+    completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
+}
+@end
+static AITrustDelegate *gTrustDel = nil;
+
+// trustAny=YES 时跳过证书校验；host 不为空时覆盖 Host 头（IP 直连时给负载均衡用）。
+// 返回 YES 表示拿到了响应体；响应体本身通过 *out 返回。
+static BOOL AIHttpEx(NSString *urlStr, NSData *body, NSTimeInterval tmo,
+                     BOOL trustAny, NSString *host, NSData **out, NSError **errOut,
+                     NSInteger *httpCode, NSTimeInterval *ms) {
+    NSURL *u = [NSURL URLWithString:urlStr];
+    if (!u) { if (errOut) *errOut = [NSError errorWithDomain:@"AI" code:-1
+                                     userInfo:@{NSLocalizedDescriptionKey: @"URL 非法"}]; return NO; }
+    NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:u
+                                                     cachePolicy:NSURLRequestReloadIgnoringCacheData
+                                                 timeoutInterval:tmo];
+    if (body) { rq.HTTPMethod = @"POST"; rq.HTTPBody = body;
+                [rq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"]; }
+    if (host.length) [rq setValue:host forHTTPHeaderField:@"Host"];
+
+    __block NSData *got = nil;
+    __block NSError *err = nil;
+    __block NSInteger code = 0;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    NSURLSession *s;
+    if (trustAny) {
+        if (!gTrustDel) gTrustDel = [AITrustDelegate new];
+        s = [NSURLSession sessionWithConfiguration:[NSURLSessionConfiguration ephemeralSessionConfiguration]
+                                          delegate:gTrustDel delegateQueue:nil];
+    } else {
+        s = [NSURLSession sharedSession];
+    }
+    NSDate *t0 = [NSDate date];
+    NSURLSessionDataTask *t = [s dataTaskWithRequest:rq completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        got = d; err = e;
+        if ([r isKindOfClass:[NSHTTPURLResponse class]]) code = [(NSHTTPURLResponse *)r statusCode];
+        dispatch_semaphore_signal(sem);
+    }];
+    [t resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)((tmo + 2.0) * NSEC_PER_SEC)));
+    if (ms)   *ms   = [[NSDate date] timeIntervalSinceDate:t0];
+    if (out)  *out  = got;
+    if (httpCode) *httpCode = code;
+    if (errOut) *errOut = err;
+    if (trustAny) { @try { [s invalidateAndCancel]; } @catch (id e) {} }
+    return got != nil && err == nil;
+}
+
 static NSString *AIBase(void) {
     // 运行时可覆盖：把控制服务器地址写进任一文件
     NSString *cands[] = {
@@ -1442,8 +1528,14 @@ static void AIReportDict(NSDictionary *d) {
     if (!bd) return;
     @try {
         NSError *e = nil;
-        AIHttpErr([gBase stringByAppendingString:@"/report"], bd, 15.0, &e);
-        if (e) AILog(@"  ⚠️ 上报失败(%@): %@", m[@"op"], e.localizedDescription);
+        AIHttpErr([(gActiveBase ?: gBase) stringByAppendingString:@"/report"], bd, 15.0, &e);
+        if (e) {
+            gRepErr++; gLastErrCode = e.code; gLastErrText = e.localizedDescription;
+            AILog(@"  ⚠️ 上报失败(%@): %@ (code=%ld)", m[@"op"], e.localizedDescription, (long)e.code);
+        } else {
+            gRepOK++;
+        }
+        AIHudApply();
     } @catch (id e) {}
 }
 
@@ -1517,48 +1609,103 @@ static void AIExecCmd(NSDictionary *cmd) {
     } else if ([op isEqualToString:@"log"]) {
         NSString *t = AILogSnapshot();
         AIReportDict(@{@"op": @"log", @"ok": @YES, @"text": t});
+    } else if ([op isEqualToString:@"toast"]) {
+        // 我主动说话 -> 手机屏幕顶端弹出来。用户只要回一句「看到了」就够了。
+        NSString *t = cmd[@"text"] ?: @"(空消息)";
+        AIToast(t);
+        AIReportDict(@{@"op": @"toast", @"ok": @YES, @"shown": t});
+    } else if ([op isEqualToString:@"hud"]) {
+        BOOL v = cmd[@"on"] ? ([cmd[@"on"] intValue] != 0) : YES;
+        AISetHudVisible(v);
+        AIReportDict(@{@"op": @"hud", @"ok": @YES, @"visible": @(v)});
+    } else if ([op isEqualToString:@"diag"]) {
+        NSString *s = AINetDiag();
+        gDiagText = s;
+        AIHudApply();
+        AIReportDict(@{@"op": @"diag", @"ok": @YES, @"text": s});
     }
+}
+
+// HUD 每秒刷一次：轮询的成败数字是活的，卡住不刷新本身就是一种诊断信息。
+static void AIHudTickLoop(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @try { AIHudApply(); } @catch (id e) {}
+        AIHudTickLoop();
+    });
 }
 
 static void AINetLoop(void) {
     AILog(@"==== [6] 控制通道 ====");
     @try { AIStartServer(); AISleep(0.6); } @catch (NSException *e) { AILog(@"  服务启动异常 %@", e); }  // 等端口真正 bind 上再打印
     gBase = AIBase();
-    AILog(@"  中继: %@", gBase);
-    if ([gBase containsString:@"invalid"]) { AILog(@"  地址无效，轮询不启动"); return; }
+    gActiveBase = gBase;
+    AILog(@"  版本=%@ 中继: %@", kAIVer, gBase);
+    if ([gBase containsString:@"invalid"]) { AILog(@"  地址无效，轮询不启动"); AIHudApply(); return; }
+
+    // 后台任务：锁屏/切走后尽量多撑一会儿，别一退后台就断线
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            UIApplication *ap = [UIApplication sharedApplication];
+            gBgTask = [ap beginBackgroundTaskWithName:@"AIPoll" expirationHandler:^{
+                @try { [ap endBackgroundTask:gBgTask]; } @catch (id e) {}
+                gBgTask = UIBackgroundTaskInvalid;
+            }];
+        } @catch (id e) {}
+    });
+
+    AIHudApply();
+    AIHudTickLoop();
 
     // 上线即报到：我在中继那边 GET /peek 就能看到这台设备的 dev id
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
         AIReportDict(@{@"op": @"hello", @"proc": gProcName, @"bundle": gBundleId,
-                       @"pid": @(getpid()), @"tap": @(gBestTap), @"shot": @(gBestShot),
+                       @"pid": @(getpid()), @"ver": kAIVer, @"tap": @(gBestTap), @"shot": @(gBestShot),
                        @"tvhits": @(gTargetHits), @"act": @(gActionHits)});
         AILog(@"  已向中继报到 dev=%@  中继=%@", gDevId, gBase);
     });
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
-        int round = 0;
+        int round = 0, failRun = 0;
         while (1) {
             @autoreleasepool {
                 @try {
-                    NSString *u = [gBase stringByAppendingFormat:@"/poll?dev=%@", gDevId];
-                    NSError *pe = nil;
-                    NSData *d = AIHttpErr(u, nil, 8.0, &pe);
-                    if (pe) AILog(@"  ⚠️ 轮询失败: %@ (code=%ld)", pe.localizedDescription, (long)pe.code);
+                    NSString *u = [gActiveBase stringByAppendingFormat:@"/poll?dev=%@", gDevId];
+                    NSError *pe = nil; NSData *d = nil;
+                    BOOL ok = AIHttpEx(u, nil, 8.0,
+                                       [gActiveBase hasPrefix:@"https://4"],   // IP 兜底时才信任任意证书
+                                       [gActiveBase hasPrefix:@"https://4"] ? @"aa0c466b5cdb559bb.app.workbuddy.host" : nil,
+                                       &d, &pe, NULL, NULL);
+                    if (ok) {
+                        gPollOK++; failRun = 0;
+                        if (gPollOK == 1) AILog(@"  ✅ 首次轮询成功，已上线");
+                    } else {
+                        gPollErr++; failRun++;
+                        gLastErrCode = pe ? pe.code : -999;
+                        gLastErrText = pe.localizedDescription;
+                        AILog(@"  ⚠️ 轮询失败: %@ (code=%ld)", pe.localizedDescription, (long)gLastErrCode);
+                        // 域名连续挂 4 次 -> 切 IP 直连兜底（DNS 被污染时救命）
+                        if (failRun >= 4 && ![gActiveBase hasPrefix:@"https://4"]) {
+                            gActiveBase = @"https://49.233.240.214";
+                            AILog(@"  ↩️ 域名不通，切换 IP 直连兜底: %@", gActiveBase);
+                            failRun = 0;
+                        }
+                    }
                     if (d.length) {
                         id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
-                        if ([j isKindOfClass:[NSDictionary class]]) AIExecCmd(j);
+                        if ([j isKindOfClass:[NSDictionary class]]) { gCmdGot++; AIExecCmd(j); }
                         else if ([j isKindOfClass:[NSArray class]])
-                            for (NSDictionary *c in (NSArray *)j) AIExecCmd(c);
+                            for (NSDictionary *c in (NSArray *)j) { gCmdGot++; AIExecCmd(c); }
                     }
                 } @catch (NSException *e) {}
             }
             if (++round % 15 == 0) {
-                AIReportDict(@{@"op": @"beat", @"tap": @(gBestTap), @"shot": @(gBestShot),
+                AIReportDict(@{@"op": @"beat", @"ver": kAIVer, @"tap": @(gBestTap), @"shot": @(gBestShot),
                                @"tvhits": @(gTargetHits), @"act": @(gActionHits)});
             }
             [NSThread sleepForTimeInterval:2.0];
         }
     });
-    AILog(@"  轮询已启动 -> %@", gBase);
+    AILog(@"  轮询已启动(%@) -> %@", kAIVer, gBase);
 }
 
 // ---------------------------------------------------------------------------
@@ -1581,6 +1728,23 @@ static void AINetLoop(void) {
                    @"tap": @(gBestTap), @"shot": @(gBestShot), @"act": @(gActionHits)});
     AILog(@"  已上报 status，看上面有没有 ⚠️ 上报失败");
     AIShowOverlay();
+}
+- (void)netDiag:(id)sender {
+    AILog(@"==== [9] 网络自检（结果会写在屏幕顶端） ====");
+    gDiagText = @"自检中…";
+    AIHudApply();
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            NSString *s = AINetDiag();
+            gDiagText = s;
+            AIHudApply();
+            AILog(@"  自检结果已写到屏幕顶端状态条");
+        }
+    });
+}
+- (void)toggleHud:(id)sender {
+    AISetHudVisible(!gHudWanted);
+    AILog(@"  顶端状态条: %@", gHudWanted ? @"显示" : @"隐藏");
 }
 - (void)testTapCenter:(id)sender  {
     CGSize sc = [UIScreen mainScreen].bounds.size;
@@ -1627,6 +1791,137 @@ static AIReportTarget *gRT = nil;
 //   上一版它是局部变量，makeKeyAndVisible 后 ARC 立刻释放，窗口活不下来
 //   —— 这就是「注入了但什么都没出现」最可能的原因。
 
+// ---------------------------------------------------------------------------
+// v10：顶端常驻状态条（HUD）
+//
+//   独立于盖屏存在 —— 收起盖屏做点击测试时它也还在，所以我能一直看到网络状态。
+//   userInteractionEnabled=NO，不拦截任何点击。
+// ---------------------------------------------------------------------------
+static UIWindowScene *AIFirstWindowScene(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    if (!app || ![app respondsToSelector:@selector(connectedScenes)]) return nil;
+    id scenes = [app performSelector:@selector(connectedScenes)];
+    if (![scenes isKindOfClass:[NSSet class]]) return nil;
+    for (id sc in (NSSet *)scenes) if ([sc isKindOfClass:[UIWindowScene class]]) return (UIWindowScene *)sc;
+    return nil;
+}
+
+static NSString *AIHudText(void) {
+    NSString *net;
+    if (gPollOK > 0) {
+        net = (gPollErr > 0) ? [NSString stringWithFormat:@"网✅%d/❌%d", gPollOK, gPollErr]
+                             : [NSString stringWithFormat:@"网✅%d", gPollOK];
+    } else if (gPollErr > 0) {
+        net = [NSString stringWithFormat:@"网❌%ld", gLastErrCode];
+    } else {
+        net = @"网…";
+    }
+    NSString *did = gDevId ?: @"?";
+    if (did.length > 8) did = [did substringFromIndex:did.length - 8];
+    NSString *s = [NSString stringWithFormat:@"%@ %@ 报%d/%d 令%d", kAIVer, net, gRepOK, gRepErr, gCmdGot];
+    if (gToastText.length)     s = [s stringByAppendingFormat:@"\n📢 %@", gToastText];
+    else if (gDiagText.length) s = [s stringByAppendingFormat:@"\n%@", gDiagText];
+    else                       s = [s stringByAppendingFormat:@" dev=%@", did];
+    return s;
+}
+
+static void AIHudApply(void) {
+    if (!gHudWanted || gIsSpringBoard) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            CGRect f = [UIScreen mainScreen].bounds;
+            CGFloat h = (gToastText.length || gDiagText.length) ? 56 : 26;
+            CGRect hf = CGRectMake(0, 0, f.size.width, h);
+            if (!gHudWindow) {
+                gHudWindow = [[UIWindow alloc] initWithFrame:hf];
+                if ([gHudWindow respondsToSelector:@selector(setWindowScene:)]) {
+                    UIWindowScene *sc = AIFirstWindowScene();
+                    if (sc) gHudWindow.windowScene = sc;
+                }
+                gHudWindow.windowLevel = UIWindowLevelStatusBar + 500;
+                gHudWindow.backgroundColor = [UIColor clearColor];
+                gHudWindow.userInteractionEnabled = NO;   // 绝不能挡住点击
+                UIView *bg = [[UIView alloc] initWithFrame:hf];
+                bg.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.78];
+                gHudLabel = [[UILabel alloc] initWithFrame:CGRectMake(4, 0, f.size.width - 8, h)];
+                gHudLabel.numberOfLines = 0;
+                gHudLabel.font = [UIFont fontWithName:@"Menlo" size:10] ?: [UIFont systemFontOfSize:11];
+                gHudLabel.textAlignment = NSTextAlignmentCenter;
+                [bg addSubview:gHudLabel];
+                UIViewController *vc = [UIViewController new];
+                vc.view = bg;
+                gHudWindow.rootViewController = vc;
+                [gHudWindow makeKeyAndVisible];
+            }
+            gHudWindow.frame = hf;
+            gHudWindow.hidden = NO;
+            gHudLabel.frame = CGRectMake(4, 0, f.size.width - 8, h);
+            gHudLabel.text = AIHudText();
+            gHudLabel.textColor = (gPollOK > 0) ? [UIColor greenColor]
+                                : ((gPollErr > 0) ? [UIColor redColor] : [UIColor yellowColor]);
+        } @catch (NSException *e) {}
+    });
+}
+
+static void AISetHudVisible(BOOL vis) {
+    gHudWanted = vis;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try { gHudWindow.hidden = !vis; if (vis) AIHudApply(); } @catch (id e) {}
+    });
+}
+
+// 我从中继下发的一句话直接弹到手机屏幕上：
+// 用户什么都不用做，只要告诉我「看到了 / 没看到」，链路通不通立刻有结论。
+static void AIToast(NSString *txt) {
+    if (!txt.length) return;
+    gToastText = txt;
+    AILog(@"  📢 收到中继消息: %@", txt);
+    AIHudApply();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ gToastText = nil; AIHudApply(); });
+}
+
+// 网络自检：四个目标各打一次，把结果写进 gDiagText 直接画在屏幕顶端。
+// 这样「到底是一点网都没有、还是只有我们这个域名不通、还是 DNS 挂了」一目了然。
+static NSString *AINetDiag(void) {
+    NSMutableString *s = [NSMutableString string];
+    NSData *out = nil; NSError *e = nil; NSInteger code = 0; NSTimeInterval ms = 0;
+
+    // 1) 对照组：苹果官网。这个都不通 = 手机压根没网
+    BOOL ok1 = AIHttpEx(@"https://www.apple.com/library/test/success.html", nil, 10.0,
+                        NO, nil, &out, &e, &code, &ms);
+    [s appendFormat:@"①苹果 %@ %@\n", ok1 ? @"✅" : @"❌",
+     ok1 ? [NSString stringWithFormat:@"%ld %.0fms", (long)code, ms * 1000]
+         : [NSString stringWithFormat:@"%ld", (long)e.code]];
+
+    // 2) 主链路：域名 HTTPS 轮询
+    NSString *base = gActiveBase ?: gBase ?: AIBase();
+    e = nil; code = 0; ms = 0;
+    BOOL ok2 = AIHttpEx([base stringByAppendingFormat:@"/poll?dev=%@", gDevId], nil, 10.0,
+                        NO, nil, &out, &e, &code, &ms);
+    [s appendFormat:@"②中继域名 %@ %@\n", ok2 ? @"✅" : @"❌",
+     ok2 ? [NSString stringWithFormat:@"%ld %.0fms", (long)code, ms * 1000]
+         : [NSString stringWithFormat:@"%ld", (long)e.code]];
+
+    // 3) 兜底：IP 直连 + 信任证书 + 覆盖 Host（域名 DNS 挂了就靠这条）
+    e = nil; code = 0; ms = 0;
+    BOOL ok3 = AIHttpEx(@"https://49.233.240.214/poll?dev=DIAG", nil, 10.0,
+                        YES, @"aa0c466b5cdb559bb.app.workbuddy.host", &out, &e, &code, &ms);
+    [s appendFormat:@"③IP直连 %@ %@\n", ok3 ? @"✅" : @"❌",
+     ok3 ? [NSString stringWithFormat:@"%ld %.0fms", (long)code, ms * 1000]
+         : [NSString stringWithFormat:@"%ld", (long)e.code]];
+
+    // 4) 上报能不能出去
+    e = nil; code = 0; ms = 0;
+    NSData *bd = [NSJSONSerialization dataWithJSONObject:@{@"dev": gDevId ?: @"?", @"op": @"diag"} options:0 error:nil];
+    BOOL ok4 = AIHttpEx([base stringByAppendingString:@"/report"], bd, 10.0, NO, nil, &out, &e, &code, &ms);
+    [s appendFormat:@"④上报 %@ %@", ok4 ? @"✅" : @"❌",
+     ok4 ? [NSString stringWithFormat:@"%ld", (long)code] : [NSString stringWithFormat:@"%ld", (long)e.code]];
+
+    AILog(@"==== [9] 网络自检 ====\n%@", s);
+    return s;
+}
+
 static void AIShowOverlayText(NSString *txt, BOOL done, NSString *banner) {
     if (gIsSpringBoard) { AILog(@"SpringBoard 进程，跳过盖屏"); return; }
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1642,10 +1937,10 @@ static void AIShowOverlayText(NSString *txt, BOOL done, NSString *banner) {
             UIView *root = [[UIView alloc] initWithFrame:f];
             root.backgroundColor = [UIColor blackColor];
 
-            CGFloat top = 44;
+            CGFloat top = 62;   // 上方 60pt 留给 v10 常驻状态条（HUD），别被它压住
             if (banner) {
                 // 结论横幅：放最顶部，大字，一眼能看到，不用滚
-                UILabel *bl = [[UILabel alloc] initWithFrame:CGRectMake(6, 2, f.size.width - 12, 40)];
+                UILabel *bl = [[UILabel alloc] initWithFrame:CGRectMake(6, 30, f.size.width - 12, 40)];
                 bl.textColor = [UIColor whiteColor];
                 bl.backgroundColor = [UIColor redColor];
                 bl.font = [UIFont boldSystemFontOfSize:15];
@@ -1653,57 +1948,47 @@ static void AIShowOverlayText(NSString *txt, BOOL done, NSString *banner) {
                 bl.numberOfLines = 2;
                 bl.text = banner;
                 [root addSubview:bl];
-                top = 46;
+                top = 78;
             }
 
             if (done) {
+                // ★ v10 修复：v6~v9 里 b3~b6 全部漏了 addSubview，而且 frame 都写成
+                //   (162, top) 互相重叠 —— 结果「收起盖屏 / 实测点击 / 立即上报」
+                //   这三个按钮从来没出现在屏幕上，点了也没反应。
+                //   改成统一的「两列网格」构造器，逐个 addSubview，杜绝再漏。
                 if (!gRT) gRT = [AIReportTarget new];
-                UIButton *b1 = [UIButton buttonWithType:UIButtonTypeSystem];
-                b1.frame = CGRectMake(6, top, 150, 38);
-                b1.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
-                [b1 setTitle:@"复制结论(短)" forState:UIControlStateNormal];
-                [b1 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-                b1.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-                [b1 addTarget:gRT action:@selector(copyTail:) forControlEvents:UIControlEventTouchUpInside];
-                [root addSubview:b1];
-
-                UIButton *b2 = [UIButton buttonWithType:UIButtonTypeSystem];
-                b2.frame = CGRectMake(162, top, 150, 38);
-                b2.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
-                [b2 setTitle:@"复制全文(长)" forState:UIControlStateNormal];
-                [b2 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-                b2.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-                [b2 addTarget:gRT action:@selector(copyReport:) forControlEvents:UIControlEventTouchUpInside];
-                UIButton *b3 = [UIButton buttonWithType:UIButtonTypeSystem];
-                b3.frame = CGRectMake(162, top, 150, 38);
-                b3.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
-                [b3 setTitle:@"收起盖屏(露出App)" forState:UIControlStateNormal];
-                [b3 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-                b3.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-                [b3 addTarget:gRT action:@selector(toggleOverlay:) forControlEvents:UIControlEventTouchUpInside];
-                UIButton *b4 = [UIButton buttonWithType:UIButtonTypeSystem];
-                b4.frame = CGRectMake(162, top, 150, 38);
-                b4.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
-                [b4 setTitle:@"▶ 实测:点App第一个按钮" forState:UIControlStateNormal];
-                [b4 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-                b4.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-                [b4 addTarget:gRT action:@selector(testTapButton:) forControlEvents:UIControlEventTouchUpInside];
-                UIButton *b5 = [UIButton buttonWithType:UIButtonTypeSystem];
-                b5.frame = CGRectMake(162, top, 150, 38);
-                b5.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
-                [b5 setTitle:@"▶ 实测:点屏幕中心" forState:UIControlStateNormal];
-                [b5 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-                b5.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-                [b5 addTarget:gRT action:@selector(testTapCenter:) forControlEvents:UIControlEventTouchUpInside];
-                UIButton *b6 = [UIButton buttonWithType:UIButtonTypeSystem];
-                b6.frame = CGRectMake(162, top, 150, 38);
-                b6.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
-                [b6 setTitle:@"▶ 立即上报状态(让我看到你)" forState:UIControlStateNormal];
-                [b6 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-                b6.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-                [b6 addTarget:gRT action:@selector(pingNow:) forControlEvents:UIControlEventTouchUpInside];
-                [root addSubview:b2];
-                top += 42;
+                CGFloat bw = (f.size.width - 18) / 2.0;
+                // 注意：ARC 禁止 struct 内嵌 OC 对象，所以标题/SEL/配色拆成三个平行的 C 数组
+                NSString *bt[] = {@"复制结论(短)", @"复制全文(长)",
+                                  @"收起盖屏(露出App)", @"▶ 实测:点App第一个按钮",
+                                  @"▶ 实测:点屏幕中心", @"▶ 立即上报(让我看到你)",
+                                  @"▶ 网络自检(结果写屏上)", @"显示/隐藏 顶端状态条"};
+                SEL ba[] = {@selector(copyTail:), @selector(copyReport:),
+                            @selector(toggleOverlay:), @selector(testTapButton:),
+                            @selector(testTapCenter:), @selector(pingNow:),
+                            @selector(netDiag:), @selector(toggleHud:)};
+                UIColor *bc[] = {[UIColor colorWithWhite:0.25 alpha:1],
+                                 [UIColor colorWithWhite:0.25 alpha:1],
+                                 [UIColor colorWithWhite:0.25 alpha:1],
+                                 [UIColor colorWithRed:0.10 green:0.35 blue:0.15 alpha:1],
+                                 [UIColor colorWithRed:0.10 green:0.35 blue:0.15 alpha:1],
+                                 [UIColor colorWithRed:0.45 green:0.15 blue:0.15 alpha:1],
+                                 [UIColor colorWithRed:0.15 green:0.25 blue:0.45 alpha:1],
+                                 [UIColor colorWithWhite:0.25 alpha:1]};
+                for (int i = 0; i < 8; i++) {
+                    CGFloat bx = (i % 2 == 0) ? 6 : (12 + bw);
+                    CGFloat by = top + (i / 2) * 42;
+                    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+                    b.frame = CGRectMake(bx, by, bw, 38);
+                    b.backgroundColor = bc[i];
+                    [b setTitle:bt[i] forState:UIControlStateNormal];
+                    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+                    b.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+                    b.titleLabel.adjustsFontSizeToFitWidth = YES;
+                    [b addTarget:gRT action:ba[i] forControlEvents:UIControlEventTouchUpInside];
+                    [root addSubview:b];
+                }
+                top += 42 * 4;
             } else {
                 UILabel *h = [[UILabel alloc] initWithFrame:CGRectMake(8, top, f.size.width - 16, 36)];
                 h.textColor = [UIColor yellowColor];
@@ -1791,8 +2076,9 @@ static void AITestTapButton(void) {
 
 static void AIShowOverlay(void) {
     [gLogLock lock]; NSString *txt = [gLog copy]; [gLogLock unlock];
-    NSString *banner = [NSString stringWithFormat:@"AI2 结论 tap=%d shot=%d se=%d tvhits=%d act=%d",
-                        gBestTap, gBestShot, gSendEventHits, gTargetHits, gActionHits];
+    NSString *banner = [NSString stringWithFormat:@"AI2 %@ 结论 tap=%d shot=%d se=%d tvhits=%d act=%d | 网✅%d/❌%d 报%d/%d",
+                        kAIVer, gBestTap, gBestShot, gSendEventHits, gTargetHits, gActionHits,
+                        gPollOK, gPollErr, gRepOK, gRepErr];
     AIShowOverlayText(txt, YES, banner);
 }
 
