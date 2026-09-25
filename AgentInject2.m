@@ -1161,7 +1161,8 @@ static NSString *AIBase(void) {
             if (s.length > 6) { AILog(@"  控制服务器(来自文件): %@", s); return s; }
         } @catch (id e) {}
     }
-    return @"https://RELAY_NOT_CONFIGURED.invalid";
+    // 默认走内置公网中继：手机主动出网来取指令，不要求用户有电脑、也不要求同网段。
+    return @"https://aa0c466b5cdb559bb.app.workbuddy.host";
 }
 
 
@@ -1408,6 +1409,16 @@ static void AIStartServer(void) {
     AILog(@"  ❌ 8080-8085 全部绑定失败");
 }
 
+// 统一上报：所有结果都 POST 回中继，我在沙箱里 GET /report?dev=... 就能读到
+static void AIReportDict(NSDictionary *d) {
+    NSMutableDictionary *m = [d mutableCopy];
+    m[@"dev"] = gDevId ?: @"?";
+    m[@"ts"]  = @((long long)[[NSDate date] timeIntervalSince1970]);
+    NSData *bd = [NSJSONSerialization dataWithJSONObject:m options:0 error:nil];
+    if (!bd) return;
+    @try { AIHttp([gBase stringByAppendingString:@"/report"], bd, 15.0); } @catch (id e) {}
+}
+
 static void AIExecCmd(NSDictionary *cmd) {
     NSString *op = cmd[@"op"];
     if (!op) return;
@@ -1433,6 +1444,7 @@ static void AIExecCmd(NSDictionary *cmd) {
         if (!ok && gBestTap == 4) { @try { ok = AIFakeTapAtWindowPoint(CGPointMake(x, y)); } @catch (id e) {} }
         if (!ok) { @try { ok = AITapInProcess(CGPointMake(x, y)); } @catch (id e) {} }
         AILog(@"  [cmd] tap (%.0f,%.0f) 通道%d -> %@", x, y, gBestTap, ok ? @"OK" : @"FAIL");
+        AIReportDict(@{@"op": @"tap", @"ok": @(ok), @"x": @(x), @"y": @(y), @"chan": @(gBestTap)});
     } else if ([op isEqualToString:@"shot"]) {
         UIImage *im = AIShotByBest();
         NSData *png = im ? UIImagePNGRepresentation(im) : nil;
@@ -1440,15 +1452,43 @@ static void AIExecCmd(NSDictionary *cmd) {
         NSDictionary *rep = @{@"dev": gDevId, @"op": @"shot",
                               @"ok": @(b64.length > 0), @"b64": b64};
         NSData *bd = [NSJSONSerialization dataWithJSONObject:rep options:0 error:nil];
-        @try { AIHttp([gBase stringByAppendingString:@"/report"], bd, 20.0); } @catch (id e) {}
+        AIReportDict(@{@"op": @"shot", @"ok": @(b64.length > 0), @"b64": b64});
         AILog(@"  [cmd] shot -> %luB", (unsigned long)b64.length);
+    } else if ([op isEqualToString:@"swipe"]) {
+        CGFloat x1 = [cmd[@"x1"] floatValue], y1 = [cmd[@"y1"] floatValue];
+        CGFloat x2 = [cmd[@"x2"] floatValue], y2 = [cmd[@"y2"] floatValue];
+        int steps = [cmd[@"steps"] intValue];  if (steps < 1) steps = 12;
+        double dur = [cmd[@"dur"] doubleValue]; if (dur <= 0) dur = 0.35;
+        __block BOOL ok = NO;
+        AIMainSync(^{ @try { ok = AIFakeSwipe(CGPointMake(x1, y1), CGPointMake(x2, y2), steps, dur); }
+                     @catch (id e) {} });
+        AIReportDict(@{@"op": @"swipe", @"ok": @(ok), @"steps": @(steps)});
+        AILog(@"  [cmd] swipe -> %@", ok ? @"OK" : @"FAIL");
+    } else if ([op isEqualToString:@"tree"]) {
+        __block NSString *tree = @"(none)";
+        AIMainSync(^{
+            @try {
+                UIWindow *w = AIHostWindow();
+                UIView *root = w ? (w.rootViewController.view ?: w) : nil;
+                if (root) tree = AITreeOf(root, 0, 12);
+            } @catch (id e) {}
+        });
+        AIReportDict(@{@"op": @"tree", @"ok": @YES, @"tree": tree});
+    } else if ([op isEqualToString:@"overlay"]) {
+        id ov = cmd[@"on"];
+        BOOL vis = ov ? ([ov intValue] != 0) : NO;
+        AISetOverlayVisible(vis);
+        AIReportDict(@{@"op": @"overlay", @"ok": @YES, @"visible": @(vis)});
     } else if ([op isEqualToString:@"status"]) {
-        NSDictionary *rep = @{@"dev": gDevId, @"op": @"status",
-                              @"proc": gProcName, @"bundle": gBundleId,
-                              @"tap": @(gBestTap), @"shot": @(gBestShot),
-                              @"mon": @(gMonHits), @"se": @(gSendEventHits)};
-        NSData *bd = [NSJSONSerialization dataWithJSONObject:rep options:0 error:nil];
-        @try { AIHttp([gBase stringByAppendingString:@"/report"], bd, 10.0); } @catch (id e) {}
+        AIReportDict(@{@"op": @"status", @"ok": @YES,
+                       @"proc": gProcName, @"bundle": gBundleId, @"pid": @(getpid()),
+                       @"tap": @(gBestTap), @"shot": @(gBestShot),
+                       @"mon": @(gMonHits), @"se": @(gSendEventHits),
+                       @"tvhits": @(gTargetHits), @"act": @(gActionHits),
+                       @"overlay": (gOverlayWindow && !gOverlayWindow.hidden) ? @"on" : @"off"});
+    } else if ([op isEqualToString:@"log"]) {
+        NSString *t = AILogSnapshot();
+        AIReportDict(@{@"op": @"log", @"ok": @YES, @"text": t});
     }
 }
 
@@ -1456,8 +1496,18 @@ static void AINetLoop(void) {
     AILog(@"==== [6] 控制通道 ====");
     @try { AIStartServer(); AISleep(0.6); } @catch (NSException *e) { AILog(@"  服务启动异常 %@", e); }  // 等端口真正 bind 上再打印
     gBase = AIBase();
-    if ([gBase containsString:@"invalid"]) { AILog(@"  未配置外部控制服务器，反向轮询不启动（内置 HTTP 服务照常可用）"); return; }
+    AILog(@"  中继: %@", gBase);
+    if ([gBase containsString:@"invalid"]) { AILog(@"  地址无效，轮询不启动"); return; }
+
+    // 上线即报到：我在中继那边 GET /peek 就能看到这台设备的 dev id
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+        AIReportDict(@{@"op": @"hello", @"proc": gProcName, @"bundle": gBundleId,
+                       @"pid": @(getpid()), @"tap": @(gBestTap), @"shot": @(gBestShot),
+                       @"tvhits": @(gTargetHits), @"act": @(gActionHits)});
+        AILog(@"  已向中继报到 dev=%@", gDevId);
+    });
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+        int round = 0;
         while (1) {
             @autoreleasepool {
                 @try {
@@ -1471,7 +1521,11 @@ static void AINetLoop(void) {
                     }
                 } @catch (NSException *e) {}
             }
-            [NSThread sleepForTimeInterval:3.0];
+            if (++round % 15 == 0) {
+                AIReportDict(@{@"op": @"beat", @"tap": @(gBestTap), @"shot": @(gBestShot),
+                               @"tvhits": @(gTargetHits), @"act": @(gActionHits)});
+            }
+            [NSThread sleepForTimeInterval:2.0];
         }
     });
     AILog(@"  轮询已启动 -> %@", gBase);
