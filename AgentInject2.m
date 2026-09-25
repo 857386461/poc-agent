@@ -106,7 +106,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v16";
+static NSString * const kAIVer = @"v17";
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -150,6 +150,7 @@ static BOOL AIDispatchFakeViaSendEvent(CGPoint pt, int steps, double dt);
 static BOOL AIFakeSwipe(CGPoint a, CGPoint b, int steps, double dur);
 static void AIMainSync(void (^b)(void));
 static NSString *AITreeOf(UIView *v, int depth, int maxDepth);
+static NSDictionary *AIScrollAt(CGPoint pt, double dy, double dx, BOOL anim);  // v17
 
 // ---------------------------------------------------------------------------
 // 2. HID 私有符号（全部 dlsym，不做链接期依赖）
@@ -1090,6 +1091,14 @@ static NSArray *AIRunMacro(NSArray *steps, double gapMs) {
                     BOOL viaSend = NO;
                     @try { viaSend = AIDispatchFakeViaSendEvent(CGPointMake([s[@"x"] floatValue], [s[@"y"] floatValue]), 2, 0.03); } @catch (id e) {}
                     r[@"ok"] = @(viaSend); r[@"how"] = viaSend ? @"sendEvent" : @"(未确认)";
+                } else if ([op isEqualToString:@"scroll"]) {
+                    NSDictionary *d = AIScrollAt(CGPointMake([s[@"x"] floatValue], [s[@"y"] floatValue]),
+                                                 [s[@"dy"] doubleValue], [s[@"dx"] doubleValue], YES);
+                    r[@"ok"] = d[@"ok"] ?: @NO;
+                    r[@"txt"] = [NSString stringWithFormat:@"%@ %@ -> %@ (移动 %.0f)",
+                                 d[@"sv"] ?: @"?", d[@"before"] ?: @"?",
+                                 d[@"after"] ?: @"?", [d[@"moved"] doubleValue]];
+                    if (d[@"err"]) r[@"err"] = d[@"err"];
                 } else if ([op isEqualToString:@"swipe"]) {
                     int steps = [s[@"steps"] intValue];  if (steps < 1) steps = 12;
                     double dur = [s[@"dur"] doubleValue]; if (dur <= 0) dur = 0.35;
@@ -1234,6 +1243,38 @@ static BOOL AIFakeSwipe(CGPoint a, CGPoint b, int steps, double dur) {
     AILog(@"  swipe 目标: %@ (%.0f,%.0f)->(%.0f,%.0f) steps=%d",
           NSStringFromClass([target class]), la.x, la.y, lb.x, lb.y, steps);
     return AIDispatchFakeSeq(target, la, lb, steps, dur);
+}
+
+// ---------------------------------------------------------------------------
+//   v17：伪触摸滑动已证实无效（回执 ok 但视图树零差异 —— UIKit 不路由伪造事件）。
+//   改走结果侧：直接改 UIScrollView.contentOffset，绕开整条触摸链。
+//   dy > 0 = 内容向上走（看到后面的内容），dy < 0 = 往回看。
+// ---------------------------------------------------------------------------
+static NSDictionary *AIScrollAt(CGPoint pt, double dy, double dx, BOOL anim) {
+    UIWindow *w = AIHostWindow();
+    if (!w) return @{@"ok": @NO, @"err": @"无 window"};
+    UIView *hit = nil;
+    @try { hit = [w hitTest:pt withEvent:nil]; } @catch (NSException *e) {}
+    UIView *v = hit;  UIScrollView *sv = nil;  int up = 0;
+    while (v && up < 25) {
+        if ([v isKindOfClass:[UIScrollView class]]) { sv = (UIScrollView *)v; break; }
+        v = v.superview; up++;
+    }
+    if (!sv) return @{@"ok": @NO, @"err": @"父链 25 层内无 UIScrollView",
+                      @"hit": hit ? NSStringFromClass(hit.class) : @"nil"};
+    CGPoint before = sv.contentOffset;
+    CGFloat maxY = MAX(0, sv.contentSize.height - sv.bounds.size.height);
+    CGFloat maxX = MAX(0, sv.contentSize.width  - sv.bounds.size.width);
+    CGPoint after = CGPointMake(MIN(maxX, MAX(0, before.x + dx)),
+                                MIN(maxY, MAX(0, before.y + dy)));
+    [sv setContentOffset:after animated:anim];
+    return @{@"ok": @YES, @"sv": NSStringFromClass(sv.class), @"up": @(up),
+             @"hit": hit ? NSStringFromClass(hit.class) : @"nil",
+             @"before": NSStringFromCGPoint(before),
+             @"after":  NSStringFromCGPoint(after),
+             @"moved":  @(after.y - before.y),
+             @"contentSize": NSStringFromCGSize(sv.contentSize),
+             @"frame":  NSStringFromCGRect(sv.bounds)};
 }
 
 // 主线程同步执行（HTTP 服务在后台线程，触摸/截图必须回主线程）
@@ -2163,6 +2204,16 @@ static void AIExecCmd(NSDictionary *cmd) {
         NSArray *res = AIRunMacro(steps, gapMs);
         AIReportDict(@{@"op": @"macro", @"ok": @YES, @"n": @(res.count), @"results": res});
         AILog(@"  [cmd] macro %lu 步完成", (unsigned long)res.count);
+    } else if ([op isEqualToString:@"scroll"]) {
+        // v17：伪触摸滑动无效，直接改 contentOffset
+        CGPoint p = CGPointMake([cmd[@"x"] floatValue], [cmd[@"y"] floatValue]);
+        double dy = [cmd[@"dy"] doubleValue];
+        double dx = [cmd[@"dx"] doubleValue];
+        BOOL anim = [cmd[@"anim"] respondsToSelector:@selector(boolValue)] ? [cmd[@"anim"] boolValue] : YES;
+        __block NSDictionary *d = nil;
+        AIMainSync(^{ @try { d = AIScrollAt(p, dy, dx, anim); } @catch (NSException *e) {} });
+        AILog(@"  [cmd] scroll dy=%.0f -> %@", dy, d);
+        AIReportDict(@{@"op": @"scroll", @"info": d ?: @{@"err": @"scroll 返回 nil"}});
     } else if ([op isEqualToString:@"diag"]) {
         NSString *s = AINetDiag();
         gDiagText = s;
