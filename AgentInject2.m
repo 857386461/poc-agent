@@ -106,6 +106,7 @@ static UIWindow *gOverlayWindow = nil;
 static void AIBoot(void);
 // AITapInProcess（约 430 行）在 AIHostWindow 定义（约 580 行）之前就要用它
 static UIWindow *AIHostWindow(void);
+static void AISetOverlayVisible(BOOL vis);   // 盖屏按钮在它的定义之前就要用
 
 // ---------------------------------------------------------------------------
 // 2. HID 私有符号（全部 dlsym，不做链接期依赖）
@@ -800,8 +801,10 @@ static void AITargetViewTest(void) {
 
     NSString *cn = NSStringFromClass([target class]);
     AILog(@"  目标 view: %@  屏幕 %.0fx%.0f 点(%.0f,%.0f)", cn, s.width, s.height, pt.x, pt.y);
-    if ([cn hasPrefix:@"AI"] || target == gOverlayWindow) {
+    if (target.window == gOverlayWindow || [cn hasPrefix:@"AI"]) {
         AILog(@"  ⚠️ 命中的是我们自己的盖屏 —— 没找到 App 自己的窗口");
+    } else {
+        AILog(@"  ✓ 命中的是 App 自己的 view（window=%@）", NSStringFromClass([target.window class]));
     }
 
     @try { AIHookTouchesOn([target class]); } @catch (id e) { AILog(@"  hook 失败"); }
@@ -1219,12 +1222,21 @@ static void AIServeFd(int fd) {
         q = [tgt substringFromIndex:qm.location + 1];
     }
 
+    if ([path isEqualToString:@"/overlay"]) {
+        NSString *on = AIQv(q, @"on");
+        BOOL vis = !(on && ([on isEqualToString:@"0"] || [on isEqualToString:@"false"]
+                            || [on isEqualToString:@"off"] || [on isEqualToString:@"hide"]));
+        AISetOverlayVisible(vis);
+        AIJson(fd, @{@"ok": @YES, @"op": @"overlay", @"visible": @(vis)});
+        return;
+    }
     if ([path isEqualToString:@"/status"]) {
         AIJson(fd, @{@"ok": @YES, @"proc": gProcName, @"bundle": gBundleId,
                      @"dev": gDevId, @"pid": @(getpid()),
                      @"tap": @(gBestTap), @"shot": @(gBestShot),
                      @"mon": @(gMonHits), @"se": @(gSendEventHits),
                      @"targetViewHits": @(gTargetHits),
+                     @"overlay": gOverlayWindow && !gOverlayWindow.hidden ? @"on" : @"off",
                      @"port": @(gSrvPort), @"ip": gSrvIp ?: @""});
         return;
     }
@@ -1304,6 +1316,8 @@ static void AIServeFd(int fd) {
         @"  GET /swipe?x1=&y1=&x2=&y2=&steps=12&dur=0.35\n"
         @"  GET /shot                -> PNG 截图（/shot?fmt=b64 拿 base64）\n"
         @"  GET /tree                -> 视图树\n"
+        @"  GET /overlay?on=0        -> 收起盖屏（必须先做这步，否则点击被盖屏拦截）\n"
+        @"  GET /overlay?on=1        -> 恢复盖屏\n"
         @"  GET /report  /log?n=200  -> 报告 / 日志尾\n"
         @"\n本机: http://%@:%d/\n通道: tap=%d shot=%d\n",
         ip, gSrvPort, gBestTap, gBestShot];
@@ -1434,13 +1448,17 @@ static void AINetLoop(void) {
 @interface AIReportTarget : NSObject
 @end
 @implementation AIReportTarget
+- (void)toggleOverlay:(id)sender {
+    BOOL nowVisible = gOverlayWindow ? !gOverlayWindow.hidden : NO;
+    AISetOverlayVisible(!nowVisible);   // 可见就收起，收起就放回
+}
 - (void)copyTail:(id)sender {
     @try {
         [gLogLock lock]; NSString *t = [gLog copy]; [gLogLock unlock];
         NSArray *lines = [t componentsSeparatedByString:@"\n"];
         NSArray *tail = ([lines count] > 25) ? [lines subarrayWithRange:NSMakeRange([lines count] - 25, 25)] : lines;
-        NSString *short1 = [NSString stringWithFormat:@"AI2 结论 tap=%d shot=%d se=%d mon=%d\n---\n%@",
-                            gBestTap, gBestShot, gSendEventHits, gMonHits,
+        NSString *short1 = [NSString stringWithFormat:@"AI2 结论 tap=%d shot=%d se=%d mon=%d tvhits=%d\n---\n%@",
+                            gBestTap, gBestShot, gSendEventHits, gMonHits, gTargetHits,
                             [tail componentsJoinedByString:@"\n"]];
         [UIPasteboard generalPasteboard].string = short1;
         AILog(@"已复制结论（%lu 字符）", (unsigned long)short1.length);
@@ -1518,6 +1536,13 @@ static void AIShowOverlayText(NSString *txt, BOOL done, NSString *banner) {
                 [b2 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
                 b2.titleLabel.font = [UIFont boldSystemFontOfSize:14];
                 [b2 addTarget:gRT action:@selector(copyReport:) forControlEvents:UIControlEventTouchUpInside];
+                UIButton *b3 = [UIButton buttonWithType:UIButtonTypeSystem];
+                b3.frame = CGRectMake(162, top, 150, 38);
+                b3.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
+                [b3 setTitle:@"收起盖屏(露出App)" forState:UIControlStateNormal];
+                [b3 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+                b3.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+                [b3 addTarget:gRT action:@selector(toggleOverlay:) forControlEvents:UIControlEventTouchUpInside];
                 [root addSubview:b2];
                 top += 42;
             } else {
@@ -1552,9 +1577,20 @@ static void AIShowOverlayText(NSString *txt, BOOL done, NSString *banner) {
 
 static void AIShowOverlay(void) {
     [gLogLock lock]; NSString *txt = [gLog copy]; [gLogLock unlock];
-    NSString *banner = [NSString stringWithFormat:@"AI2 结论 tap=%d shot=%d se=%d mon=%d",
-                        gBestTap, gBestShot, gSendEventHits, gMonHits];
+    NSString *banner = [NSString stringWithFormat:@"AI2 结论 tap=%d shot=%d se=%d mon=%d tvhits=%d",
+                        gBestTap, gBestShot, gSendEventHits, gMonHits, gTargetHits];
     AIShowOverlayText(txt, YES, banner);
+}
+
+// 盖屏开关：盖屏在的时候会拦截所有 hitTest，API 点击根本到不了 App。
+// 所以必须能一键收起来。hidden 只是把窗口藏起来，对象还留着，随时能放回来。
+static void AISetOverlayVisible(BOOL vis) {
+    if (!gOverlayWindow) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        gOverlayWindow.hidden = !vis;
+        if (vis) [gOverlayWindow makeKeyAndVisible];
+        AILog(@"  [overlay] 盖屏已%@", vis ? @"恢复显示" : @"收起（露出 App，API 点击生效）");
+    });
 }
 
 // ---------------------------------------------------------------------------
