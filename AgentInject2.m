@@ -106,7 +106,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v15";
+static NSString * const kAIVer = @"v16";
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -146,6 +146,10 @@ static NSString *AITcpTest(const char *host, int port, double tmoSec);  // AINet
 // 在本文件里任何「定义在后面的 static 函数」被提前调用，都得在这里补一行声明。
 static void AISleep(double sec);                        // 7c 段在它定义之前调用
 static BOOL AIDispatchFakeViaSendEvent(CGPoint pt, int steps, double dt);
+// v16：macro（~1000 行）要在下面这几个函数的定义之前调用它们
+static BOOL AIFakeSwipe(CGPoint a, CGPoint b, int steps, double dur);
+static void AIMainSync(void (^b)(void));
+static NSString *AITreeOf(UIView *v, int depth, int maxDepth);
 
 // ---------------------------------------------------------------------------
 // 2. HID 私有符号（全部 dlsym，不做链接期依赖）
@@ -1039,6 +1043,92 @@ static NSDictionary *AIPickByText(NSString *kw) {
     NSMutableDictionary *d = [AIPickCellIn(best, [NSMutableDictionary dictionary]) mutableCopy];
     d[@"cands"] = @(cands.count);
     return d;
+}
+
+// ---------------------------------------------------------------------------
+// 7f. v16：macro —— 一串动作一次下发，手机本地连跑，最后一次上报
+//
+//   慢的根因：手机每 2 秒才来 poll 一次，每个动作都要等一趟往返。
+//   实测 6 个动作 = 21 秒，其中绝大部分是"等手机来取"的空转。
+//   macro 把整串动作塞进一条指令：手机本地按 gap 依次执行，往返只有一次。
+//   （同时轮询改成自适应：刚执行过指令就快轮询，空闲时退回慢轮询省电。）
+// ---------------------------------------------------------------------------
+static NSArray *AIRunMacro(NSArray *steps, double gapMs) {
+    NSMutableArray *out = [NSMutableArray array];
+    int idx = 0;
+    for (NSDictionary *s in steps) {
+        if (![s isKindOfClass:[NSDictionary class]]) continue;
+        idx++;
+        NSString *op = s[@"op"] ?: @"";
+        NSMutableDictionary *r = [NSMutableDictionary dictionary];
+        r[@"i"] = @(idx); r[@"op"] = op;
+
+        AIMainSync(^{
+            @try {
+                if ([op isEqualToString:@"wait"]) {
+                    double ms = [s[@"ms"] doubleValue]; if (ms <= 0) ms = gapMs;
+                    AISleep(ms / 1000.0);
+                    r[@"ok"] = @YES;
+                } else if ([op isEqualToString:@"pick"]) {
+                    NSDictionary *d = AIPickAt(CGPointMake([s[@"x"] floatValue], [s[@"y"] floatValue]));
+                    r[@"ok"]  = d[@"ok"] ?: @NO;
+                    r[@"how"] = d[@"how"] ?: @"";
+                    r[@"txt"] = d[@"cellText"] ?: d[@"ctrl"] ?: @"";
+                    if (d[@"err"]) r[@"err"] = d[@"err"];
+                } else if ([op isEqualToString:@"picktxt"]) {
+                    NSDictionary *d = AIPickByText(s[@"text"] ?: @"");
+                    r[@"ok"]  = d[@"ok"] ?: @NO;
+                    r[@"how"] = d[@"how"] ?: @"";
+                    r[@"txt"] = d[@"cellText"] ?: @"";
+                    r[@"cands"] = d[@"cands"] ?: @0;
+                    if (d[@"err"]) r[@"err"] = d[@"err"];
+                } else if ([op isEqualToString:@"tapui"]) {
+                    NSString *desc = nil;
+                    BOOL ok = AITapUIControlAt(CGPointMake([s[@"x"] floatValue], [s[@"y"] floatValue]), &desc);
+                    r[@"ok"] = @(ok); r[@"txt"] = desc ?: @"";
+                } else if ([op isEqualToString:@"tap"]) {
+                    BOOL viaSend = NO;
+                    @try { viaSend = AIDispatchFakeViaSendEvent(CGPointMake([s[@"x"] floatValue], [s[@"y"] floatValue]), 2, 0.03); } @catch (id e) {}
+                    r[@"ok"] = @(viaSend); r[@"how"] = viaSend ? @"sendEvent" : @"(未确认)";
+                } else if ([op isEqualToString:@"swipe"]) {
+                    int steps = [s[@"steps"] intValue];  if (steps < 1) steps = 12;
+                    double dur = [s[@"dur"] doubleValue]; if (dur <= 0) dur = 0.35;
+                    BOOL ok = AIFakeSwipe(CGPointMake([s[@"x1"] floatValue], [s[@"y1"] floatValue]),
+                                          CGPointMake([s[@"x2"] floatValue], [s[@"y2"] floatValue]), steps, dur);
+                    r[@"ok"] = @(ok);
+                } else if ([op isEqualToString:@"rows"]) {
+                    NSString *t = AIRowsInfo();
+                    NSString *head = t.length > 300 ? [t substringToIndex:300] : t;
+                    r[@"ok"] = @YES; r[@"txt"] = head;
+                    r[@"n"]  = @([t componentsSeparatedByString:@"\n"].count);
+                } else if ([op isEqualToString:@"tree"]) {
+                    UIWindow *w = AIHostWindow();
+                    UIView *root = w ? (w.rootViewController.view ?: w) : nil;
+                    NSString *t = root ? AITreeOf(root, 0, 12) : @"";
+                    r[@"ok"] = @YES; r[@"n"] = @([t componentsSeparatedByString:@"\n"].count);
+                    NSString *b64 = [[t dataUsingEncoding:NSUTF8StringEncoding] base64EncodedStringWithOptions:0];
+                    r[@"b64"] = b64 ?: @"";      // 完整树塞回来，省一趟往返
+                } else if ([op isEqualToString:@"toast"]) {
+                    AIToast(s[@"text"] ?: @"(空)");
+                    r[@"ok"] = @YES;
+                } else if ([op isEqualToString:@"probe"]) {
+                    NSDictionary *d = AIProbeAt(CGPointMake([s[@"x"] floatValue], [s[@"y"] floatValue]));
+                    r[@"ok"] = @YES; r[@"txt"] = [NSString stringWithFormat:@"%@ / %@",
+                                                  d[@"hit"] ?: @"?", d[@"ctrl"] ?: @"?"];
+                } else {
+                    r[@"ok"] = @NO; r[@"err"] = [@"macro 不支持的 op: " stringByAppendingString:op];
+                }
+            } @catch (NSException *e) {
+                r[@"ok"] = @NO; r[@"err"] = e.reason ?: @"异常";
+            }
+            // 每步之间留出动画时间（wait 步自己已经睡过了）
+            if (![op isEqualToString:@"wait"]) AISleep(gapMs / 1000.0);
+        });
+        [out addObject:r];
+        AILog(@"  [macro %d/%lu] %@ -> ok=%@ %@",
+              idx, (unsigned long)steps.count, op, r[@"ok"], r[@"txt"] ?: r[@"err"] ?: @"");
+    }
+    return out;
 }
 
 // 诊断：把所有 window / scene 打出来，一眼看出到底有没有 App 自己的窗口
@@ -2008,7 +2098,7 @@ static void AIExecCmd(NSDictionary *cmd) {
         AISetOverlayVisible(vis);
         AIReportDict(@{@"op": @"overlay", @"ok": @YES, @"visible": @(vis)});
     } else if ([op isEqualToString:@"status"]) {
-        AIReportDict(@{@"op": @"status", @"ok": @YES,
+        AIReportDict(@{@"op": @"status", @"ok": @YES, @"ver": kAIVer,
                        @"proc": gProcName, @"bundle": gBundleId, @"pid": @(getpid()),
                        @"tap": @(gBestTap), @"shot": @(gBestShot),
                        @"mon": @(gMonHits), @"se": @(gSendEventHits),
@@ -2062,6 +2152,17 @@ static void AIExecCmd(NSDictionary *cmd) {
         AIMainSync(^{ @try { d = AIPickByText(kw); } @catch (id e) {} });
         AILog(@"  [cmd] picktxt '%@' -> %@", kw, d);
         AIReportDict(@{@"op": @"picktxt", @"text": kw, @"info": d ?: @{@"err": @"picktxt 返回 nil"}});
+    } else if ([op isEqualToString:@"macro"]) {
+        // v16：一串动作本地连跑 —— 往返从 N 次降到 1 次，这是提速的关键
+        NSArray *steps = cmd[@"steps"];
+        double gapMs = [cmd[@"gap"] doubleValue]; if (gapMs <= 0) gapMs = 700;
+        if (![steps isKindOfClass:[NSArray class]] || !steps.count) {
+            AIReportDict(@{@"op": @"macro", @"ok": @NO, @"err": @"steps 为空"});
+            return;
+        }
+        NSArray *res = AIRunMacro(steps, gapMs);
+        AIReportDict(@{@"op": @"macro", @"ok": @YES, @"n": @(res.count), @"results": res});
+        AILog(@"  [cmd] macro %lu 步完成", (unsigned long)res.count);
     } else if ([op isEqualToString:@"diag"]) {
         NSString *s = AINetDiag();
         gDiagText = s;
@@ -2080,6 +2181,9 @@ static void AIHudTickLoop(void) {
 }
 
 static BOOL gNetStarted = NO;
+// v16：自适应轮询间隔（刚干完活 -> 0.35s 快轮询；空闲 -> 逐步退回 2.5s）
+static double gPollGap = 2.0;
+static double gLastBeat = 0;
 
 static void AINetLoop(void) {
     if (gNetStarted) return;    // 幂等：早期先起一次网络，后面再调不会重复启动
@@ -2127,7 +2231,7 @@ static void AINetLoop(void) {
         AILog(@"  已向中继报到 dev=%@  中继=%@", gDevId, gBase);
     });
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
-        int round = 0, failRun = 0;
+        int failRun = 0;
         while (1) {
             @autoreleasepool {
                 @try {
@@ -2156,19 +2260,30 @@ static void AINetLoop(void) {
                             failRun = 0;
                         }
                     }
+                    BOOL gotCmd = NO;
                     if (d.length) {
                         id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
-                        if ([j isKindOfClass:[NSDictionary class]]) { gCmdGot++; AIExecCmd(j); }
-                        else if ([j isKindOfClass:[NSArray class]])
-                            for (NSDictionary *c in (NSArray *)j) { gCmdGot++; AIExecCmd(c); }
+                        if ([j isKindOfClass:[NSDictionary class]]) { gCmdGot++; AIExecCmd(j); gotCmd = YES; }
+                        else if ([j isKindOfClass:[NSArray class]]) {
+                            NSArray *arr = (NSArray *)j;
+                            gotCmd = arr.count > 0;
+                            for (NSDictionary *c in arr) { gCmdGot++; AIExecCmd(c); }
+                        }
                     }
+                    // v16 自适应轮询：刚执行过指令说明"正在被操作"，立刻切快轮询抓紧接下一串；
+                    // 空闲下来再逐步退回慢轮询省电。固定 2 秒是之前最大的速度瓶颈。
+                    if (gotCmd) gPollGap = 0.35;
+                    else        gPollGap = MIN(gPollGap * 1.7, 2.5);
                 } @catch (NSException *e) {}
             }
-            if (++round % 15 == 0) {
+            // beat 改成按时间（20 秒一次），不再按轮询次数 —— 次数会随 gap 变化而失控
+            double now = [[NSDate date] timeIntervalSince1970];
+            if (now - gLastBeat > 20) {
+                gLastBeat = now;
                 AIReportDict(@{@"op": @"beat", @"ver": kAIVer, @"tap": @(gBestTap), @"shot": @(gBestShot),
-                               @"tvhits": @(gTargetHits), @"act": @(gActionHits)});
+                               @"tvhits": @(gTargetHits), @"act": @(gActionHits), @"gap": @(gPollGap)});
             }
-            [NSThread sleepForTimeInterval:2.0];
+            [NSThread sleepForTimeInterval:gPollGap];
         }
     });
     AILog(@"  轮询已启动(%@) -> %@", kAIVer, gBase);
