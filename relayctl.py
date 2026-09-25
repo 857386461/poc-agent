@@ -40,8 +40,29 @@ def main():
         print(json.dumps(get("/peek"), indent=2)); return
 
     if a == "report":
+        # 注意：不能在这里截断再 json.dumps —— tree/log 动辄上万字符，
+        # 截断会切在 JSON 中间，调用方解析直接炸。要截就截字段内容。
         r = get("/report?dev=" + sys.argv[2])
-        print(json.dumps(r, indent=2, ensure_ascii=False)[:4000]); return
+        print(json.dumps(r, indent=2, ensure_ascii=False)); return
+
+    if a == "tree":
+        # 直接按 op=tree 取，绕开 beat 心跳的覆盖问题
+        r = get("/report?dev=%s&op=tree" % sys.argv[2])
+        d = r.get("data") or {}
+        if d.get("tree"):
+            print(d["tree"])
+        else:
+            print("(还没收到 tree 返回: %s)" % json.dumps(r, ensure_ascii=False)[:300])
+        return
+
+    if a == "get":
+        # 通用：按 op 取任意历史结果  relayctl.py get <dev> <op>
+        print(json.dumps(get("/report?dev=%s&op=%s" % (sys.argv[2], sys.argv[3])),
+                         indent=2, ensure_ascii=False))
+        return
+
+    if a == "argv":
+        print(json.dumps(sys.argv, ensure_ascii=False)); return
 
     if a == "shot":
         dev, out = sys.argv[2], (sys.argv[3] if len(sys.argv) > 3 else "shot.png")
