@@ -106,7 +106,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v17";
+static NSString * const kAIVer = @"v18";
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -151,6 +151,8 @@ static BOOL AIFakeSwipe(CGPoint a, CGPoint b, int steps, double dur);
 static void AIMainSync(void (^b)(void));
 static NSString *AITreeOf(UIView *v, int depth, int maxDepth);
 static NSDictionary *AIScrollAt(CGPoint pt, double dy, double dx, BOOL anim);  // v17
+static NSString *AIBack(void);                  // v18：AIRunMacro(~1057) 在它定义之前要调用
+static NSString *AINavInfo(void);               // v18
 
 // ---------------------------------------------------------------------------
 // 2. HID 私有符号（全部 dlsym，不做链接期依赖）
@@ -1124,6 +1126,12 @@ static NSArray *AIRunMacro(NSArray *steps, double gapMs) {
                     NSDictionary *d = AIProbeAt(CGPointMake([s[@"x"] floatValue], [s[@"y"] floatValue]));
                     r[@"ok"] = @YES; r[@"txt"] = [NSString stringWithFormat:@"%@ / %@",
                                                   d[@"hit"] ?: @"?", d[@"ctrl"] ?: @"?"];
+                } else if ([op isEqualToString:@"back"]) {
+                    NSString *t = AIBack();
+                    r[@"ok"] = @(![t hasPrefix:@"act=none"]);
+                    r[@"txt"] = t;
+                } else if ([op isEqualToString:@"nav"]) {
+                    r[@"ok"] = @YES; r[@"txt"] = AINavInfo();
                 } else {
                     r[@"ok"] = @NO; r[@"err"] = [@"macro 不支持的 op: " stringByAppendingString:op];
                 }
@@ -1138,6 +1146,96 @@ static NSArray *AIRunMacro(NSArray *steps, double gapMs) {
               idx, (unsigned long)steps.count, op, r[@"ok"], r[@"txt"] ?: r[@"err"] ?: @"");
     }
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// 7i. v18：back / nav —— 治「看得见却点不着」的返回键
+//
+//   现象：微信「作品」页（FlutterView）左上角明明有返回箭头，probe 扫过去却
+//         整屏零 UIControl。原因：那个箭头是 Flutter 用 Skia 自己画到画布上的，
+//         UIKit 视图树里根本没有对应的 UIButton —— 靠 UIControl 的 pick/tapui
+//         必然找不到；伪造触摸 Flutter 引擎也不认（跟 tap/swipe 一个病）。
+//   但视图树里有 UINavigationTransitionView ⇒ 这一页是 push 进原生导航栈的。
+//   所以解法不是"点箭头"，而是"绕开 UI，直接命令导航栈 pop"。
+// ---------------------------------------------------------------------------
+
+// 递归收集所有 view 的 nextResponder（是 UIViewController 的）——
+// 比从 rootViewController 一层层下钻可靠：微信的容器 VC 不一定走标准
+// nav/tab/presented 关系，但每个 VC 的 view 一定在响应链上。
+static void AICollectVCs(UIView *v, NSMutableArray *out, int depth, int maxDepth) {
+    if (!v || depth > maxDepth) return;
+    id nr = v.nextResponder;
+    if ([nr isKindOfClass:[UIViewController class]] && ![out containsObject:nr]) [out addObject:nr];
+    for (UIView *s in v.subviews) AICollectVCs(s, out, depth + 1, maxDepth);
+}
+
+// 当前屏幕上能摸到的所有 VC（含窗口根 VC）
+static NSArray *AIVCsOnScreen(void) {
+    NSMutableArray *vcs = [NSMutableArray array];
+    UIWindow *w = AIHostWindow();
+    if (w == gOverlayWindow || w == gHudWindow) return vcs;   // 别把自己盖的屏当宿主
+    if (w.rootViewController) [vcs addObject:w.rootViewController];
+    AICollectVCs(w, vcs, 0, 40);
+    return vcs;
+}
+
+static NSString *AINavInfo(void) {
+    __block NSMutableString *s = [NSMutableString string];
+    AIMainSync(^{
+        UIWindow *w = AIHostWindow();
+        [s appendFormat:@"hostWin=%@ root=%@\n", NSStringFromClass([w class]),
+            w.rootViewController ? NSStringFromClass([w.rootViewController class]) : @"(nil)"];
+        int i = 0;
+        for (UIViewController *vc in AIVCsOnScreen()) {
+            BOOL vis = (vc.isViewLoaded && vc.view.window != nil);
+            UINavigationController *n = [vc isKindOfClass:[UINavigationController class]]
+                ? (UINavigationController *)vc : vc.navigationController;
+            NSMutableString *ex = [NSMutableString string];
+            if (n) [ex appendFormat:@" NAV(栈深%d)", (int)n.viewControllers.count];
+            if (vc.presentedViewController)
+                [ex appendFormat:@" present=%@", NSStringFromClass([vc.presentedViewController class])];
+            [s appendFormat:@"  [%d] %@ 可见=%@%@\n", i++, NSStringFromClass([vc class]),
+                vis ? @"Y" : @"n", ex];
+        }
+    });
+    return [s copy];
+}
+
+static NSString *AIBack(void) {
+    __block NSMutableString *s = [NSMutableString string];
+    AIMainSync(^{
+        NSArray *vcs = AIVCsOnScreen();
+
+        // 1) 最内层「被 present 且可见」的 VC → dismiss（弹出的东西优先关掉）
+        UIViewController *presTarget = nil;
+        for (UIViewController *vc in vcs) {
+            UIViewController *p = vc.presentedViewController;
+            if (p && !p.isBeingDismissed && p.isViewLoaded && p.view.window) presTarget = p;
+        }
+
+        // 2) 可见的、栈深 >1 的 UINavigationController → pop（push 进来的页面）
+        UINavigationController *navToPop = nil;
+        for (UIViewController *vc in vcs) {
+            UINavigationController *n = [vc isKindOfClass:[UINavigationController class]]
+                ? (UINavigationController *)vc : vc.navigationController;
+            if (n && n.viewControllers.count > 1 && n.isViewLoaded && n.view.window) {
+                if (!navToPop || n.viewControllers.count >= navToPop.viewControllers.count) navToPop = n;
+            }
+        }
+
+        if (presTarget) {
+            [s appendFormat:@"act=dismiss 目标=%@ ", NSStringFromClass([presTarget class])];
+            [presTarget.presentingViewController dismissViewControllerAnimated:YES completion:nil];
+        } else if (navToPop) {
+            [s appendFormat:@"act=pop nav=%@ 栈深=%d 退掉=%@ ",
+                NSStringFromClass([navToPop class]), (int)navToPop.viewControllers.count,
+                NSStringFromClass([navToPop.topViewController class])];
+            [navToPop popViewControllerAnimated:YES];
+        } else {
+            [s appendString:@"act=none(没找到可见的导航栈，先跑 nav 看结构)"];
+        }
+    });
+    return [s copy];
 }
 
 // 诊断：把所有 window / scene 打出来，一眼看出到底有没有 App 自己的窗口
@@ -2214,6 +2312,15 @@ static void AIExecCmd(NSDictionary *cmd) {
         AIMainSync(^{ @try { d = AIScrollAt(p, dy, dx, anim); } @catch (NSException *e) {} });
         AILog(@"  [cmd] scroll dy=%.0f -> %@", dy, d);
         AIReportDict(@{@"op": @"scroll", @"info": d ?: @{@"err": @"scroll 返回 nil"}});
+    } else if ([op isEqualToString:@"back"]) {
+        // v18：绕开 UI，直接命令导航栈返回（治 Flutter/游戏这类"看得见点不着"的返回键）
+        NSString *t = AIBack();
+        AILog(@"  [cmd] back -> %@", t);
+        AIReportDict(@{@"op": @"back", @"ok": @(![t hasPrefix:@"act=none"]), @"txt": t});
+    } else if ([op isEqualToString:@"nav"]) {
+        NSString *t = AINavInfo();
+        AILog(@"  [cmd] nav:\n%@", t);
+        AIReportDict(@{@"op": @"nav", @"ok": @YES, @"txt": t});
     } else if ([op isEqualToString:@"diag"]) {
         NSString *s = AINetDiag();
         gDiagText = s;
