@@ -1682,7 +1682,7 @@ static void AINetLoop(void) {
                                        &d, &pe, NULL, NULL);
                     if (ok) {
                         gPollOK++; failRun = 0;
-                        if (gPollOK == 1) AILog(@"  ✅ 首次轮询成功，已上线");
+                        if (gPollOK == 1) AILog(@"  ✅ 首次轮询成功，已上线 -> %@", gActiveBase);
                     } else {
                         gPollErr++; failRun++;
                         gLastErrCode = pe ? pe.code : -999;
@@ -1838,10 +1838,17 @@ static void AIHudApply(void) {
             CGFloat h = (gToastText.length || gDiagText.length) ? 56 : 26;
             CGRect hf = CGRectMake(0, 0, f.size.width, h);
             if (!gHudWindow) {
-                gHudWindow = [[UIWindow alloc] initWithFrame:hf];
-                if ([gHudWindow respondsToSelector:@selector(setWindowScene:)]) {
-                    UIWindowScene *sc = AIFirstWindowScene();
-                    if (sc) gHudWindow.windowScene = sc;
+                UIWindowScene *sc = AIFirstWindowScene();
+                if (sc) {
+                    // ★ v11 修复：iOS 13+ 必须用 initWithWindowScene:。用 initWithFrame:
+                    //   建出来的 UIWindow 不属于任何 scene —— 它会显示，但 scene 不认它，
+                    //   makeKeyAndVisible 之后【按键事件投递链会断掉】，表现就是
+                    //   sendEvent 计数永远是 0、屏幕上点哪儿都没反应。
+                    //   v10 的 se=0 就是这个原因（v9 时还是 se=366~398）。
+                    gHudWindow = [[UIWindow alloc] initWithWindowScene:sc];
+                    gHudWindow.frame = hf;
+                } else {
+                    gHudWindow = [[UIWindow alloc] initWithFrame:hf];
                 }
                 gHudWindow.windowLevel = UIWindowLevelStatusBar + 500;
                 gHudWindow.backgroundColor = [UIColor clearColor];
@@ -1856,7 +1863,11 @@ static void AIHudApply(void) {
                 UIViewController *vc = [UIViewController new];
                 vc.view = bg;
                 gHudWindow.rootViewController = vc;
-                [gHudWindow makeKeyAndVisible];
+
+                // ★ 绝不能用 makeKeyAndVisible —— 那会把 App 自己的窗口挤成非 key，
+                //   事件链直接断掉（v10 实测 se=0 的元凶之一）。
+                //   只显示、不抢 key。
+                gHudWindow.hidden = NO;
             }
             gHudWindow.frame = hf;
             gHudWindow.hidden = NO;
@@ -2018,7 +2029,15 @@ static void AIShowOverlayText(NSString *txt, BOOL done, NSString *banner) {
             UIViewController *vc = [UIViewController new];
             vc.view = root;
             gOverlayWindow.rootViewController = vc;
-            [gOverlayWindow makeKeyAndVisible];
+
+            // ★ 盖屏是「操作界面」，它确实需要能接收点击，所以它用 makeKeyAndVisible
+            //   是对的。但必须保证它在窗口层级里【只被 makeKey 一次】，不能反复抢。
+            if (!gOverlayWindow.isKeyWindow) [gOverlayWindow makeKeyAndVisible];
+            else gOverlayWindow.hidden = NO;
+
+            // 盖屏一显示就把 HUD 拉回来 —— 否则 HUD 会被盖屏压在下面看不见，
+            // 用户就没法把「网✅/网❌」念给我听了。
+            if (gHudWanted) AIHudApply();
             AILog(@"盖屏已刷新（%lu 字符, done=%d）", (unsigned long)txt.length, done);
         } @catch (NSException *e) { AILog(@"盖屏异常 %@", e); }
     });
