@@ -114,7 +114,10 @@ static UIWindow        *gHudWindow   = nil;   // 顶端常驻状态条（独立�
 static UILabel         *gHudLabel    = nil;
 static BOOL             gHudWanted   = YES;
 static NSString        *gActiveBase  = nil;   // 当前实际在用的中继地址（可能是 IP 兜底）
-static UIBackgroundTaskIdentifier gBgTask = UIBackgroundTaskInvalid;
+// 注意：不能用 UIBackgroundTaskInvalid 初始化 —— 它不是编译期常量，
+// static 变量拿它当 initializer 会直接报 "initializer element is not a compile-time constant"。
+static UIBackgroundTaskIdentifier gBgTask = 0;
+static BOOL gBgActive = NO;
 
 // 盖屏窗口。必须是 static 强引用，否则 ARC 会在函数返回时把它释放掉，
 // 表现就是"注入成功但屏幕上什么都没有"（v2 踩过的坑）。
@@ -1648,9 +1651,11 @@ static void AINetLoop(void) {
         @try {
             UIApplication *ap = [UIApplication sharedApplication];
             gBgTask = [ap beginBackgroundTaskWithName:@"AIPoll" expirationHandler:^{
-                @try { [ap endBackgroundTask:gBgTask]; } @catch (id e) {}
-                gBgTask = UIBackgroundTaskInvalid;
+                @try { if (gBgActive) [ap endBackgroundTask:gBgTask]; } @catch (id e) {}
+                gBgActive = NO; gBgTask = 0;
             }];
+            gBgActive = (gBgTask != 0);
+            AILog(@"  后台任务: %@", gBgActive ? @"已申请（锁屏后能多撑一会儿）" : @"申请失败");
         } @catch (id e) {}
     });
 
