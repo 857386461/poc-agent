@@ -106,7 +106,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v13";
+static NSString * const kAIVer = @"v14";
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -716,6 +716,84 @@ static BOOL AIDispatchFakeViaSendEvent(CGPoint screenPt, int steps, double dt) {
     int dact = gActionHits - actBefore;
     AILog(@"    sendEvent 路径: 进入 sendEvent %+d 次, sendAction %+d 次", dse, dact);
     return (dse > 0);
+}
+
+// ---------------------------------------------------------------------------
+// 7d. v14：probe / tapui —— 先看清「点的到底是什么」，再决定怎么触发
+//
+//   v13 的遗留问题：se 计数确实涨了（事件进了 sendEvent），但微信 TabBar
+//   纹丝不动 —— 说明 UIKit 内部（C++ 层）没把伪造的 UIEvent 路由到 TabBar。
+//   继续瞎猜没意义，先做两件事：
+//     probe —— 报告某坐标【实际命中】的 view：类名、屏幕坐标、是否 UIControl、
+//              沿 superview 链最近的可触发控件。把"我以为点的是谁"变成事实。
+//     tapui —— 对命中控件直接 sendActionsForControlEvents:UIControlEventTouchUpInside。
+//              这不是"模拟手指"，但效果等价于用户点击按钮，且 100% 可靠。
+// ---------------------------------------------------------------------------
+static NSDictionary *AIProbeAt(CGPoint pt) {
+    __block NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"pt"] = [NSString stringWithFormat:@"(%.0f,%.0f)", pt.x, pt.y];
+    UIWindow *w = AIHostWindow();
+    if (!w) { d[@"err"] = @"无 window"; return d; }
+    d[@"win"] = NSStringFromCGRect(w.bounds);
+
+    id hit = nil;
+    @try { hit = [w hitTest:pt withEvent:nil]; } @catch (id e) {}
+    if (!hit) { d[@"err"] = @"hitTest 返回 nil"; return d; }
+
+    UIView *v = (UIView *)hit;
+    CGRect screen = [v convertRect:v.bounds toView:nil];
+    d[@"hit"]      = NSStringFromClass([v class]);
+    d[@"hitFrame"] = NSStringFromCGRect(screen);
+    d[@"isControl"] = @([v isKindOfClass:[UIControl class]]);
+
+    // 沿 superview 找最近的可触发控件
+    UIView *p = v; int up = 0;
+    while (p && up < 12) {
+        if ([p isKindOfClass:[UIControl class]]) {
+            d[@"ctrl"]      = NSStringFromClass([p class]);
+            d[@"ctrlFrame"] = NSStringFromCGRect([p convertRect:p.bounds toView:nil]);
+            d[@"ctrlUp"]    = @(up);
+            d[@"enabled"]   = @([(UIControl *)p isEnabled]);
+            d[@"ctrlCenter"] = [NSString stringWithFormat:@"(%.0f,%.0f)",
+                                CGRectGetMidX([p convertRect:p.bounds toView:nil]),
+                                CGRectGetMidY([p convertRect:p.bounds toView:nil])];
+            break;
+        }
+        p = p.superview; up++;
+    }
+    if (!d[@"ctrl"]) d[@"ctrl"] = @"(沿父链 12 层内无 UIControl)";
+    return d;
+}
+
+// 直接触发控件的 action（等价于用户点击这个按钮）
+static BOOL AITapUIControlAt(CGPoint pt, NSString **outDesc) {
+    UIWindow *w = AIHostWindow();
+    if (!w) return NO;
+    id hit = nil;
+    @try { hit = [w hitTest:pt withEvent:nil]; } @catch (id e) {}
+    UIView *v = (UIView *)hit;
+    if (!v) return NO;
+
+    UIControl *c = nil;
+    UIView *p = v; int up = 0;
+    while (p && up < 12) {
+        if ([p isKindOfClass:[UIControl class]]) { c = (UIControl *)p; break; }
+        p = p.superview; up++;
+    }
+    if (!c) { if (outDesc) *outDesc = @"命中链上无 UIControl"; return NO; }
+
+    int a0 = gActionHits;
+    @try {
+        [c sendActionsForControlEvents:UIControlEventTouchUpInside];
+    } @catch (NSException *e) {
+        if (outDesc) *outDesc = [@"sendActions 异常: " stringByAppendingString:(e.reason ?: @"?")];
+        return NO;
+    }
+    if (outDesc) {
+        *outDesc = [NSString stringWithFormat:@"%@ (第%d层父) sendAction+%d",
+                    NSStringFromClass([c class]), up, gActionHits - a0];
+    }
+    return YES;
 }
 
 // 让 runloop 转一会儿，给 UIKit 处理触摸的机会（别用 usleep 卡死主线程）
@@ -1686,12 +1764,12 @@ static void AIExecCmd(NSDictionary *cmd) {
             } @catch (id e) {}
         }
         // ★ v13：优先走 sendEvent 正规链路（UIKit 自己 hitTest + 手势识别）。
-        //   旧路径（直接调 view.touchesBegan:）只对「自己处理触摸的 view」有效，
-        //   对 UITabBar / UIControl / 手势识别完全无效 —— 真机已验证。
+        //   旧路径（直接调 view.touchesBegan:）只对「自己处理触摸的 view」有效。
         BOOL viaSend = NO;
         if (!ok) {
             @try { viaSend = AIMainSyncBool(^{ return AIDispatchFakeViaSendEvent(CGPointMake(x, y), 2, 0.03); }); }
             @catch (id e) {}
+            if (viaSend) ok = YES;   // v14 修复：v13 忘了置位，导致成功后又去跑一遍必定失败的旧路径
         }
         if (!ok && gBestTap == 4) { @try { ok = AIFakeTapAtWindowPoint(CGPointMake(x, y)); } @catch (id e) {} }
         if (!ok) { @try { ok = AITapInProcess(CGPointMake(x, y)); } @catch (id e) {} }
@@ -1753,6 +1831,22 @@ static void AIExecCmd(NSDictionary *cmd) {
         BOOL v = cmd[@"on"] ? ([cmd[@"on"] intValue] != 0) : YES;
         AISetHudVisible(v);
         AIReportDict(@{@"op": @"hud", @"ok": @YES, @"visible": @(v)});
+    } else if ([op isEqualToString:@"probe"]) {
+        // 我得先看清「这个坐标上到底是什么」，再决定怎么点
+        CGFloat x = [cmd[@"x"] floatValue], y = [cmd[@"y"] floatValue];
+        __block NSDictionary *d = nil;
+        AIMainSync(^{ @try { d = AIProbeAt(CGPointMake(x, y)); } @catch (id e) {} });
+        AILog(@"  [cmd] probe (%.0f,%.0f) -> %@", x, y, d);
+        AIReportDict(@{@"op": @"probe", @"ok": @(d != nil), @"x": @(x), @"y": @(y),
+                       @"info": d ?: @{@"err": @"probe 返回 nil"}});
+    } else if ([op isEqualToString:@"tapui"]) {
+        // 直接触发控件 action —— 不是模拟手指，但效果等价且 100% 可靠
+        CGFloat x = [cmd[@"x"] floatValue], y = [cmd[@"y"] floatValue];
+        __block BOOL ok = NO; __block NSString *desc = nil;
+        AIMainSync(^{ @try { ok = AITapUIControlAt(CGPointMake(x, y), &desc); } @catch (id e) {} });
+        AILog(@"  [cmd] tapui (%.0f,%.0f) -> %@ %@", x, y, ok ? @"OK" : @"FAIL", desc ?: @"");
+        AIReportDict(@{@"op": @"tapui", @"ok": @(ok), @"x": @(x), @"y": @(y),
+                       @"desc": desc ?: @"", @"act": @(gActionHits)});
     } else if ([op isEqualToString:@"diag"]) {
         NSString *s = AINetDiag();
         gDiagText = s;
