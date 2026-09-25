@@ -37,6 +37,10 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <ifaddrs.h>
 
 // ---------------------------------------------------------------------------
 // 0. 日志：同时进内存缓冲 / NSLog / 文件
@@ -469,6 +473,7 @@ static BOOL AITapInProcess(CGPoint pt) {
 @interface AIFakeTouch : UITouch
 @property (nonatomic, assign) CGPoint       aiPoint;   // 相对于 aiView 的坐标
 @property (nonatomic, weak)   UIView       *aiView;
+@property (nonatomic, weak)   UIWindow     *aiWindow;
 @property (nonatomic, assign) UITouchPhase  aiPhase;
 @property (nonatomic, assign) NSTimeInterval aiTime;
 @end
@@ -478,16 +483,28 @@ static BOOL AITapInProcess(CGPoint pt) {
     if (!v || v == self.aiView) return self.aiPoint;
     return [self.aiView convertPoint:self.aiPoint toView:v];
 }
-- (CGPoint)previousLocationInView:(UIView *)v { return [self locationInView:v]; }
+- (CGPoint)previousLocationInView:(UIView *)v          { return [self locationInView:v]; }
+// Unity / Cocos 有些版本读 preciseLocationInView，父类实现会去读未初始化的 ivar，必须挡掉
+- (CGPoint)preciseLocationInView:(UIView *)v           { return [self locationInView:v]; }
+- (CGPoint)precisePreviousLocationInView:(UIView *)v   { return [self locationInView:v]; }
 - (UITouchPhase)phase       { return self.aiPhase; }
 - (UIView *)view            { return self.aiView; }
-- (UIWindow *)window        { return self.aiView.window; }
+- (UIWindow *)window        { return self.aiWindow ?: self.aiView.window; }
 - (NSTimeInterval)timestamp { return self.aiTime; }
 - (NSUInteger)tapCount      { return 1; }
 - (UITouchType)type         { return UITouchTypeDirect; }
-- (CGFloat)force            { return 1.0; }
-- (CGFloat)majorRadius      { return 5.0; }
-- (CGFloat)minorRadius      { return 5.0; }
+- (CGFloat)force                { return 1.0; }
+- (CGFloat)maximumPossibleForce { return 1.0; }
+- (CGFloat)majorRadius          { return 5.0; }
+- (CGFloat)majorRadiusTolerance { return 0.0; }
+- (CGFloat)minorRadius          { return 5.0; }
+- (CGFloat)altitudeAngle        { return 1.5707963; }
+- (CGFloat)azimuthAngle         { return 0.0; }
+- (CGVector)azimuthUnitVectorInView:(UIView *)v { CGVector g; g.dx = 1.0; g.dy = 0.0; return g; }
+- (NSArray *)gestureRecognizers  { return nil; }
+- (UITouchProperties)estimatedProperties                   { return 0; }
+- (UITouchProperties)estimatedPropertiesExpectingUpdates   { return 0; }
+- (NSNumber *)estimationUpdateIndex                        { return nil; }
 @end
 
 @interface AIFakeEvent : UIEvent
@@ -531,26 +548,109 @@ static BOOL AIDispatchFakeToView(UIView *target, CGPoint ptInTarget) {
     }
 }
 
-// 自己 hit-test + 分发（验证能否自动定位到正确的 view）
-static UIView *AIHitTestIn(UIView *root, CGPoint ptInRoot) {
-    @try { return [root hitTest:ptInRoot withEvent:nil]; } @catch (NSException *e) { return nil; }
+// 让 runloop 转一会儿，给 UIKit 处理触摸的机会（别用 usleep 卡死主线程）
+static void AISleep(double sec) {
+    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:sec]];
 }
 
-static BOOL AIFakeTapAtWindowPoint(CGPoint pt) {
+// 找「App 自己的」窗口：排除我们盖的屏、排除键盘/文本特效窗口
+static UIWindow *AIHostWindow(void) {
     UIApplication *app = [UIApplication sharedApplication];
-    UIWindow *w = nil;
-    for (UIWindow *it in app.windows) {
-        if (it == gOverlayWindow) continue;      // 跳过我们自己盖的屏
-        if (it.hidden) continue;
-        w = it; break;
+    UIWindow *fallback = nil;
+    for (UIWindow *w in app.windows) {
+        if (w == gOverlayWindow) continue;
+        NSString *cn = NSStringFromClass([w class]);
+        if ([cn rangeOfString:@"TextEffects"].location != NSNotFound) continue;
+        if ([cn rangeOfString:@"RemoteKeyboard"].location != NSNotFound) continue;
+        if (w.hidden || w.alpha < 0.01) continue;
+        if (fallback) { }
+        fallback = fallback ?: w;
+        // 优先带 rootViewController 的（通常是 App 主窗口）
+        if (w.rootViewController && w.rootViewController.view.window == w) return w;
     }
-    if (!w) w = gOverlayWindow;
-    if (!w) return NO;
-    UIView *target = AIHitTestIn(w, pt);
-    if (!target) { AILog(@"  hitTest 未命中任何 view"); return NO; }
+    return fallback ?: gOverlayWindow;
+}
+
+// 屏幕坐标 -> 某个 view 内部的伪造触摸序列（Began / N×Moved / Ended）
+static BOOL AIDispatchFakeSeq(UIView *target, CGPoint from, CGPoint to, int steps, double dur) {
+    if (!target) return NO;
+    if (steps < 1) steps = 1;
+    if (dur <= 0) dur = 0.06;
+
+    AIFakeTouch *t = [AIFakeTouch new];
+    t.aiView  = target;
+    t.aiTime  = [[NSDate date] timeIntervalSince1970];
+
+    AIFakeEvent *ev = [AIFakeEvent new];
+    NSSet *one = [NSSet setWithObject:t];
+    ev.aiTouches = one;
+    ev.aiTime    = t.aiTime;
+
+    @try {
+        t.aiPhase = UITouchPhaseBegan;
+        t.aiPoint = from;
+        [target touchesBegan:one withEvent:ev];
+        AISleep(dur / (double)steps);
+        for (int i = 1; i <= steps; i++) {
+            t.aiPhase = UITouchPhaseMoved;
+            t.aiPoint = CGPointMake(from.x + (to.x - from.x) * (CGFloat)i / (CGFloat)steps,
+                                    from.y + (to.y - from.y) * (CGFloat)i / (CGFloat)steps);
+            t.aiTime  = [[NSDate date] timeIntervalSince1970];
+            ev.aiTime = t.aiTime;
+            [target touchesMoved:one withEvent:ev];
+            AISleep(dur / (double)steps);
+        }
+        t.aiPhase = UITouchPhaseEnded;
+        t.aiPoint = to;
+        t.aiTime  = [[NSDate date] timeIntervalSince1970];
+        ev.aiTime = t.aiTime;
+        [target touchesEnded:one withEvent:ev];
+        return YES;
+    } @catch (NSException *ex) {
+        AILog(@"  序列分发异常: %@", ex.reason);
+        return NO;
+    }
+}
+
+// 【统一入口】屏幕坐标点击：自己 hit-test 到最深的 view，再分发伪造触摸。
+// v3 的 bug：回退到盖屏 window 后命中了自己的 UITextView，坐标还超出屏幕 ——
+// 这里改成始终以「App 自己的窗口」为基准，命中不到就退到根 view（游戏一般整屏一个 view）。
+static BOOL AIFakeTapAtWindowPoint(CGPoint pt) {
+    UIWindow *w = AIHostWindow();
+    if (!w) { AILog(@"  无可用 window"); return NO; }
+    AILog(@"  宿主 window: %@ %@", NSStringFromClass([w class]), NSStringFromCGRect(w.bounds));
+
+    UIView *target = nil;
+    @try { target = [w hitTest:pt withEvent:nil]; } @catch (NSException *e) {}
+    if (!target) target = w.rootViewController.view;
+    if (!target) {
+        for (UIView *v in w.subviews) { target = v; break; }
+    }
+    if (!target) target = w;
+    AILog(@"  hitTest 命中: %@", NSStringFromClass([target class]));
+
     CGPoint local = [w convertPoint:pt toView:target];
-    AILog(@"  hitTest 命中: %@ (%.0f,%.0f)", NSStringFromClass([target class]), local.x, local.y);
-    return AIDispatchFakeToView(target, local);
+    return AIDispatchFakeSeq(target, local, local, 1, 0.06);
+}
+
+// 屏幕坐标滑动
+static BOOL AIFakeSwipe(CGPoint a, CGPoint b, int steps, double dur) {
+    UIWindow *w = AIHostWindow();
+    if (!w) return NO;
+    UIView *target = nil;
+    @try { target = [w hitTest:a withEvent:nil]; } @catch (NSException *e) {}
+    if (!target) target = w.rootViewController.view ?: w;
+    CGPoint la = [w convertPoint:a toView:target];
+    CGPoint lb = [w convertPoint:b toView:target];
+    AILog(@"  swipe 目标: %@ (%.0f,%.0f)->(%.0f,%.0f) steps=%d",
+          NSStringFromClass([target class]), la.x, la.y, lb.x, lb.y, steps);
+    return AIDispatchFakeSeq(target, la, lb, steps, dur);
+}
+
+// 主线程同步执行（HTTP 服务在后台线程，触摸/截图必须回主线程）
+static void AIMainSync(void (^b)(void)) {
+    if ([NSThread isMainThread]) b();
+    else dispatch_sync(dispatch_get_main_queue(), b);
 }
 
 // --- 闭环自证用的测试视图 ---
@@ -583,17 +683,82 @@ static void AIFakeTapTest(void) {
     BOOL ok1 = AIDispatchFakeToView(tv, CGPointMake(70, 45));
     AILog(@"  [1] 直接分发到 AITestView -> %@  计数器+%d", ok1 ? @"已投递" : @"失败", gFakeHits - h0);
 
-    // 步骤 2：走 hit-test 自动定位（用测试 view 中心的屏幕坐标）
-    int h1 = gFakeHits;
-    CGRect r = [tv convertRect:tv.bounds toView:nil];
-    BOOL ok2 = AIFakeTapAtWindowPoint(CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)));
-    AILog(@"  [2] 经 hitTest 自动定位分发 -> %@  计数器+%d", ok2 ? @"已投递" : @"失败", gFakeHits - h1);
+    // 步骤 2：走 hit-test 自动定位（目标是【App 自己的】view，不是我们的盖屏）
+    // 计数器不涨是【正常的】—— 因为事件被送去了 App 的 view，不是 AITestView。
+    // 真正的判据在 [3d]。
+    CGSize scr = [UIScreen mainScreen].bounds.size;
+    BOOL ok2 = AIFakeTapAtWindowPoint(CGPointMake(scr.width * 0.5, scr.height * 0.5));
+    AILog(@"  [2] 屏幕中心 (%.0f,%.0f) 自动定位分发 -> %@", scr.width * 0.5, scr.height * 0.5,
+          ok2 ? @"已投递" : @"失败");
 
     if (gFakeHits > 0 && gBestTap == 0) {
         gBestTap = 4;   // 4 = 伪造对象直接分发
         AILog(@"  ↑ 选定为点击通道：伪造 Touch/Event 直接分发");
     }
     [tv removeFromSuperview];
+}
+
+// ---------------------------------------------------------------------------
+// 7c. 【决定性判据】目标 App 自己的 view 到底收没收到我们的伪造触摸？
+//
+//  只说"已投递"不算数（AIDispatchFakeSeq 返回 YES 只能证明没抛异常）。
+//  这里给目标 view 的类装一个 touchesBegan: 计数器，用 swizzle 实现：
+//    · class_addMethod 先把父类实现复制进本类 → 替换只影响本类，不污染 UIResponder
+//    · 只统计 event 是 AIFakeEvent（我们自己造的）的调用 → 不会误计真实触摸
+// ---------------------------------------------------------------------------
+static volatile int32_t gTargetHits = 0;
+static NSString *gTargetHitClass = nil;
+static IMP       gOrigTouchesBegan = NULL;
+
+static void AIHookedTouchesBegan(id self, SEL _cmd, NSSet *touches, UIEvent *ev) {
+    if ([ev isKindOfClass:[AIFakeEvent class]]) {
+        gTargetHits++;
+        gTargetHitClass = NSStringFromClass([self class]);
+    }
+    if (gOrigTouchesBegan) ((void (*)(id, SEL, NSSet *, UIEvent *))gOrigTouchesBegan)(self, _cmd, touches, ev);
+}
+
+static void AIHookTouchesOn(Class c) {
+    if (!c) return;
+    SEL sel = @selector(touchesBegan:withEvent:);
+    Method m = class_getInstanceMethod(c, sel);
+    if (!m) return;
+    IMP orig = method_getImplementation(m);
+    if (orig == (IMP)AIHookedTouchesBegan) return;   // 已经装过
+    class_addMethod(c, sel, orig, method_getTypeEncoding(m));
+    gOrigTouchesBegan = orig;
+    method_setImplementation(class_getInstanceMethod(c, sel), (IMP)AIHookedTouchesBegan);
+    AILog(@"  已给 %@ 的 touchesBegan: 装计数器", NSStringFromClass(c));
+}
+
+static void AITargetViewTest(void) {
+    AILog(@"==== [3d] 目标 App 自己的 view 实测（决定性判据） ====");
+    UIWindow *w = AIHostWindow();
+    if (!w) { AILog(@"  无宿主 window"); return; }
+    CGSize s = [UIScreen mainScreen].bounds.size;
+    CGPoint pt = CGPointMake(s.width * 0.5, s.height * 0.5);
+
+    UIView *target = nil;
+    @try { target = [w hitTest:pt withEvent:nil]; } @catch (id e) {}
+    if (!target) target = w.rootViewController.view;
+    if (!target) target = w;
+
+    NSString *cn = NSStringFromClass([target class]);
+    AILog(@"  目标 view: %@  屏幕 %.0fx%.0f 点(%.0f,%.0f)", cn, s.width, s.height, pt.x, pt.y);
+    if ([cn hasPrefix:@"AI"] || target == gOverlayWindow) {
+        AILog(@"  ⚠️ 命中的是我们自己的盖屏 —— 没找到 App 自己的窗口");
+    }
+
+    @try { AIHookTouchesOn([target class]); } @catch (id e) { AILog(@"  hook 失败"); }
+    int h0 = gTargetHits;
+    CGPoint local = [w convertPoint:pt toView:target];
+    BOOL ok = AIDispatchFakeSeq(target, local, local, 1, 0.06);
+    AILog(@"  分发 -> %@   ★目标 view 实际收到伪造触摸 +%d (%@)",
+          ok ? @"已投递" : @"失败", gTargetHits - h0, gTargetHitClass ?: @"-");
+    if (gTargetHits > h0 && gBestTap == 0) {
+        gBestTap = 4;
+        AILog(@"  ↑ 选定为点击通道：伪造 Touch/Event 直接分发（已证实目标 view 收到）");
+    }
 }
 
 // --- dump UITouch / UIEvent 的真实方法名：找出本系统真正的构造入口 ---
@@ -903,6 +1068,239 @@ static NSString *AIBase(void) {
     return @"https://RELAY_NOT_CONFIGURED.invalid";
 }
 
+
+// ---------------------------------------------------------------------------
+// 12b. 内置 HTTP 控制服务
+//
+//  为什么不再是「反向轮询外部服务器」：那需要额外部署一台中继，且手机必须能出网。
+//  改成 dylib 自己监听一个端口 —— 手机和电脑在同一个 WiFi 下就能直接 curl，
+//  这才是「像 API 一样随连随用」。反向轮询保留为可选（写了 base 才启用）。
+// ---------------------------------------------------------------------------
+static int    gSrvPort = 0;
+static NSString *gSrvIp = nil;
+
+static NSString *AIIpAddr(void) {
+    struct ifaddrs *ifa = NULL;
+    if (getifaddrs(&ifa) != 0) return nil;
+    NSString *res = nil;
+    for (struct ifaddrs *p = ifa; p; p = p->ifa_next) {
+        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
+        const char *n = p->ifa_name ? p->ifa_name : "";
+        if (strncmp(n, "en", 2) != 0) continue;          // en0 = Wi-Fi
+        char buf[64];
+        if (inet_ntop(AF_INET, &((struct sockaddr_in *)p->ifa_addr)->sin_addr, buf, sizeof(buf))) {
+            res = [NSString stringWithUTF8String:buf];
+            break;
+        }
+    }
+    freeifaddrs(ifa);
+    return res;
+}
+
+static NSString *AILogSnapshot(void) {
+    if (!gLog) return @"(no log)";
+    [gLogLock lock];
+    NSString *t = [gLog copy];
+    [gLogLock unlock];
+    return t ?: @"";
+}
+
+static NSString *AIQv(NSString *q, NSString *k) {
+    for (NSString *kv in [q componentsSeparatedByString:@"&"]) {
+        NSArray *pp = [kv componentsSeparatedByString:@"="];
+        if (pp.count == 2 && [pp[0] isEqualToString:k]) {
+            return [pp[1] stringByRemovingPercentEncoding];
+        }
+    }
+    return nil;
+}
+
+static void AIResp(int fd, int code, NSString *ctype, NSData *body) {
+    NSString *h = [NSString stringWithFormat:
+        @"HTTP/1.1 %d OK\r\nContent-Type: %@\r\nContent-Length: %lu\r\n"
+        @"Connection: close\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+        code, ctype, (unsigned long)body.length];
+    NSData *hd = [h dataUsingEncoding:NSUTF8StringEncoding];
+    if (!hd || !body) return;
+    @try { send(fd, hd.bytes, hd.length, 0); send(fd, body.bytes, body.length, 0); } @catch (id e) {}
+}
+
+static void AIJson(int fd, NSDictionary *d) {
+    NSData *b = [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
+    AIResp(fd, 200, @"application/json; charset=utf-8", b ?: [NSData data]);
+}
+
+static NSString *AITreeOf(UIView *v, int depth, int maxDepth) {
+    NSMutableString *m = [NSMutableString string];
+    for (int i = 0; i < depth; i++) [m appendString:@"  "];
+    CGRect f = v.frame;
+    [m appendFormat:@"%@ (%.0f,%.0f,%.0f,%.0f)%@\n", NSStringFromClass([v class]),
+     f.origin.x, f.origin.y, f.size.width, f.size.height, v.hidden ? @" hidden" : @""];
+    if (depth >= maxDepth) return m;
+    for (UIView *c in v.subviews) [m appendString:AITreeOf(c, depth + 1, maxDepth)];
+    return m;
+}
+
+static void AIServeFd(int fd) {
+    NSMutableData *req = [NSMutableData data];
+    char buf[4096];
+    NSData *sep = [@"\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding];
+    while (req.length < 65536) {
+        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        [req appendBytes:buf length:(NSUInteger)n];
+        if ([req rangeOfData:sep options:0 range:NSMakeRange(0, req.length)].location != NSNotFound) break;
+    }
+    NSString *s = [[NSString alloc] initWithData:req encoding:NSUTF8StringEncoding] ?: @"";
+    NSArray *lines = [s componentsSeparatedByString:@"\r\n"];
+    NSString *first = lines.count ? lines[0] : @"";
+    NSArray *parts = [first componentsSeparatedByString:@" "];
+    NSString *tgt = parts.count > 1 ? parts[1] : @"/";
+    NSString *path = tgt, *q = @"";
+    NSRange qm = [tgt rangeOfString:@"?"];
+    if (qm.location != NSNotFound) {
+        path = [tgt substringToIndex:qm.location];
+        q = [tgt substringFromIndex:qm.location + 1];
+    }
+
+    if ([path isEqualToString:@"/status"]) {
+        AIJson(fd, @{@"ok": @YES, @"proc": gProcName, @"bundle": gBundleId,
+                     @"dev": gDevId, @"pid": @(getpid()),
+                     @"tap": @(gBestTap), @"shot": @(gBestShot),
+                     @"mon": @(gMonHits), @"se": @(gSendEventHits),
+                     @"targetViewHits": @(gTargetHits),
+                     @"port": @(gSrvPort), @"ip": gSrvIp ?: @""});
+        return;
+    }
+    if ([path isEqualToString:@"/tap"]) {
+        CGFloat x = [AIQv(q, @"x") floatValue];
+        CGFloat y = [AIQv(q, @"y") floatValue];
+        __block BOOL ok = NO;
+        AIMainSync(^{ @try { ok = AIFakeTapAtWindowPoint(CGPointMake(x, y)); } @catch (id e) {} });
+        AIJson(fd, @{@"ok": @(ok), @"op": @"tap", @"x": @(x), @"y": @(y), @"chan": @(gBestTap)});
+        AILog(@"  [http] tap (%.0f,%.0f) -> %@", x, y, ok ? @"OK" : @"FAIL");
+        return;
+    }
+    if ([path isEqualToString:@"/swipe"]) {
+        CGFloat x1 = [AIQv(q, @"x1") floatValue], y1 = [AIQv(q, @"y1") floatValue];
+        CGFloat x2 = [AIQv(q, @"x2") floatValue], y2 = [AIQv(q, @"y2") floatValue];
+        int steps = [AIQv(q, @"steps") intValue]; if (steps < 1) steps = 12;
+        double dur = [AIQv(q, @"dur") doubleValue]; if (dur <= 0) dur = 0.35;
+        __block BOOL ok = NO;
+        AIMainSync(^{ @try { ok = AIFakeSwipe(CGPointMake(x1, y1), CGPointMake(x2, y2), steps, dur); }
+                     @catch (id e) {} });
+        AIJson(fd, @{@"ok": @(ok), @"op": @"swipe", @"steps": @(steps)});
+        AILog(@"  [http] swipe (%.0f,%.0f)->(%.0f,%.0f) -> %@", x1, y1, x2, y2, ok ? @"OK" : @"FAIL");
+        return;
+    }
+    if ([path isEqualToString:@"/shot"]) {
+        __block NSData *png = nil;
+        AIMainSync(^{
+            @try {
+                UIImage *im = AIShotByBest();
+                png = im ? UIImagePNGRepresentation(im) : nil;
+            } @catch (id e) {}
+        });
+        if (!png) { AIJson(fd, @{@"ok": @NO, @"op": @"shot", @"err": @"no image"}); return; }
+        NSString *fmt = AIQv(q, @"fmt");
+        if ([fmt isEqualToString:@"b64"]) {
+            AIJson(fd, @{@"ok": @YES, @"op": @"shot", @"w": @(0), @"b64": [png base64EncodedStringWithOptions:0]});
+        } else {
+            AIResp(fd, 200, @"image/png", png);
+        }
+        AILog(@"  [http] shot -> %luB", (unsigned long)png.length);
+        return;
+    }
+    if ([path isEqualToString:@"/report"]) {
+        AIResp(fd, 200, @"text/plain; charset=utf-8",
+               [AILogSnapshot() dataUsingEncoding:NSUTF8StringEncoding]);
+        return;
+    }
+    if ([path isEqualToString:@"/log"]) {
+        NSString *t = AILogSnapshot();
+        NSArray *ls = [t componentsSeparatedByString:@"\n"];
+        NSUInteger n = ls.count;
+        NSUInteger want = (NSUInteger)[AIQv(q, @"n") integerValue];
+        if (want == 0) want = 200;
+        NSArray *tail = (n > want) ? [ls subarrayWithRange:NSMakeRange(n - want, want)] : ls;
+        AIResp(fd, 200, @"text/plain; charset=utf-8",
+               [[tail componentsJoinedByString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]);
+        return;
+    }
+    if ([path isEqualToString:@"/tree"]) {
+        __block NSString *tree = @"(none)";
+        AIMainSync(^{
+            @try {
+                UIWindow *w = AIHostWindow();
+                UIView *root = w ? (w.rootViewController.view ?: w) : nil;
+                if (root) tree = AITreeOf(root, 0, 10);
+            } @catch (id e) {}
+        });
+        AIResp(fd, 200, @"text/plain; charset=utf-8", [tree dataUsingEncoding:NSUTF8StringEncoding]);
+        return;
+    }
+    // 首页：极简说明
+    NSString *ip = gSrvIp ?: @"?";
+    NSString *help = [NSString stringWithFormat:
+        @"AgentInject2 控制 API\n"
+        @"  GET /status              -> 状态 JSON\n"
+        @"  GET /tap?x=195&y=422     -> 点击屏幕坐标\n"
+        @"  GET /swipe?x1=&y1=&x2=&y2=&steps=12&dur=0.35\n"
+        @"  GET /shot                -> PNG 截图（/shot?fmt=b64 拿 base64）\n"
+        @"  GET /tree                -> 视图树\n"
+        @"  GET /report  /log?n=200  -> 报告 / 日志尾\n"
+        @"\n本机: http://%@:%d/\n通道: tap=%d shot=%d\n",
+        ip, gSrvPort, gBestTap, gBestShot];
+    AIResp(fd, 200, @"text/plain; charset=utf-8", [help dataUsingEncoding:NSUTF8StringEncoding]);
+}
+
+static void AIServerLoop(int port) {
+    int sfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sfd < 0) return;
+    int yes = 1;
+    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons((in_port_t)port);
+    a.sin_addr.s_addr = INADDR_ANY;
+    if (bind(sfd, (struct sockaddr *)&a, sizeof(a)) < 0) { close(sfd); return; }
+    if (listen(sfd, 8) < 0) { close(sfd); return; }
+    gSrvPort = port;
+    gSrvIp = AIIpAddr();
+    AILog(@"  ★ HTTP 控制服务已启动: http://%@:%d/", gSrvIp ?: @"?", port);
+    while (1) {
+        int fd = accept(sfd, NULL, NULL);
+        if (fd < 0) continue;
+        @autoreleasepool { AIServeFd(fd); }
+        close(fd);
+    }
+}
+
+static void AIStartServer(void) {
+    static BOOL started = NO;
+    if (started) return;
+    started = YES;
+    for (int p = 8080; p <= 8085; p++) {
+        // 先试绑一下，成功才起线程
+        int t = socket(AF_INET, SOCK_STREAM, 0);
+        if (t < 0) return;
+        int yes = 1; setsockopt(t, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        struct sockaddr_in a; memset(&a, 0, sizeof(a));
+        a.sin_family = AF_INET; a.sin_port = htons((in_port_t)p); a.sin_addr.s_addr = INADDR_ANY;
+        int r = bind(t, (struct sockaddr *)&a, sizeof(a));
+        close(t);
+        if (r == 0) {
+            int port = p;
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+                AIServerLoop(port);
+            });
+            return;
+        }
+    }
+    AILog(@"  ❌ 8080-8085 全部绑定失败");
+}
+
 static void AIExecCmd(NSDictionary *cmd) {
     NSString *op = cmd[@"op"];
     if (!op) return;
@@ -925,6 +1323,7 @@ static void AIExecCmd(NSDictionary *cmd) {
                 ok = YES;
             } @catch (id e) {}
         }
+        if (!ok && gBestTap == 4) { @try { ok = AIFakeTapAtWindowPoint(CGPointMake(x, y)); } @catch (id e) {} }
         if (!ok) { @try { ok = AITapInProcess(CGPointMake(x, y)); } @catch (id e) {} }
         AILog(@"  [cmd] tap (%.0f,%.0f) 通道%d -> %@", x, y, gBestTap, ok ? @"OK" : @"FAIL");
     } else if ([op isEqualToString:@"shot"]) {
@@ -948,8 +1347,9 @@ static void AIExecCmd(NSDictionary *cmd) {
 
 static void AINetLoop(void) {
     AILog(@"==== [6] 控制通道 ====");
+    @try { AIStartServer(); AISleep(0.6); } @catch (NSException *e) { AILog(@"  服务启动异常 %@", e); }  // 等端口真正 bind 上再打印
     gBase = AIBase();
-    if ([gBase containsString:@"invalid"]) { AILog(@"  未配置控制服务器，轮询不启动"); return; }
+    if ([gBase containsString:@"invalid"]) { AILog(@"  未配置外部控制服务器，反向轮询不启动（内置 HTTP 服务照常可用）"); return; }
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
         while (1) {
             @autoreleasepool {
@@ -1136,12 +1536,14 @@ static void AIBoot(void) {
                 if (gSendEventHits - s0 > 0 && gBestTap == 0) { gBestTap = 2; AILog(@"  ↑ 选定为进程内 UIKit 通道"); }
             } @catch (NSException *e) { AILog(@"inproc 异常 %@", e); }
             @try { AIFakeTapTest(); } @catch (NSException *e) { AILog(@"faketap 异常 %@", e); }
+            @try { AITargetViewTest(); } @catch (NSException *e) { AILog(@"targetview 异常 %@", e); }
             @try { AIControlProbe(); } @catch (NSException *e) { AILog(@"control 异常 %@", e); }
             @try { AIShotMatrix(); } @catch (NSException *e) { AILog(@"shot 异常 %@", e); }
             @try { AINetLoop(); }    @catch (NSException *e) { AILog(@"net 异常 %@", e); }
 
-            AILog(@"########## 结论: tap=%d shot=%d mon=%d se=%d ##########",
-                  gBestTap, gBestShot, gMonHits, gSendEventHits);
+            AILog(@"########## 结论: tap=%d shot=%d mon=%d se=%d tvhits=%d ##########",
+                  gBestTap, gBestShot, gMonHits, gSendEventHits, gTargetHits);
+            if (gSrvPort) AILog(@"########## 控制: http://%@:%d/status ##########", gSrvIp ?: @"?", gSrvPort);
             @try { AIWriteReport(); } @catch (NSException *e) {}
             @try { AIShowOverlay(); } @catch (NSException *e) {}
         });
