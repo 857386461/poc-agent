@@ -430,9 +430,7 @@ static id AIInvokeRet(id target, NSString *selName, NSArray *args) {
 static BOOL AITapInProcess(CGPoint pt) {
     UIApplication *app = [UIApplication sharedApplication];
     if (!app) return NO;
-    UIWindow *w = nil;
-    if ([app respondsToSelector:@selector(keyWindow)]) w = app.keyWindow;
-    if (!w && app.windows.count) w = app.windows.firstObject;
+    UIWindow *w = AIHostWindow();
     if (!w) return NO;
 
     UITouch *t = [UITouch alloc];
@@ -553,22 +551,77 @@ static void AISleep(double sec) {
     [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:sec]];
 }
 
+// 【iOS 13+ 大坑】用了 SceneDelegate 的 App，window 挂在每个 UIWindowScene 上，
+// [UIApplication sharedApplication].windows 对它们是【空数组】，keyWindow 也常是 nil。
+// v4 就是栽在这：拿不到 App 自己的 window，于是所有点击/截图全落在我们自己盖的屏上。
+static NSArray *AIAllWindows(void) {
+    NSMutableArray *out = [NSMutableArray array];
+    UIApplication *app = [UIApplication sharedApplication];
+    if (!app) return out;
+
+    if ([app respondsToSelector:@selector(connectedScenes)]) {
+        id scenes = [app performSelector:@selector(connectedScenes)];
+        if ([scenes isKindOfClass:[NSSet class]]) {
+            for (id sc in (NSSet *)scenes) {
+                if (![sc respondsToSelector:@selector(windows)]) continue;
+                id ws = [sc performSelector:@selector(windows)];
+                if (![ws isKindOfClass:[NSArray class]]) continue;
+                for (id w in (NSArray *)ws) {
+                    if ([w isKindOfClass:[UIWindow class]] && ![out containsObject:w]) [out addObject:w];
+                }
+            }
+        }
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    for (UIWindow *w in app.windows) if (![out containsObject:w]) [out addObject:w];
+#pragma clang diagnostic pop
+    return out;
+}
+
 // 找「App 自己的」窗口：排除我们盖的屏、排除键盘/文本特效窗口
 static UIWindow *AIHostWindow(void) {
-    UIApplication *app = [UIApplication sharedApplication];
     UIWindow *fallback = nil;
-    for (UIWindow *w in app.windows) {
+    for (UIWindow *w in AIAllWindows()) {
         if (w == gOverlayWindow) continue;
         NSString *cn = NSStringFromClass([w class]);
         if ([cn rangeOfString:@"TextEffects"].location != NSNotFound) continue;
         if ([cn rangeOfString:@"RemoteKeyboard"].location != NSNotFound) continue;
         if (w.hidden || w.alpha < 0.01) continue;
-        if (fallback) { }
-        fallback = fallback ?: w;
-        // 优先带 rootViewController 的（通常是 App 主窗口）
+        if (!fallback) fallback = w;
+        if (w.isKeyWindow) return w;
         if (w.rootViewController && w.rootViewController.view.window == w) return w;
     }
     return fallback ?: gOverlayWindow;
+}
+
+// 诊断：把所有 window / scene 打出来，一眼看出到底有没有 App 自己的窗口
+static void AIDumpWindows(void) {
+    AILog(@"==== [0b] Window / Scene 枚举（诊断） ====");
+    UIApplication *app = [UIApplication sharedApplication];
+    NSArray *all = AIAllWindows();
+    AILog(@"  共找到 %lu 个 window", (unsigned long)all.count);
+    for (UIWindow *w in all) {
+        AILog(@"    - %@ hidden=%d key=%d alpha=%.2f %@ rootVC=%@%@",
+              NSStringFromClass([w class]), w.hidden, (int)w.isKeyWindow, w.alpha,
+              NSStringFromCGRect(w.frame),
+              w.rootViewController ? NSStringFromClass([w.rootViewController class]) : @"(nil)",
+              (w == gOverlayWindow ? @"   ← 我们的盖屏" : @""));
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    AILog(@"  [UIApplication windows] 数量 = %lu", (unsigned long)app.windows.count);
+#pragma clang diagnostic pop
+    if ([app respondsToSelector:@selector(connectedScenes)]) {
+        id scenes = [app performSelector:@selector(connectedScenes)];
+        NSSet *ss = [scenes isKindOfClass:[NSSet class]] ? (NSSet *)scenes : nil;
+        AILog(@"  connectedScenes 数量 = %lu", (unsigned long)ss.count);
+        for (id sc in ss) {
+            int act = -1;
+            @try { act = (int)[[sc valueForKey:@"activationState"] integerValue]; } @catch (id e) {}
+            AILog(@"    * %@ activationState=%d", NSStringFromClass([sc class]), act);
+        }
+    }
 }
 
 // 屏幕坐标 -> 某个 view 内部的伪造触摸序列（Began / N×Moved / Ended）
@@ -880,9 +933,9 @@ static UIImage *AIShot_Private2(void) {  // _UICreateScreenUIImage
 }
 static UIImage *AIShot_Hierarchy(void) {
     UIApplication *app = [UIApplication sharedApplication];
-    UIWindow *w = ([app respondsToSelector:@selector(keyWindow)] ? app.keyWindow : nil);
-    if (!w && app.windows.count) w = app.windows.firstObject;
+    UIWindow *w = AIHostWindow();
     if (!w) return nil;
+    if (w == gOverlayWindow) AILog(@"    ⚠️ 拿到的还是我们的盖屏，截图内容可能不对");
     CGSize s = w.bounds.size;
     if (s.width < 1 || s.height < 1) return nil;
     @try {
@@ -895,9 +948,9 @@ static UIImage *AIShot_Hierarchy(void) {
 }
 static UIImage *AIShot_Layer(void) {
     UIApplication *app = [UIApplication sharedApplication];
-    UIWindow *w = ([app respondsToSelector:@selector(keyWindow)] ? app.keyWindow : nil);
-    if (!w && app.windows.count) w = app.windows.firstObject;
+    UIWindow *w = AIHostWindow();
     if (!w) return nil;
+    if (w == gOverlayWindow) AILog(@"    ⚠️ 拿到的还是我们的盖屏，截图内容可能不对");
     CGSize s = w.bounds.size;
     if (s.width < 1 || s.height < 1) return nil;
     @try {
@@ -954,9 +1007,10 @@ static void AIWalkControls(UIView *root, NSMutableArray *out, int depth) {
 static void AIControlProbe(void) {
     AILog(@"==== [5] UIControl / 视图树 ====");
     UIApplication *app = [UIApplication sharedApplication];
-    UIWindow *w = ([app respondsToSelector:@selector(keyWindow)] ? app.keyWindow : nil);
-    if (!w && app.windows.count) w = app.windows.firstObject;
+    UIWindow *w = AIHostWindow();
     if (!w) { AILog(@"  无 window"); return; }
+    AILog(@"  宿主 window: %@ rootVC=%@", NSStringFromClass([w class]),
+          w.rootViewController ? NSStringFromClass([w.rootViewController class]) : @"(nil)");
     NSMutableArray *ctls = [NSMutableArray array];
     @try { AIWalkControls(w, ctls, 0); } @catch (id e) {}
     AILog(@"  UIControl 数量: %lu", (unsigned long)ctls.count);
@@ -1514,6 +1568,7 @@ static void AIBoot(void) {
     AIShowOverlayText(@"AgentInject2 已加载 ✓\n正在自检，请稍候…", NO, nil);
 
     @try { AIEnv(); }          @catch (NSException *e) { AILog(@"env 异常 %@", e); }
+    @try { AIDumpWindows(); }  @catch (NSException *e) { AILog(@"win 异常 %@", e); }
     @try { AIHookSendEvent(); } @catch (NSException *e) { AILog(@"hook 异常 %@", e); }
     @try { AILoadHID(); }      @catch (NSException *e) { AILog(@"loadHID 异常 %@", e); }
 
