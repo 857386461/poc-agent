@@ -107,7 +107,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v32";   // v32 = v31（版本自报 built/lib/ops + UI 三层任务态）+ 罩层真源自愈（治 idle 也挡屏 / overlay off 关不掉）
+static NSString * const kAIVer = @"v33";   // v33 = v32（罩层真源自愈）+ 悬浮球自愈/可观测（治「球不见了」）+ wininfo 体检（版本自报 built/lib/ops + UI 三层任务态）+ 罩层真源自愈（治 idle 也挡屏 / overlay off 关不掉）
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -172,6 +172,7 @@ static UIWindow *AIHostWindow(void);
 static void AISetOverlayVisible(BOOL vis);   // 盖屏按钮在它的定义之前就要用
 static void AIGuardSync(void);               // v32：罩层状态自愈（tick 每秒收敛一次）
 static void AIGuardRender(void);             // v32：guardVerify(4392) 在定义(4411)之前要用
+static void AIFloatSync(void);               // v33：悬浮球自愈（tick 每秒收敛一次）
 static void AIShowOverlay(void);            // 盖屏按钮回调里要刷新报告
 // v30 UI 三层任务态（定义见 AIFloatApply 之前）
 static void AITaskSet(NSString *name, int step, int total, NSString *state, int ok, NSString *brief);
@@ -3649,6 +3650,21 @@ static void AIExecCmd(NSDictionary *cmd) {
         BOOL vis = ov ? ([ov intValue] != 0) : NO;
         AISetOverlayVisible(vis);
         AIReportDict(@{@"op": @"overlay", @"ok": @YES, @"visible": @(vis)});
+    } else if ([op isEqualToString:@"wininfo"]) {
+        // v33：三个自建窗口的体检报告。悬浮球「看不见」时先打这一条，
+        // 一眼分清是「没建」「没挂 scene」「被藏了」还是「跑到屏外」。
+        NSMutableString *s = [NSMutableString string];
+        UIWindow *ws[3]   = { gFloatWindow, gOverlayWindow, gHudWindow };
+        NSString *ns[3]   = { @"float(球)", @"guard(罩)", @"hud(顶栏)" };
+        for (int i = 0; i < 3; i++) {
+            UIWindow *w = ws[i];
+            if (!w) { [s appendFormat:@"%@ —— 不存在\n", ns[i]]; continue; }
+            [s appendFormat:@"%@ hidden=%d scn=%d frame=%.0f,%.0f %.0fx%.0f lv=%.0f subs=%d\n",
+                ns[i], w.hidden ? 1 : 0, w.windowScene ? 1 : 0,
+                w.frame.origin.x, w.frame.origin.y, w.frame.size.width, w.frame.size.height,
+                w.windowLevel, (int)(w.rootViewController.view.subviews.count)];
+        }
+        AIReportDict(@{@"op": @"wininfo", @"ok": @YES, @"text": s});
     } else if ([op isEqualToString:@"status"]) {
         // v30：自报「我是谁」—— 本 dylib 在手机上的真实路径 + 构建时刻 + op 集。
         // 背景：v28 起存档把「源码版本」当「注入版本」写，导致 v27/v28 之争；
@@ -3801,6 +3817,7 @@ static void AIHudTickLoop(void) {
                    dispatch_get_main_queue(), ^{
         @try { AIHudApply(); } @catch (id e) {}
         @try { AIGuardSync(); } @catch (id e) {}   // v32：罩层每秒自愈，谁偷偷显示都会被拉回真源
+        @try { AIFloatSync(); } @catch (id e) {}   // v33：悬浮球每秒自愈，弄丢了 1 秒内拉回来
         AIHudTickLoop();
     });
 }
@@ -4882,7 +4899,14 @@ static NSDictionary *AITaskDict(void) {
 // /status 的 ui{}：三层 UI 各自读自己那块
 static NSDictionary *AIUiDict(void) {
     NSString *st = AITaskStateNow();
-    return @{@"float": @{@"dot": st ?: @"idle", @"line": AITaskLine()},
+    // v33：float 加可观测字段 —— 球到底在不在，看 win/vis/scn/frame 四个数，不用再靠肉眼猜
+    CGRect ff = gFloatWindow ? gFloatWindow.frame : CGRectZero;
+    return @{@"float": @{@"dot": st ?: @"idle", @"line": AITaskLine(),
+                         @"win":  @(gFloatWindow ? 1 : 0),
+                         @"vis":  (gFloatWindow && !gFloatWindow.hidden) ? @1 : @0,
+                         @"scn":  (gFloatWindow && gFloatWindow.windowScene) ? @1 : @0,
+                         @"frame": [NSString stringWithFormat:@"%.0f,%.0f %.0fx%.0f",
+                                    ff.origin.x, ff.origin.y, ff.size.width, ff.size.height]},
              @"guard": @{@"visible": (gOverlayWindow && !gOverlayWindow.hidden) ? @1 : @0,
                          @"want":    @(AIGuardShouldShow() ? 1 : 0),   // v32：真源 vs 实际的差就是 bug
                          @"mode":    gGuardMode ?: @"privacy",
@@ -4902,6 +4926,29 @@ static void AIStepAdd(NSString *state, NSString *act, NSString *obj, NSString *e
     if (gSteps.count > 60) [gSteps removeObjectAtIndex:0];
 }
 
+// v33 · 悬浮球自愈：跟罩层一个套路 —— 「该不该在」由 ball flag 决定，
+// 只要窗口不存在 / 被藏 / 没挂 scene / 尺寸为 0 / 跑到屏外，就强制重建一次。
+// 每秒调一次，任何把它弄丢的路径都会在 1 秒内被拉回来。
+static void AIFloatSync(void) {
+    if (gIsSpringBoard) return;
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ AIFloatSync(); });
+        return;
+    }
+    if (!AIFlag(@"ball", YES)) return;      // 用户主动关了就别强开
+    BOOL need = NO;
+    if (!gFloatWindow) need = YES;
+    else if (gFloatWindow.hidden) need = YES;
+    else if (gFloatWindow.windowScene == nil && AIFirstWindowScene()) need = YES;  // 无 scene 不上屏
+    else {
+        CGRect f  = gFloatWindow.frame;
+        CGRect sb = [UIScreen mainScreen].bounds;
+        if (f.size.width <= 0 || f.size.height <= 0) need = YES;
+        else if (!CGRectIntersectsRect(f, sb))        need = YES;   // 跑到屏幕外
+    }
+    if (need) { gFloatForce = YES; AIFloatApply(); }
+}
+
 static void AIFloatApply(void) {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{ AIFloatApply(); });
@@ -4917,6 +4964,14 @@ static void AIFloatApply(void) {
         if (!gFT) gFT = [AIFloatTarget new];
         CGSize sc = [UIScreen mainScreen].bounds.size;
 
+        // v33 · 关键修复：boot 早期 AIFirstWindowScene() 可能还没返回 scene（connectedScenes 为空），
+        // 于是建出「无 windowScene 的窗口」—— iOS 13+ 上这种窗口永远不上屏，而且因为
+        // gFloatWindow 已非 nil，后面再也不会重建。表现就是「悬浮球不见了」。
+        // 这里一旦发现缺 scene 且现在能拿到 scene，就销毁重建。
+        if (gFloatWindow && gFloatWindow.windowScene == nil) {
+            UIWindowScene *scnFix = AIFirstWindowScene();
+            if (scnFix) { @try { gFloatWindow.hidden = YES; } @catch (id e) {} gFloatWindow = nil; }
+        }
         if (!gFloatWindow) {
             UIWindowScene *scn = AIFirstWindowScene();
             if (scn) gFloatWindow = [[UIWindow alloc] initWithWindowScene:scn];
@@ -4928,6 +4983,7 @@ static void AIFloatApply(void) {
         }
         UIView *host = gFloatWindow.rootViewController.view;
         for (UIView *v in host.subviews) [v removeFromSuperview];
+        host.frame = gFloatWindow.bounds;   // v33：root view 尺寸必须跟着窗口，否则球画到屏外
 
         BOOL want = AIFlag(@"ball", YES);
         gFloatWindow.hidden = !want;
