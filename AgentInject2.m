@@ -3187,6 +3187,16 @@ static void AINetLoop(void) {
                         else if ([j isKindOfClass:[NSArray class]]) {
                             NSArray *arr = (NSArray *)j;
                             gotCmd = arr.count > 0;
+                            // v24：积压保护。App 崩掉/被杀时，云端会攒下一堆没消费的指令，
+                            //      重开后一次性灌进来 —— 很可能就是当初把它搞崩的那批。
+                            //      正常操作一次最多下发 1~2 条，超过 3 条基本可以断定是历史遗留。
+                            //      只执行最后 3 条，其余丢弃并上报，避免"一开就再崩"。
+                            if (arr.count > 3) {
+                                AILog(@"  ⚠️ 积压 %lu 条旧指令，只执行最后 3 条", (unsigned long)arr.count);
+                                AIReportDict(@{@"op": @"drop", @"ok": @YES,
+                                               @"dropped": @(arr.count - 3), @"total": @(arr.count)});
+                                arr = [arr subarrayWithRange:NSMakeRange(arr.count - 3, 3)];
+                            }
                             for (NSDictionary *c in arr) { gCmdGot++; AIExecCmd(c); }
                         }
                     }
