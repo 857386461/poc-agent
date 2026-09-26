@@ -17,22 +17,52 @@ from relayctl import post, get
 
 DEV = "68814FAE-730A-42C5-865B-4EB10F445282"
 
+# ---- G13 看门狗 ----
+# 坑：dylib 的轮询线程偶尔 hang 死（命令下去永远不回执，心跳也停），且无自愈。
+# 现象：wait_op 一路超时，AI 侧看不出来是「这次慢」还是「手机死了」，
+#       只能干等到最后才发现白等。恢复办法一直是：杀进程重开。
+# 判据：超时后补发一条最轻的 status 探活，连它都不回 = 手机端已 hang。
+WD_TMO = 10          # 探活 status 只等 10 秒（正常 1~2 秒就回）
+WD_HANG = {"ts": 0.0, "op": ""}     # 最近一次判定 hang 的时刻与当时的 op
 
-def wait_op(op, t0, timeout=25, after_ts=0):
+
+def wait_op(op, t0, timeout=25, after_ts=0, dev=None, wd=True):
     # after_ts：本次请求【发出前】服务端上该 op 的最后 ts。
     # 必须要求新结果的 ts 严格大于它，否则会读到上一次的旧数据 ——
     # 实测中连续 probe 出现过 y=86 和 y=142 返回同一个值的串扰。
+    d = dev or DEV
     while time.time() - t0 < timeout:
         time.sleep(0.35)
-        d = (get("/report?dev=%s&op=%s" % (DEV, op)).get("data") or {})
-        if d.get("op") == op and d.get("ts", 0) > max(after_ts, t0 - 3):
-            return d
+        r = (get("/report?dev=%s&op=%s" % (d, op)).get("data") or {})
+        if r.get("op") == op and r.get("ts", 0) > max(after_ts, t0 - 3):
+            return r
+    # 超时了：先分清是「这次真的慢」还是「手机 hang 了」
+    if wd and op != "status" and not alive(dev=d):
+        WD_HANG["ts"], WD_HANG["op"] = time.time(), op
+        print("  ⚠️ G13：手机端轮询线程已 hang（%s 超时 %ds，连 status 探活都不回）\n"
+              "     恢复办法 = 杀掉 App 进程重开；App 退后台也会这样，先切回前台再试。"
+              % (op, timeout))
     return None
 
 
-def _last_ts(op):
-    d = (get("/report?dev=%s&op=%s" % (DEV, op)).get("data") or {})
+def _last_ts(op, dev=None):
+    d = (get("/report?dev=%s&op=%s" % (dev or DEV, op)).get("data") or {})
     return d.get("ts", 0) if d.get("op") == op else 0
+
+
+def alive(dev=None, timeout=WD_TMO):
+    """最轻的一次判活：发 status，能答就说明手机端轮询线程还活着。
+    回执 dict / None（None = hang 或 App 不在前台）。"""
+    d = dev or DEV
+    prev = _last_ts("status", d)
+    post("/cmd", {"dev": d, "op": "status"})
+    return wait_op("status", time.time(), timeout=timeout, after_ts=prev,
+                   dev=d, wd=False)
+
+
+def hung(max_age=120):
+    """最近 max_age 秒内是否判定过 hang。长任务循环里拿它做提前中止。"""
+    return (time.time() - WD_HANG["ts"]) < max_age
 
 
 def macro(steps, gap=700, timeout=60, verbose=True):
