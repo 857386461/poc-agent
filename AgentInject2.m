@@ -1299,8 +1299,73 @@ static NSDictionary *AIPickAt(CGPoint pt) {
     }
     if (ccell) return AIPickCellInCollection(ccell, d);
 
-    if (!cell) { d[@"ok"] = @NO; d[@"err"] = @"这条父链上既无 UIControl 也无 Cell"; return d; }
+    // v23：快手侧边栏这类自绘 UI，父链上既没 UIControl 也不是任何标准 Cell，
+    //      但点击一定绑在 tap 手势上 —— 走手势触发，别再干瞪眼。
+    if (!cell) {
+        NSDictionary *g = AIGestureTapAt(pt);
+        if ([g[@"ok"] boolValue]) {
+            [d addEntriesFromDictionary:g];
+            d[@"how"] = [@"gesture:" stringByAppendingString:(g[@"how"] ?: @"")];
+            return d;
+        }
+        d[@"ok"] = @NO;
+        d[@"err"] = @"这条父链上既无 UIControl 也无 Cell，手势也没打成";
+        return d;
+    }
     return AIPickCellIn(cell, d);
+}
+
+static NSString *AITextOfView(UIView *v);   // v23：本文件后面定义，这里先用
+
+// v23：界面上「文字在哪」的递归查找。快手把文字画在 _TKLabel 里，
+//      标准 tree/rows 都看不到，只能靠 AITextOfView 一个个问出来。
+static void AIFindTextRec(UIView *v, NSString *kw, NSMutableArray *out) {
+    if (!v || out.count > 200 || !AIBudgetTake()) return;
+    @try {
+        NSString *t = AITextOfView(v);
+        if (t.length && [t rangeOfString:kw options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            CGRect ab = [v convertRect:v.bounds toView:nil];
+            if (ab.size.width > 4 && ab.size.height > 4 &&
+                ab.origin.x < 420 && ab.origin.x + ab.size.width > -20 &&
+                ab.origin.y < 900 && ab.origin.y + ab.size.height > 0)
+                [out addObject:v];
+        }
+        for (UIView *c in v.subviews) AIFindTextRec(c, kw, out);
+    } @catch (id e) {}
+}
+
+// v23：按文字定位控件并触发它的 tap 手势 —— 自绘 UI 的通用点击解法。
+//      不依赖它是 UIControl / UITableViewCell / UICollectionViewCell。
+static NSDictionary *AIPickTextViaGesture(NSString *kw) {
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    AIBudgetReset(4000);
+    NSMutableArray *out = [NSMutableArray array];
+    for (UIWindow *w in AIAllWindows()) {
+        if (w == gOverlayWindow || w == gHudWindow) continue;
+        AIFindTextRec(w, kw, out);
+    }
+    if (!out.count) {
+        d[@"ok"] = @NO;
+        d[@"err"] = [@"界面上找不到含该文字的控件: " stringByAppendingString:kw];
+        d[@"cands"] = @0;
+        return d;
+    }
+    UIView *best = nil; CGFloat by = 1e9;
+    for (UIView *v in out) {
+        CGRect ab = [v convertRect:v.bounds toView:nil];
+        CGFloat y = CGRectGetMinY(ab);
+        if (y < by) { by = y; best = v; }
+    }
+    CGRect ab = [best convertRect:best.bounds toView:nil];
+    CGPoint c = CGPointMake(CGRectGetMidX(ab), CGRectGetMidY(ab));
+    d[@"cands"] = @(out.count);
+    d[@"found"] = NSStringFromClass([best class]);
+    d[@"foundFrame"] = NSStringFromCGRect(ab);
+    d[@"point"] = NSStringFromCGPoint(c);
+    NSDictionary *g = AIGestureTapAt(c);
+    [d addEntriesFromDictionary:g];
+    d[@"how"] = [@"gesture:" stringByAppendingString:(g[@"how"] ?: @"none")];
+    return d;
 }
 
 // 列出屏幕上所有可见表格行（含文本和屏幕中心点）——省掉逐个 probe 的往返
