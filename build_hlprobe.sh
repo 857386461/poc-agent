@@ -68,17 +68,29 @@ echo "--- 结论判据：(from IOKit)=真解析；dynamic_lookup=只是被放行
 
 # 既然 IOKit 有导出表，§2.4 的「Create 有 11/13/14 三种社区版本」就别猜了：
 # 直接把导出符号列出来，看真机上到底存在哪几个变体。
-IOK="$SDK/System/Library/Frameworks/IOKit.framework/IOKit"
+IOKF="$SDK/System/Library/Frameworks/IOKit.framework"
 echo "=== [2c/5] IOKit 导出表（回答 §2.4 的参数个数之争） ==="
-echo "framework 文件: $(ls -la "$IOK" 2>/dev/null | awk '{print $5" "$NF}')"
-echo "--- 所有 IOHIDEventCreate* 变体 ---"
-nm -gU "$IOK" 2>/dev/null | grep -i "IOHIDEventCreate" | head -25 || echo "  （nm 不可用）"
-echo "--- 所有 IOHIDEventSystemClient* 变体 ---"
-nm -gU "$IOK" 2>/dev/null | grep -i "EventSystemClient" | head -20 || echo "  （nm 不可用）"
-echo "--- 坐标/字段写入类 ---"
-nm -gU "$IOK" 2>/dev/null | grep -iE "IOHIDEvent(Set|Append|Get)" | head -15 || echo "  （nm 不可用）"
-echo "--- 导出符号总数 ---"
-nm -gU "$IOK" 2>/dev/null | wc -l
+echo "--- framework 目录里到底有什么 ---"
+ls -la "$IOKF" 2>/dev/null || echo "  目录不存在"
+# iOS SDK 里的 framework 多是 .tbd 文本 stub（无真二进制，nm 拿不到），
+# 但 tbd 本身就是符号清单，直接 grep 读更可靠。
+TBD=$(find "$IOKF" -name "*.tbd" 2>/dev/null | head -1)
+echo "tbd: ${TBD:-（无，尝试真二进制）}"
+SRC_TAB="$TBD"
+if [ -z "$SRC_TAB" ]; then
+  SRC_TAB=$(find "$IOKF" -type f -name "IOKit" 2>/dev/null | head -1)
+fi
+echo "符号来源: ${SRC_TAB:-（都没找到）}"
+if [ -n "$TBD" ]; then
+  echo "--- IOHIDEventCreate* 变体（决定 11/13/14/18 参到底有哪几个） ---"
+  grep -oE "_IOHIDEventCreate[A-Za-z]*" "$TBD" | sort -u | head -30 || echo "  （未命中）"
+  echo "--- IOHIDEventSystemClient* 变体 ---"
+  grep -oE "_IOHIDEventSystemClient[A-Za-z]*" "$TBD" | sort -u | head -25 || echo "  （未命中）"
+  echo "--- IOHIDEvent Set/Append/Get ---"
+  grep -oE "_IOHIDEvent(Set|Append|Get)[A-Za-z]*" "$TBD" | sort -u | head -20 || echo "  （未命中）"
+  echo "--- 导出符号总数 ---"
+  grep -cE "^[[:space:]]+_IOHID" "$TBD" || true
+fi
 } 2>&1 | tee -a "$REPORT"
 
 echo "=== [3/5] 编译 HLProbe.dylib（dlsym 路线，不链 IOKit） ==="
