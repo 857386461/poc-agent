@@ -106,7 +106,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v21";
+static NSString * const kAIVer = @"v22";
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -936,6 +936,86 @@ static NSString *AITextsOf(UIView *v) {
     return [a componentsJoinedByString:@" | "];
 }
 
+// v22：快手侧边栏/首页大量用 UICollectionView（TKListView 底层就是它），
+//      cell 里既没有 UIControl 也不是 UITableViewCell —— 旧 pick 统统点不动。
+static void AIFindCVRec(UIView *v, NSMutableArray *out, int depth) {
+    if (!v || depth > 12) return;
+    @try {
+        if ([v isKindOfClass:[UICollectionView class]] && ![out containsObject:v]) [out addObject:v];
+        for (UIView *s in v.subviews) AIFindCVRec(s, out, depth + 1);
+    } @catch (id e) {}
+}
+static NSArray *AIVisibleCollectionViews(void) {
+    NSMutableArray *out = [NSMutableArray array];
+    for (UIWindow *w in AIAllWindows()) {
+        if (w == gOverlayWindow || w == gHudWindow) continue;
+        AIFindCVRec(w, out, 0);
+    }
+    return out;
+}
+static UICollectionView *AICollectionViewOfCell(UICollectionViewCell *cell) {
+    UIView *p = cell.superview; int up = 0;
+    while (p && up < 15) {
+        if ([p isKindOfClass:[UICollectionView class]]) return (UICollectionView *)p;
+        p = p.superview; up++;
+    }
+    for (UICollectionView *cv in AIVisibleCollectionViews())
+        if ([[cv visibleCells] containsObject:cell]) return cv;
+    return nil;
+}
+static NSDictionary *AIPickCellInCollection(UICollectionViewCell *cell, NSMutableDictionary *d) {
+    d[@"cell"]      = NSStringFromClass([cell class]);
+    d[@"cellFrame"] = NSStringFromCGRect([cell convertRect:cell.bounds toView:nil]);
+    d[@"cellText"]  = AITextsOf(cell);
+
+    UICollectionView *cv = AICollectionViewOfCell(cell);
+    if (!cv) { d[@"ok"] = @NO; d[@"err"] = @"找不到 cell 所属的 UICollectionView"; return d; }
+    d[@"cv"] = NSStringFromClass([cv class]);
+
+    NSIndexPath *ip = nil;
+    @try { ip = [cv indexPathForCell:cell]; } @catch (id e) {}
+    if (!ip) {
+        @try {
+            CGPoint c = cell.center;
+            CGPoint inCv = [cv convertPoint:c fromView:cell.superview];
+            ip = [cv indexPathForItemAtPoint:inCv];
+        } @catch (id e) {}
+    }
+    if (!ip) { d[@"ok"] = @NO; d[@"err"] = @"indexPathForCell 返回 nil"; return d; }
+    d[@"section"] = @(ip.section); d[@"item"] = @(ip.item);
+
+    id dlg = nil;
+    @try { dlg = cv.delegate; } @catch (id e) {}
+    d[@"delegate"] = dlg ? NSStringFromClass([dlg class]) : @"(nil)";
+
+    SEL sel = @selector(collectionView:didSelectItemAtIndexPath:);
+    BOOL called = NO;
+    if (dlg && [dlg respondsToSelector:sel]) {
+        @try {
+            NSMethodSignature *sig = [dlg methodSignatureForSelector:sel];
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            inv.selector = sel;
+            __unsafe_unretained UICollectionView *cvArg = cv;
+            __unsafe_unretained NSIndexPath *ipArg = ip;
+            [inv setArgument:&cvArg atIndex:2];
+            [inv setArgument:&ipArg atIndex:3];
+            [inv invokeWithTarget:dlg];
+            called = YES;
+            d[@"how"] = @"delegate collectionView:didSelectItemAtIndexPath:";
+        } @catch (NSException *e) { d[@"invokeErr"] = e.reason ?: @"?"; }
+    }
+    if (!called) {
+        @try {
+            [cv selectItemAtIndexPath:ip animated:NO scrollPosition:UICollectionViewScrollPositionNone];
+            called = YES;
+            d[@"how"] = @"selectItemAtIndexPath 兜底（无 delegate）";
+        } @catch (id e) {}
+    }
+    if (!d[@"how"]) d[@"how"] = @"两种都没调到";
+    d[@"ok"] = @(called);
+    return d;
+}
+
 static void AIFindTVRec(UIView *v, NSMutableArray *out, int depth) {
     if (!v || depth > 12) return;
     @try {
@@ -1044,6 +1124,14 @@ static NSDictionary *AIPickAt(CGPoint pt) {
         if ([p isKindOfClass:[UITableViewCell class]]) { cell = (UITableViewCell *)p; break; }
         p = p.superview; up++;
     }
+    // v22：UICollectionViewCell（快手侧边栏/网格页全靠这条）
+    UICollectionViewCell *ccell = nil; p = v; up = 0;
+    while (p && up < 12) {
+        if ([p isKindOfClass:[UICollectionViewCell class]]) { ccell = (UICollectionViewCell *)p; break; }
+        p = p.superview; up++;
+    }
+    if (ccell) return AIPickCellInCollection(ccell, d);
+
     if (!cell) { d[@"ok"] = @NO; d[@"err"] = @"这条父链上既无 UIControl 也无 Cell"; return d; }
     return AIPickCellIn(cell, d);
 }
@@ -1074,6 +1162,30 @@ static NSString *AIRowsInfo(void) {
                               NSStringFromCGRect(f), AITextsOf(c)]];
         }
     }
+    // v22：UICollectionView 的可见 cell 也列出来（快手侧边栏 TKListView 靠这个读到文字）
+    for (UICollectionView *cv in AIVisibleCollectionViews()) {
+        NSArray *cells = nil;
+        @try { cells = [cv visibleCells]; } @catch (id e) {}
+        if (!cells.count) continue;
+        cells = [cells sortedArrayUsingComparator:^NSComparisonResult(UIView *a, UIView *b) {
+            CGFloat ya = CGRectGetMinY([a convertRect:a.bounds toView:nil]);
+            CGFloat yb = CGRectGetMinY([b convertRect:b.bounds toView:nil]);
+            if (ya < yb) return NSOrderedAscending;
+            if (ya > yb) return NSOrderedDescending;
+            return NSOrderedSame;
+        }];
+        [lines addObject:[NSString stringWithFormat:@"=== %@ [collection] (%lu 项可见) ===",
+                          NSStringFromClass([cv class]), (unsigned long)cells.count]];
+        for (UICollectionViewCell *c in cells) {
+            CGRect f = [c convertRect:c.bounds toView:nil];
+            NSIndexPath *ip = nil;
+            @try { ip = [cv indexPathForCell:c]; } @catch (id e) {}
+            [lines addObject:[NSString stringWithFormat:@"s%ld-i%ld 中心(%.0f,%.0f) 框%@ 文本:%@",
+                              (long)(ip ? ip.section : -1), (long)(ip ? ip.item : -1),
+                              CGRectGetMidX(f), CGRectGetMidY(f),
+                              NSStringFromCGRect(f), AITextsOf(c)]];
+        }
+    }
     return lines.count ? [lines componentsJoinedByString:@"\n"] : @"(屏幕上没有可见表格行)";
 }
 
@@ -1088,13 +1200,25 @@ static NSDictionary *AIPickByText(NSString *kw) {
             }
         }
     }
+    // v22：collection view 的 item 也参与文本匹配（快手侧边栏）
+    for (UICollectionView *cv in AIVisibleCollectionViews()) {
+        for (UICollectionViewCell *c in [cv visibleCells]) {
+            NSString *t = AITextsOf(c);
+            if (t && [t rangeOfString:kw options:NSCaseInsensitiveSearch].location != NSNotFound)
+                [cands addObject:c];
+        }
+    }
     if (!cands.count) return @{@"ok": @NO, @"err": [@"没找到含文本的行: " stringByAppendingString:kw], @"cands": @0};
-    UITableViewCell *best = nil; CGFloat by = 1e9;
-    for (UITableViewCell *c in cands) {
+    UIView *best = nil; CGFloat by = 1e9;
+    for (UIView *c in cands) {
         CGFloat y = CGRectGetMinY([c convertRect:c.bounds toView:nil]);
         if (y < by) { by = y; best = c; }
     }
-    NSMutableDictionary *d = [AIPickCellIn(best, [NSMutableDictionary dictionary]) mutableCopy];
+    NSMutableDictionary *d;
+    if ([best isKindOfClass:[UICollectionViewCell class]])
+        d = [AIPickCellInCollection((UICollectionViewCell *)best, [NSMutableDictionary dictionary]) mutableCopy];
+    else
+        d = [AIPickCellIn((UITableViewCell *)best, [NSMutableDictionary dictionary]) mutableCopy];
     d[@"cands"] = @(cands.count);
     return d;
 }
