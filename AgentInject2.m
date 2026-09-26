@@ -170,6 +170,8 @@ static NSString *AITextList(UIView *v, int depth, int maxDepth);  // v19：读�
 static BOOL AIBudgetTake(void);                      // v23：额度控制，定义在 ~2340 行
 static NSArray *AIHostWindows(void);                 // v23：候选窗口列表（AIHitAtPoint 提前用）
 static UIView *AIHitAtPoint(CGPoint pt);             // v23：跨窗口命中测试
+static void AIBudgetReset(int n);                    // v23：额度重置，定义在 ~2410 行
+static NSDictionary *AIPickTextViaGesture(NSString *kw);  // v23：按文字触发手势，定义在 ~1339 行
 static NSDictionary *AIScrollAt(CGPoint pt, double dy, double dx, BOOL anim);  // v17
 static NSString *AIBack(void);                  // v18：AIRunMacro(~1057) 在它定义之前要调用
 static NSString *AINavInfo(void);               // v18
