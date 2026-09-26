@@ -175,6 +175,9 @@ static NSString *AICoreDir(void);
 static BOOL  AIHandoffToNewer(void);
 static NSString *AIUpdateFrom(NSString *url, NSString *ver);
 static void  AIFloatApply(void);
+static NSString *AINewerCorePath(void);      // core 命令 + 悬浮球面板要用
+static void  AICheckUpdateAsync(void);       // AIBoot 里要用
+static void  AIInstall(void);                // AgentCoreStart（非 static）要调用它
 
 // ---------------------------------------------------------------------------
 // 2. HID 私有符号（全部 dlsym，不做链接期依赖）
