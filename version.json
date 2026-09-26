@@ -1,6 +1,6 @@
 {
   "ver": "20",
-  "url": "https://github.com/857386461/poc-agent/releases/download/inject2-32/AgentInject2.dylib",
+  "url": "https://github.com/857386461/poc-agent/releases/download/inject2-33/AgentInject2.dylib",
   "note": "v20: 修快手掌空 keyWindow 导致 tree/text 抓空；text 支持自绘控件；内置更新(OTA)；悬浮球 UI 替代盖屏",
   "min": "20"
 }
