@@ -176,6 +176,7 @@ static BOOL AIMemSafe(void);                         // v24：内存水位阀，
 static int  AIMemMB(void);                           // v24：当前常驻内存 MB
 static id   AISafeObjGet(id v, SEL g);               // v24：只接受对象返回值的 selector 调用
 static NSString *AIRuntimeTextOf(id v);              // v27：AIFindViewsAt 要用，定义在 ~2684 行
+static BOOL AITapUIControlAt(CGPoint pt, NSString **outDesc);  // v28：AIDismiss 要用，定义在 ~1137 行
 static NSArray   *AIFindViewsAt(CGPoint pt, int maxN);   // v27：按坐标精确命中（躲开 hitTest）
 static NSDictionary *AIPickTextViaGesture(NSString *kw);  // v23：按文字触发手势，定义在 ~1339 行
 static NSDictionary *AIScrollAt(CGPoint pt, double dy, double dx, BOOL anim);  // v17
@@ -895,13 +896,33 @@ static NSDictionary *AIRNTap(CGPoint pt, int up, int rank, int delayMs) {
     if (![tv isKindOfClass:[UIView class]]) return @{@"ok": @NO, @"err": @"候选无效"};
     for (int i = 0; i < up && tv.superview; i++) tv = tv.superview;
 
+    // 找手势：★优先 RCTTouchHandler（RN 的点击只认它）
+    //   v27 踩的坑：按钮在 RN 的滚动容器里，沿父链第一个碰到的永远是
+    //   UIScrollViewPanGestureRecognizer 那几个滚动手势（实测 state=5 全 failed），
+    //   真正管点击的 RCTTouchHandler 挂在更上面的 RCTRootContentView 上。
+    //   所以这里先一路扫到顶专门找 RCTTouchHandler，找不到再退回「第一个有手势的」。
     UIView *gv = tv; int up2 = 0; NSArray *grs = nil;
-    while (gv && up2 < 24) {
-        @try { if (gv.gestureRecognizers.count) { grs = gv.gestureRecognizers; break; } } @catch (id e) {}
-        gv = gv.superview; up2++;
+    UIView *scan = tv; int sc = 0;
+    while (scan && sc < 26) {
+        @try {
+            for (UIGestureRecognizer *gr in scan.gestureRecognizers) {
+                if ([NSStringFromClass(gr.class) rangeOfString:@"RCTTouchHandler"].length) {
+                    gv = scan; grs = scan.gestureRecognizers; up2 = sc; break;
+                }
+            }
+            if (grs) break;
+        } @catch (id e) {}
+        scan = scan.superview; sc++;
+    }
+    if (!grs) {
+        gv = tv; up2 = 0;
+        while (gv && up2 < 24) {
+            @try { if (gv.gestureRecognizers.count) { grs = gv.gestureRecognizers; break; } } @catch (id e) {}
+            gv = gv.superview; up2++;
+        }
     }
     if (!gv || !grs.count)
-        return @{@"ok": @NO, @"err": @"父链 24 层内无手势",
+        return @{@"ok": @NO, @"err": @"父链 26 层内无手势",
                  @"tv": NSStringFromClass(tv.class), @"tag": cands[rank][@"tag"] ?: @"-"};
 
     AIFakeTouch *t = [AIFakeTouch new];
@@ -929,6 +950,83 @@ static NSDictionary *AIRNTap(CGPoint pt, int up, int rank, int delayMs) {
                                 @"grs": fired, @"ncand": @(cands.count)} mutableCopy];
     if (errs.count) d[@"errs"] = errs;
     return d;
+}
+
+// ---------------------------------------------------------------------------
+// v28：dismiss —— 一键关掉随机弹窗
+//
+//   快手这类 App 每走一步都可能蹦出个没见过的弹窗（邀请好友 / 领现金 /
+//   开通会员 …），把原本要点的按钮盖住，而且【每次长得都不一样】。
+//   靠猜坐标回头再补一个版本，来回注入成本太高。
+//
+//   所以做成自动的：扫一遍界面文字，按「关掉我」的优先级（关闭 > ✕ >
+//   稍后再看 > 取消 > 拒绝 > 返回）挑一个，依次用三条通路点：
+//     ① 是 UIControl 就直接 sendActionsForControlEvents（最干净）
+//     ② 不是就 rntap（拿它自己的 reactTag 喂 RCTTouchHandler）
+//   点了就返回，让云端看界面变化判断成没成。
+// ---------------------------------------------------------------------------
+static NSDictionary *AIDismiss(void) {
+    UIWindow *w = AIHostWindow();
+    if (!w) return @{@"ok": @NO, @"err": @"无 window"};
+    NSArray *kws = @[@"关闭", @"✕", @"×", @"X", @"稍后再看", @"残忍拒绝", @"下次再说",
+                     @"知道了", @"我知道了", @"取消", @"暂不", @"不了", @"跳过", @"返回"];
+    CGFloat scr = w.bounds.size.width * w.bounds.size.height;
+    if (scr <= 0) scr = 390 * 844;
+
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
+    NSMutableArray *hits  = [NSMutableArray array];
+    int budget = 6000;
+    while (stack.count && budget > 0) {
+        UIView *v = stack.lastObject; [stack removeLastObject]; budget--;
+        if (![v isKindOfClass:[UIView class]]) continue;
+        @try {
+            NSString *tx = AIRuntimeTextOf(v);
+            if (tx.length && tx.length <= 8) {
+                NSString *tt = [tx stringByTrimmingCharactersInSet:
+                                [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                for (int i = 0; i < (int)kws.count; i++) {
+                    NSString *kw = kws[i];
+                    BOOL m = (tt.length <= 2) ? [tt isEqualToString:kw] : [tt containsString:kw];
+                    if (!m) continue;
+                    CGRect r = [v convertRect:v.bounds toView:nil];
+                    CGFloat a = r.size.width * r.size.height;
+                    if (r.size.width > 0 && r.size.height > 0 && a < scr * 0.9) {
+                        [hits addObject:@{@"kw": kw, @"pri": @(i), @"txt": tt,
+                                          @"area": @((int)a),
+                                          @"cx": @(r.origin.x + r.size.width  / 2.0),
+                                          @"cy": @(r.origin.y + r.size.height / 2.0)}];
+                    }
+                    break;
+                }
+            }
+        } @catch (id e) {}
+        @try { for (UIView *c in v.subviews) [stack addObject:c]; } @catch (id e) {}
+    }
+    if (!hits.count) return @{@"ok": @NO, @"err": @"界面上没有常见的关闭/取消类文字", @"n": @0};
+    [hits sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        if (![a[@"pri"] isEqual:b[@"pri"]]) return [a[@"pri"] compare:b[@"pri"]];
+        return [a[@"area"] compare:b[@"area"]];
+    }];
+
+    for (int i = 0; i < (int)hits.count && i < 3; i++) {
+        NSDictionary *h = hits[i];
+        CGPoint pt = CGPointMake([h[@"cx"] floatValue], [h[@"cy"] floatValue]);
+        NSString *desc = nil;
+        @try {
+            if (AITapUIControlAt(pt, &desc))
+                return @{@"ok": @YES, @"how": @"tapui", @"kw": h[@"kw"], @"txt": h[@"txt"],
+                         @"pt": NSStringFromCGPoint(pt), @"desc": desc ?: @"", @"n": @(hits.count)};
+        } @catch (id e) {}
+        @try {
+            NSDictionary *r2 = AIRNTap(pt, 0, 0, 60);
+            if ([r2[@"ok"] boolValue])
+                return @{@"ok": @YES, @"how": @"rntap", @"kw": h[@"kw"], @"txt": h[@"txt"],
+                         @"pt": NSStringFromCGPoint(pt), @"tag": r2[@"tag"] ?: @"-",
+                         @"grs": r2[@"grs"] ?: @[], @"n": @(hits.count)};
+        } @catch (id e) {}
+    }
+    return @{@"ok": @NO, @"err": @"找到关闭类文字但点不动", @"n": @(hits.count),
+             @"first": hits[0][@"txt"] ?: @"-"};
 }
 
 // ---------------------------------------------------------------------------
@@ -3175,6 +3273,17 @@ static void AIExecCmd(NSDictionary *cmd) {
         AIReportDict(mm);
         AILog(@"  [cmd] rntap (%.0f,%.0f) up=%d rank=%d -> tv=%@ tag=%@ grs=%@",
               x, y, up, rk, mm[@"tv"], mm[@"tag"], mm[@"grs"]);
+        return;
+    }
+    // v28：dismiss —— 自动找「关闭/取消/稍后再看/返回」这类文字并点掉
+    if ([op isEqualToString:@"dismiss"]) {
+        __block NSDictionary *res = nil;
+        AIMainSync(^{ @try { res = AIDismiss(); } @catch (id e) {} });
+        NSMutableDictionary *mm = [(res ?: @{}) mutableCopy];
+        mm[@"op"] = @"dismiss";
+        AIReportDict(mm);
+        AILog(@"  [cmd] dismiss -> how=%@ kw=%@ pt=%@ err=%@",
+              mm[@"how"], mm[@"kw"], mm[@"pt"], mm[@"err"] ?: @"-");
         return;
     }
     // v27：uioff —— 剥遮挡层：把该点 hitTest 命中的 view 的交互关掉（不改外观）
