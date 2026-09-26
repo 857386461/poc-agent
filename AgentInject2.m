@@ -29,6 +29,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
+#import <UIKit/UIGestureRecognizerSubclass.h>   // v25：允许直接调 gr 的 touchesBegan/Ended
 #import <dlfcn.h>
 #import <mach/mach.h>
 #import <mach/mach_time.h>
@@ -106,7 +107,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v24";
+static NSString * const kAIVer = @"v25";
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -594,7 +595,13 @@ static BOOL AITapInProcess(CGPoint pt) {
 // ★ v13：走 sendEvent 路径时 aiView 是 nil（UIKit 自己决定发给谁）。
 //   此时 aiPoint 存的是【window 坐标】，用它往目标 view 换算。
 - (CGPoint)locationInView:(UIView *)v {
-    if (!v) return self.aiPoint;
+    // v25：v==nil 的语义是「要 window 坐标」。原来直接返回 aiPoint，
+    // 但 aiPoint 是相对 aiView 的 —— RN 的 RCTTouchHandler 正是用
+    // locationInView:nil 取 window 坐标做 hit-test 的，会算错整个点击位置。
+    if (!v) {
+        if (self.aiView) return [self.aiView convertPoint:self.aiPoint toView:nil];
+        return self.aiPoint;
+    }
     if (!self.aiView) {
         // aiPoint 是 window 坐标 —— 从 window 换算到 v
         UIWindow *win = self.aiWindow ?: v.window;
@@ -667,6 +674,76 @@ static BOOL AIDispatchFakeToView(UIView *target, CGPoint ptInTarget) {
         AILog(@"  分发异常: %@", ex.reason);
         return NO;
     }
+}
+
+// ---------------------------------------------------------------------------
+// v25：gdtap —— 把触摸【直接喂给手势识别器】
+//
+//   为什么需要它：快手任务中心是 React Native 渲染的。
+//   chain 显示整条父链上只有 RCTRootContentView 挂着 RCTTouchHandler，
+//   而「立即签到」按钮本身是 RCTView / RCTTextView，既不是 UIControl，
+//   也不自带手势 —— 点击全靠 RCTTouchHandler 收到触摸后转发给 JS。
+//
+//   两条老路都进不了它的门：
+//     · sendEvent（tap）      —— UIKit 分发伪造事件实测不路由（微信上早已判死）
+//     · 喂给 hitTest 命中的子 view —— 手势挂在 9 层之上的祖先，子 view 收不到
+//
+//   所以：沿父链找到第一个挂着手势的 view，用 AIFakeTouch 直接调
+//   `-[UIGestureRecognizer touchesBegan/Moved/Ended:]`。
+//   UIGestureRecognizerSubclass.h 里这几个方法是公开的，子类化时本来就要重写。
+// ---------------------------------------------------------------------------
+static NSDictionary *AIGestureDirectTap(CGPoint pt) {
+    UIWindow *w = AIHostWindow();
+    if (!w) return @{@"ok": @NO, @"err": @"无 window"};
+    UIView *hit = nil;
+    @try { hit = [w hitTest:pt withEvent:nil]; } @catch (id e) {}
+    if (!hit) return @{@"ok": @NO, @"err": @"hitTest 未命中"};
+
+    UIView *gv = hit; int up = 0; NSArray *grs = nil;
+    while (gv && up < 22) {
+        @try {
+            if (gv.gestureRecognizers.count) { grs = gv.gestureRecognizers; break; }
+        } @catch (id e) {}
+        gv = gv.superview; up++;
+    }
+    if (!gv || !grs.count)
+        return @{@"ok": @NO, @"err": @"父链 22 层内无手势",
+                 @"hit": NSStringFromClass(hit.class)};
+
+    CGPoint p = [w convertPoint:pt toView:gv];
+    AIFakeTouch *t = [AIFakeTouch new];
+    t.aiPoint = p; t.aiView = gv; t.aiWindow = w;
+    t.aiTime = [[NSDate date] timeIntervalSince1970];
+    AIFakeEvent *ev = [AIFakeEvent new];
+    NSSet *one = [NSSet setWithObject:t];
+    ev.aiTouches = one; ev.aiTime = t.aiTime;
+
+    NSMutableArray *fired = [NSMutableArray array];
+    @try {
+        t.aiPhase = UITouchPhaseBegan;
+        for (UIGestureRecognizer *gr in grs) { @try { [gr touchesBegan:one withEvent:ev]; } @catch (id e) {} }
+        t.aiPhase = UITouchPhaseMoved;
+        for (UIGestureRecognizer *gr in grs) { @try { [gr touchesMoved:one withEvent:ev]; } @catch (id e) {} }
+        t.aiPhase = UITouchPhaseEnded;
+        for (UIGestureRecognizer *gr in grs) {
+            @try {
+                [gr touchesEnded:one withEvent:ev];
+                [fired addObject:[NSString stringWithFormat:@"%@|state=%ld",
+                                  NSStringFromClass(gr.class), (long)gr.state]];
+            } @catch (id e) {}
+        }
+    } @catch (NSException *ex) {
+        return @{@"ok": @NO, @"err": ex.reason ?: @"手势分发异常"};
+    }
+    // 兜底：有些控件自己在 touchesEnded: 里处理，把手势所在 view 也喂一遍
+    @try {
+        t.aiPhase = UITouchPhaseBegan; [gv touchesBegan:one withEvent:ev];
+        t.aiPhase = UITouchPhaseEnded; [gv touchesEnded:one withEvent:ev];
+    } @catch (id e) {}
+
+    return @{@"ok": @YES, @"gv": NSStringFromClass(gv.class), @"up": @(up),
+             @"hit": NSStringFromClass(hit.class), @"grs": fired,
+             @"n": @(grs.count), @"pt": NSStringFromCGPoint(p)};
 }
 
 // ---------------------------------------------------------------------------
@@ -2836,6 +2913,18 @@ static void AIReportDict(NSDictionary *d) {
 static void AIExecCmd(NSDictionary *cmd) {
     NSString *op = cmd[@"op"];
     if (!op) return;
+    // v25：把手势喂进手势识别器本体 —— RN / 自绘 UI 的点击通路
+    if ([op isEqualToString:@"gdtap"]) {
+        CGFloat x = [cmd[@"x"] floatValue], y = [cmd[@"y"] floatValue];
+        __block NSDictionary *res = nil;
+        AIMainSync(^{ @try { res = AIGestureDirectTap(CGPointMake(x, y)); } @catch (id e) {} });
+        NSMutableDictionary *mm = [(res ?: @{}) mutableCopy];
+        mm[@"op"] = @"gdtap"; mm[@"x"] = @(x); mm[@"y"] = @(y);
+        AIReportDict(mm);
+        AILog(@"  [cmd] gdtap (%.0f,%.0f) -> gv=%@ up=%@ grs=%@ err=%@",
+              x, y, mm[@"gv"], mm[@"up"], mm[@"grs"], mm[@"err"] ?: @"-");
+        return;
+    }
     if ([op isEqualToString:@"tap"]) {
         CGFloat x = [cmd[@"x"] floatValue], y = [cmd[@"y"] floatValue];
         BOOL ok = NO;
