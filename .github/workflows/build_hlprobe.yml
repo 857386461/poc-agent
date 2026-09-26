@@ -44,6 +44,7 @@ jobs:
           gh release create "$TAG" \
             build_hl/HLProbe.dylib \
             build_hl/HLProbe.zip \
+            build_hl/hl_sdk_report.txt \
             --title "HLProbe dylib $TAG" \
             --notes "TrollFools 注入任意 App → 等 5 秒出探针界面 → 先手动点中间按钮看计数 +1 → 点「自动遍历」跑完 18 种组合 → 点「取色」验 RGB"
 
