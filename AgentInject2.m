@@ -106,7 +106,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v18";
+static NSString * const kAIVer = @"v23";
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -128,6 +128,22 @@ static BOOL gBgActive = NO;
 // 同时它必须在文件靠前的位置声明 —— v3 的伪造 Touch 分发代码（约 530 行）
 // 会用到它，声明放在 13 节会导致 "use of undeclared identifier"。
 static UIWindow *gOverlayWindow = nil;
+static UIWindow *gFloatWindow   = nil;   // v20 悬浮球（替代碍事的全屏盖屏，默认只留这个）
+static BOOL      gFloatExpanded = NO;    // 悬浮球是否展开了面板
+static BOOL      gFloatForce    = NO;    // 交互操作要立刻重绘，跳过节流
+static CFTimeInterval gFloatLast = 0;
+
+// v20 开关项：状态存 NSUserDefaults，杀 App 重开也记得住。
+// 放在文件靠前的位置 —— AIExecCmd（~2200 行）在它定义之前就要用。
+#define AIK(k) [@"ai2_" stringByAppendingString:(k)]
+static BOOL AIFlag(NSString *k, BOOL def) {
+    id v = [[NSUserDefaults standardUserDefaults] objectForKey:AIK(k)];
+    return v ? [v boolValue] : def;
+}
+static void AISetFlag(NSString *k, BOOL b) {
+    [[NSUserDefaults standardUserDefaults] setBool:b forKey:AIK(k)];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
 
 // 前向声明：sendEvent hook 里要在定义之前调用 AIBoot
 static void AIBoot(void);
@@ -150,9 +166,18 @@ static BOOL AIDispatchFakeViaSendEvent(CGPoint pt, int steps, double dt);
 static BOOL AIFakeSwipe(CGPoint a, CGPoint b, int steps, double dur);
 static void AIMainSync(void (^b)(void));
 static NSString *AITreeOf(UIView *v, int depth, int maxDepth);
+static NSString *AITextList(UIView *v, int depth, int maxDepth);  // v19：读界面文本（陌生 App 导航刚需）
 static NSDictionary *AIScrollAt(CGPoint pt, double dy, double dx, BOOL anim);  // v17
 static NSString *AIBack(void);                  // v18：AIRunMacro(~1057) 在它定义之前要调用
 static NSString *AINavInfo(void);               // v18
+// v20 自更新：AIInstall（~3060 行）在它们的定义之前要调用
+static NSString *AICoreDir(void);
+static BOOL  AIHandoffToNewer(void);
+static NSString *AIUpdateFrom(NSString *url, NSString *ver);
+static void  AIFloatApply(void);
+static NSString *AINewerCorePath(void);      // core 命令 + 悬浮球面板要用
+static void  AICheckUpdateAsync(void);       // AIBoot 里要用
+static void  AIInstall(void);                // AgentCoreStart（非 static）要调用它
 
 // ---------------------------------------------------------------------------
 // 2. HID 私有符号（全部 dlsym，不做链接期依赖）
@@ -836,21 +861,210 @@ static NSArray *AIAllWindows(void) {
     return out;
 }
 
-// 找「App 自己的」窗口：排除我们盖的屏、排除键盘/文本特效窗口
-static UIWindow *AIHostWindow(void) {
-    UIWindow *fallback = nil;
+// v20：数一棵视图树有多少个「可见」节点 —— 用来判断哪个窗口才是 App 真正在显示的。
+//
+//   ★ 踩坑（快手）：快手上有一个【全屏但内容为空】的窗口抢到了 isKeyWindow，
+//     旧逻辑「见到 keyWindow 就 return」于是 tree / text 全抓到一个光秃秃的
+//     UIView (0,0,390,844)，界面文字一条都读不到。微信目前侥幸没踩到，
+//     但只要宿主 App 多开一个空窗口就会复现，所以这里改成按内容量选。
+static int AICountNodes(UIView *v, int depth, int maxDepth, int cap) {
+    if (!v || depth > maxDepth) return 0;
+    if (v.hidden || v.alpha < 0.01) return 0;
+    int n = 1;
+    for (UIView *c in v.subviews) {
+        n += AICountNodes(c, depth + 1, maxDepth, cap);
+        if (n >= cap) break;                 // 够多就打住，别把主线程拖住
+    }
+    return n;
+}
+
+// v23：允许外部指定「用第几个窗口」（wins 列出来的序号）。
+//  -1 = 自动。宿主 App 把侧边栏/弹层挂在别的窗口时，靠它切过去。
+static int gWinIdx = -1;
+
+// v23：候选窗口列表（过滤掉我们自己盖的东西），顺序稳定，wins 与 win=N 共用
+static NSArray *AIHostWindows(void) {
+    NSMutableArray *out = [NSMutableArray array];
     for (UIWindow *w in AIAllWindows()) {
         if (w == gOverlayWindow) continue;
         if (w == gHudWindow) continue;          // v10 顶端状态条，别让它冒充 App 窗口
+        if (w == gFloatWindow) continue;        // v20 悬浮球
         NSString *cn = NSStringFromClass([w class]);
         if ([cn rangeOfString:@"TextEffects"].location != NSNotFound) continue;
         if ([cn rangeOfString:@"RemoteKeyboard"].location != NSNotFound) continue;
-        if (w.hidden || w.alpha < 0.01) continue;
-        if (!fallback) fallback = w;
-        if (w.isKeyWindow) return w;
-        if (w.rootViewController && w.rootViewController.view.window == w) return w;
+        [out addObject:w];
     }
-    return fallback ?: gOverlayWindow;
+    return out;
+}
+
+// v23：命中测试必须从【最上面的窗口】往下找。快手的侧边栏挂在后面加的窗口上，
+// 只问 keyWindow / 内容最多的窗口，hitTest 会被底层那个全屏大窗口截胡。
+static UIView *AIHitAtPoint(CGPoint pt) {
+    NSArray *ws = AIHostWindows();
+    for (NSInteger i = ws.count - 1; i >= 0; i--) {
+        UIWindow *w = ws[i];
+        if (w.hidden || w.alpha < 0.01) continue;
+        @try {
+            UIView *v = [w hitTest:pt withEvent:nil];
+            if (v) return v;
+        } @catch (id e) {}
+    }
+    return nil;
+}
+
+// 找「App 自己的」窗口：排除我们盖的屏、排除键盘/文本特效窗口
+static UIWindow *AIHostWindow(void) {
+    NSArray *ws = AIHostWindows();
+    if (gWinIdx >= 0 && gWinIdx < (int)ws.count) {
+        UIWindow *w = ws[gWinIdx];
+        AILog(@"  [win] 指定窗口 #%d = %@", gWinIdx, NSStringFromClass([w class]));
+        return w;
+    }
+    UIWindow *best = nil, *key = nil;
+    int bestN = 0;
+    for (UIWindow *w in ws) {
+        if (w.hidden || w.alpha < 0.01) continue;
+        int n = AICountNodes(w, 0, 14, 600);
+        if (w.isKeyWindow) key = w;
+        if (n > bestN) { bestN = n; best = w; }
+    }
+    // keyWindow 只要不是空壳（≥8 个节点）就尊重它，否则退回「内容最多」的那个
+    if (key) {
+        int kn = AICountNodes(key, 0, 14, 600);
+        if (kn >= 8) return key;
+        AILog(@"  ⚠️ keyWindow %@ 只有 %d 个节点（空壳），改用内容最多的窗口(%d)",
+              NSStringFromClass([key class]), kn, bestN);
+    }
+    return best ?: key ?: gOverlayWindow;
+}
+
+// ---------------------------------------------------------------------------
+// 7d-x. v23：gtap —— 手势直达，专治「自绘控件点不动」
+//
+//   ★ 踩坑（快手）：侧边栏每个格子命中 TK_VIEW_TKView，父链 12 层里
+//     【既没有 UIControl，也不是 UITableViewCell / UICollectionViewCell】。
+//     于是 tapui（sendActionsForControlEvents）哑火、pick（走 delegate）也哑火，
+//     界面纹丝不动。这种自绘控件的点击，实际是靠挂在 view 上的
+//     UITapGestureRecognizer 完成的 —— 那就直接把它的 target-action 拿出来调。
+//
+//   三板斧，依次降级：
+//     1) runtime 读 UIGestureRecognizer 的私有 _targets，取 target/action 直接 perform
+//     2) KVC 强写 state = Recognized，让 UIKit 自己发 action
+//     3) 都没有就退回正规合成触摸（UIApplication sendEvent）
+// ---------------------------------------------------------------------------
+
+// 把某个 view（含父链若干层）上的手势罗列出来，诊断用
+static NSString *AIChainOf(UIView *v) {
+    NSMutableString *s = [NSMutableString string];
+    UIView *p = v; int up = 0;
+    while (p && up < 16) {
+        CGRect f = [p convertRect:p.bounds toView:nil];
+        NSMutableString *gs = [NSMutableString string];
+        @try {
+            for (UIGestureRecognizer *gr in p.gestureRecognizers) {
+                [gs appendFormat:@"%@%@", gs.length ? @"," : @"",
+                 NSStringFromClass([gr class])];
+            }
+        } @catch (id e) {}
+        [s appendFormat:@"%2d %@ 框(%.0f,%.0f,%.0f,%.0f)%@\n",
+         up, NSStringFromClass([p class]), f.origin.x, f.origin.y, f.size.width, f.size.height,
+         gs.length ? [@" 手势:" stringByAppendingString:gs] : @""];
+        p = p.superview; up++;
+    }
+    return s;
+}
+
+// 从手势里抠出 target/action 并触发。返回 YES 表示确实发了 action。
+static BOOL AIFireGesture(UIGestureRecognizer *gr) {
+    if (!gr || !gr.enabled) return NO;
+    // 1) 私有 _targets：数组里每个元素是 UIGestureRecognizerTarget，含 _target / _action
+    @try {
+        Ivar iv = class_getInstanceVariable([gr class], "_targets");
+        if (iv) {
+            id arr = object_getIvar(gr, iv);
+            if ([arr isKindOfClass:[NSArray class]]) {
+                BOOL fired = NO;
+                for (id t in (NSArray *)arr) {
+                    id tgt = nil; SEL act = NULL;
+                    Ivar ti = class_getInstanceVariable([t class], "_target");
+                    Ivar ai = class_getInstanceVariable([t class], "_action");
+                    if (ti) tgt = object_getIvar(t, ti);
+                    if (ai) {
+                        // SEL 不是对象，不能用 object_getIvar（ARC 下会炸），直接按偏移取
+                        char *base = (char *)(__bridge void *)t;
+                        act = *(SEL *)(base + ivar_getOffset(ai));
+                    }
+                    if (tgt && act && [tgt respondsToSelector:act]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                        [tgt performSelector:act withObject:gr];
+#pragma clang diagnostic pop
+                        fired = YES;
+                        AILog(@"    手势 action 已触发: %@ -> %@",
+                              NSStringFromClass([tgt class]), NSStringFromSelector(act));
+                    }
+                }
+                if (fired) return YES;
+            }
+        }
+    } @catch (id e) {}
+
+    // 2) KVC 强写 state，让 UIKit 自己发 action
+    @try {
+        [gr setValue:@(UIGestureRecognizerStateRecognized) forKey:@"state"];
+        AILog(@"    手势 state 已置 Recognized（KVC 兜底）");
+        return YES;
+    } @catch (id e) {}
+    return NO;
+}
+
+// 在指定屏幕坐标上，沿父链找到第一个可点的手势并触发
+static NSDictionary *AIGestureTapAt(CGPoint pt) {
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    UIView *hit = AIHitAtPoint(pt);
+    if (!hit) { d[@"ok"] = @NO; d[@"err"] = @"该坐标没命中任何 view"; return d; }
+    d[@"hit"] = NSStringFromClass([hit class]);
+
+    // 先给一次 UIControl 的机会（最正统）
+    UIControl *c = nil; UIView *p = hit; int up = 0;
+    while (p && up < 12) {
+        if ([p isKindOfClass:[UIControl class]]) { c = (UIControl *)p; break; }
+        p = p.superview; up++;
+    }
+    if (c) {
+        int a0 = gActionHits;
+        @try { [c sendActionsForControlEvents:UIControlEventTouchUpInside]; } @catch (id e) {}
+        d[@"how"] = @"UIControl"; d[@"ctrl"] = NSStringFromClass([c class]);
+        d[@"ok"] = @(gActionHits - a0 > 0);
+        return d;
+    }
+
+    // 再找手势：命中 view 自己 → 父链 16 层
+    p = hit; up = 0;
+    while (p && up < 16) {
+        @try {
+            for (UIGestureRecognizer *gr in p.gestureRecognizers) {
+                if (![gr isKindOfClass:[UITapGestureRecognizer class]] &&
+                    ![gr isKindOfClass:[UILongPressGestureRecognizer class]]) continue;
+                if (AIFireGesture(gr)) {
+                    d[@"ok"] = @YES;
+                    d[@"how"] = @"gesture";
+                    d[@"gr"] = NSStringFromClass([gr class]);
+                    d[@"up"] = @(up);
+                    d[@"on"] = NSStringFromClass([p class]);
+                    return d;
+                }
+            }
+        } @catch (id e) {}
+        p = p.superview; up++;
+    }
+
+    // 都没有：退回正规合成触摸（UIKit 自己走 hitTest + 手势识别）
+    BOOL via = NO;
+    @try { via = AIDispatchFakeViaSendEvent(pt, 2, 0.03); } @catch (id e) {}
+    d[@"ok"] = @(via); d[@"how"] = via ? @"sendEvent" : @"none";
+    d[@"err"] = via ? nil : @"这条父链上既无 UIControl 也无手势，合成触摸也没确认";
+    return d;
 }
 
 // ---------------------------------------------------------------------------
@@ -869,6 +1083,7 @@ static UIWindow *AIHostWindow(void) {
 // 递归收集 view 里的可见文本（标签/输入框），用来判断这一行是不是我要找的
 static void AICollectTexts(UIView *v, NSMutableArray *a, int depth, int maxDepth) {
     if (!v || depth > maxDepth || !v.window) return;
+    if (!AIBudgetTake()) return;            // v23：同上
     @try {
         NSString *t = nil;
         if ([v isKindOfClass:[UILabel class]])          t = ((UILabel *)v).text;
@@ -883,6 +1098,86 @@ static NSString *AITextsOf(UIView *v) {
     NSMutableArray *a = [NSMutableArray array];
     AICollectTexts(v, a, 0, 6);
     return [a componentsJoinedByString:@" | "];
+}
+
+// v22：快手侧边栏/首页大量用 UICollectionView（TKListView 底层就是它），
+//      cell 里既没有 UIControl 也不是 UITableViewCell —— 旧 pick 统统点不动。
+static void AIFindCVRec(UIView *v, NSMutableArray *out, int depth) {
+    if (!v || depth > 12) return;
+    @try {
+        if ([v isKindOfClass:[UICollectionView class]] && ![out containsObject:v]) [out addObject:v];
+        for (UIView *s in v.subviews) AIFindCVRec(s, out, depth + 1);
+    } @catch (id e) {}
+}
+static NSArray *AIVisibleCollectionViews(void) {
+    NSMutableArray *out = [NSMutableArray array];
+    for (UIWindow *w in AIAllWindows()) {
+        if (w == gOverlayWindow || w == gHudWindow) continue;
+        AIFindCVRec(w, out, 0);
+    }
+    return out;
+}
+static UICollectionView *AICollectionViewOfCell(UICollectionViewCell *cell) {
+    UIView *p = cell.superview; int up = 0;
+    while (p && up < 15) {
+        if ([p isKindOfClass:[UICollectionView class]]) return (UICollectionView *)p;
+        p = p.superview; up++;
+    }
+    for (UICollectionView *cv in AIVisibleCollectionViews())
+        if ([[cv visibleCells] containsObject:cell]) return cv;
+    return nil;
+}
+static NSDictionary *AIPickCellInCollection(UICollectionViewCell *cell, NSMutableDictionary *d) {
+    d[@"cell"]      = NSStringFromClass([cell class]);
+    d[@"cellFrame"] = NSStringFromCGRect([cell convertRect:cell.bounds toView:nil]);
+    d[@"cellText"]  = AITextsOf(cell);
+
+    UICollectionView *cv = AICollectionViewOfCell(cell);
+    if (!cv) { d[@"ok"] = @NO; d[@"err"] = @"找不到 cell 所属的 UICollectionView"; return d; }
+    d[@"cv"] = NSStringFromClass([cv class]);
+
+    NSIndexPath *ip = nil;
+    @try { ip = [cv indexPathForCell:cell]; } @catch (id e) {}
+    if (!ip) {
+        @try {
+            CGPoint c = cell.center;
+            CGPoint inCv = [cv convertPoint:c fromView:cell.superview];
+            ip = [cv indexPathForItemAtPoint:inCv];
+        } @catch (id e) {}
+    }
+    if (!ip) { d[@"ok"] = @NO; d[@"err"] = @"indexPathForCell 返回 nil"; return d; }
+    d[@"section"] = @(ip.section); d[@"item"] = @(ip.item);
+
+    id dlg = nil;
+    @try { dlg = cv.delegate; } @catch (id e) {}
+    d[@"delegate"] = dlg ? NSStringFromClass([dlg class]) : @"(nil)";
+
+    SEL sel = @selector(collectionView:didSelectItemAtIndexPath:);
+    BOOL called = NO;
+    if (dlg && [dlg respondsToSelector:sel]) {
+        @try {
+            NSMethodSignature *sig = [dlg methodSignatureForSelector:sel];
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            inv.selector = sel;
+            __unsafe_unretained UICollectionView *cvArg = cv;
+            __unsafe_unretained NSIndexPath *ipArg = ip;
+            [inv setArgument:&cvArg atIndex:2];
+            [inv setArgument:&ipArg atIndex:3];
+            [inv invokeWithTarget:dlg];
+            called = YES;
+            d[@"how"] = @"delegate collectionView:didSelectItemAtIndexPath:";
+        } @catch (NSException *e) { d[@"invokeErr"] = e.reason ?: @"?"; }
+    }
+    if (!called) {
+        @try {
+            [cv selectItemAtIndexPath:ip animated:NO scrollPosition:UICollectionViewScrollPositionNone];
+            called = YES;
+            d[@"how"] = @"selectItemAtIndexPath 兜底（无 delegate）";
+        } @catch (id e) {}
+    }
+    if (!d[@"how"]) d[@"how"] = @"两种都没调到";
+    d[@"ok"] = @(called);
+    return d;
 }
 
 static void AIFindTVRec(UIView *v, NSMutableArray *out, int depth) {
@@ -993,6 +1288,14 @@ static NSDictionary *AIPickAt(CGPoint pt) {
         if ([p isKindOfClass:[UITableViewCell class]]) { cell = (UITableViewCell *)p; break; }
         p = p.superview; up++;
     }
+    // v22：UICollectionViewCell（快手侧边栏/网格页全靠这条）
+    UICollectionViewCell *ccell = nil; p = v; up = 0;
+    while (p && up < 12) {
+        if ([p isKindOfClass:[UICollectionViewCell class]]) { ccell = (UICollectionViewCell *)p; break; }
+        p = p.superview; up++;
+    }
+    if (ccell) return AIPickCellInCollection(ccell, d);
+
     if (!cell) { d[@"ok"] = @NO; d[@"err"] = @"这条父链上既无 UIControl 也无 Cell"; return d; }
     return AIPickCellIn(cell, d);
 }
@@ -1023,6 +1326,30 @@ static NSString *AIRowsInfo(void) {
                               NSStringFromCGRect(f), AITextsOf(c)]];
         }
     }
+    // v22：UICollectionView 的可见 cell 也列出来（快手侧边栏 TKListView 靠这个读到文字）
+    for (UICollectionView *cv in AIVisibleCollectionViews()) {
+        NSArray *cells = nil;
+        @try { cells = [cv visibleCells]; } @catch (id e) {}
+        if (!cells.count) continue;
+        cells = [cells sortedArrayUsingComparator:^NSComparisonResult(UIView *a, UIView *b) {
+            CGFloat ya = CGRectGetMinY([a convertRect:a.bounds toView:nil]);
+            CGFloat yb = CGRectGetMinY([b convertRect:b.bounds toView:nil]);
+            if (ya < yb) return NSOrderedAscending;
+            if (ya > yb) return NSOrderedDescending;
+            return NSOrderedSame;
+        }];
+        [lines addObject:[NSString stringWithFormat:@"=== %@ [collection] (%lu 项可见) ===",
+                          NSStringFromClass([cv class]), (unsigned long)cells.count]];
+        for (UICollectionViewCell *c in cells) {
+            CGRect f = [c convertRect:c.bounds toView:nil];
+            NSIndexPath *ip = nil;
+            @try { ip = [cv indexPathForCell:c]; } @catch (id e) {}
+            [lines addObject:[NSString stringWithFormat:@"s%ld-i%ld 中心(%.0f,%.0f) 框%@ 文本:%@",
+                              (long)(ip ? ip.section : -1), (long)(ip ? ip.item : -1),
+                              CGRectGetMidX(f), CGRectGetMidY(f),
+                              NSStringFromCGRect(f), AITextsOf(c)]];
+        }
+    }
     return lines.count ? [lines componentsJoinedByString:@"\n"] : @"(屏幕上没有可见表格行)";
 }
 
@@ -1037,13 +1364,25 @@ static NSDictionary *AIPickByText(NSString *kw) {
             }
         }
     }
+    // v22：collection view 的 item 也参与文本匹配（快手侧边栏）
+    for (UICollectionView *cv in AIVisibleCollectionViews()) {
+        for (UICollectionViewCell *c in [cv visibleCells]) {
+            NSString *t = AITextsOf(c);
+            if (t && [t rangeOfString:kw options:NSCaseInsensitiveSearch].location != NSNotFound)
+                [cands addObject:c];
+        }
+    }
     if (!cands.count) return @{@"ok": @NO, @"err": [@"没找到含文本的行: " stringByAppendingString:kw], @"cands": @0};
-    UITableViewCell *best = nil; CGFloat by = 1e9;
-    for (UITableViewCell *c in cands) {
+    UIView *best = nil; CGFloat by = 1e9;
+    for (UIView *c in cands) {
         CGFloat y = CGRectGetMinY([c convertRect:c.bounds toView:nil]);
         if (y < by) { by = y; best = c; }
     }
-    NSMutableDictionary *d = [AIPickCellIn(best, [NSMutableDictionary dictionary]) mutableCopy];
+    NSMutableDictionary *d;
+    if ([best isKindOfClass:[UICollectionViewCell class]])
+        d = [AIPickCellInCollection((UICollectionViewCell *)best, [NSMutableDictionary dictionary]) mutableCopy];
+    else
+        d = [AIPickCellIn((UITableViewCell *)best, [NSMutableDictionary dictionary]) mutableCopy];
     d[@"cands"] = @(cands.count);
     return d;
 }
@@ -1974,6 +2313,206 @@ static NSString *AITreeOf(UIView *v, int depth, int maxDepth) {
     return m;
 }
 
+// v19：递归收集界面上所有「带文字」的控件，附带窗口坐标。
+// 微信的 UITableView 能用 rows 读行文本，但快手这类自研列表（TKListView）不行，
+// tree 也只打类名不给文本 —— 没有文本就无法在陌生 App 里导航。这个命令补上缺口。
+// v20：从一个 view 上尽量榨出「它显示的文字」。
+//
+//   ★ 踩坑（快手）：快手侧边栏的文字在 `_TKLabel` 里，它是自绘控件、
+//     不继承 UILabel，所以 v19 只认 UILabel/UIButton 的写法一条都读不到
+//     （text 命令返回空字符串）。跨 App 想普适，必须三路兜底：
+//       1) 标准控件（UILabel/UIButton/UITextField/UITextView）
+//       2) 任何「碰巧有 text / attributedText 方法」的自绘控件（performSelector 试探）
+//       3) 无障碍标签（accessibilityLabel/Value）—— 最通用的兜底
+static NSString *AITextOfView(UIView *v);            // v21：AIDumpOf 在它定义之前要调用
+
+// ---------------------------------------------------------------------------
+// v23：性能阀门 —— v22 的一条 rows 命令把快手主线程卡死 5 分钟（心跳断了 369 秒）。
+//
+//   根因：AIRuntimeTextOf 对【每一个 view】都跑一遍 class_copyPropertyList，
+//   还要沿 6 层父类各跑一次，每次最多 80 个属性各做 respondsToSelector。
+//   快手单页视图上千个 → 上百万次 objc 调用 + 海量 malloc/free，全部压在主线程。
+//
+//   两级修复：
+//     1) 属性名按 Class 缓存（同一个类只枚举一次，父类链一并合并进缓存）
+//     2) 单次命令设总工作量预算，超了立刻收手 —— 宁可少报几条，绝不卡死
+// ---------------------------------------------------------------------------
+static NSMutableDictionary *gPropCache = nil;   // "类名" -> NSArray<NSString*> 候选属性名
+static int  gTextBudget = 0;                    // 本次命令还能处理多少个 view
+static void AIBudgetReset(int n) { gTextBudget = n; }
+static BOOL AIBudgetTake(void) {
+    if (gTextBudget <= 0) return NO;
+    gTextBudget--;
+    return YES;
+}
+
+// 某个类（含父类链 5 层）里「名字像文字」的属性名，只枚举一次并缓存
+static NSArray *AITextPropNames(Class cls) {
+    if (!cls) return @[];
+    if (!gPropCache) gPropCache = [NSMutableDictionary dictionary];
+    NSString *key = [NSString stringWithFormat:@"%s", class_getName(cls)];
+    NSArray *cached = gPropCache[key];
+    if (cached) return cached;
+
+    NSMutableArray *m = [NSMutableArray array];
+    Class c = cls; int lv = 0;
+    while (c && lv++ < 5) {
+        unsigned n = 0;
+        objc_property_t *ps = class_copyPropertyList(c, &n);
+        for (unsigned i = 0; i < n && i < 60; i++) {
+            const char *pn = property_getName(ps[i]);
+            if (!pn) continue;
+            NSString *name = [[NSString alloc] initWithUTF8String:pn];
+            NSString *ln = [name lowercaseString];
+            if (!([ln containsString:@"text"] || [ln containsString:@"title"] ||
+                  [ln containsString:@"content"] || [ln containsString:@"string"] ||
+                  [ln containsString:@"label"] || [ln containsString:@"word"] ||
+                  [ln containsString:@"desc"])) continue;
+            if (![m containsObject:name]) [m addObject:name];
+        }
+        if (ps) free(ps);
+        c = class_getSuperclass(c);
+    }
+    gPropCache[key] = m;
+    return m;
+}
+
+// v21：自绘控件（快手 _TKLabel）既不继承 UILabel，也没有 accessibilityLabel，
+//      文字藏在自定义属性里。用 runtime 枚举类的属性名，挑名字像「文字」的
+//      逐个 performSelector 试探 —— 拿不到就 nil，绝不硬猜。
+// v23：属性名单改为按类缓存，不再每个实例重复枚举（这是卡死的元凶）。
+static NSString *AIRuntimeTextOf(id v) {
+    if (!v) return nil;
+    for (NSString *name in AITextPropNames([v class])) {
+        SEL g = NSSelectorFromString(name);
+        if (!g || ![v respondsToSelector:g]) continue;
+        @try {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            id r = [v performSelector:g];
+#pragma clang diagnostic pop
+            if ([r isKindOfClass:[NSString class]] && [(NSString *)r length] > 0 &&
+                [(NSString *)r length] < 300) return (NSString *)r;
+            if ([r isKindOfClass:[NSAttributedString class]] && [(NSAttributedString *)r length])
+                return [(NSAttributedString *)r string];
+        } @catch (id e) {}
+    }
+    return nil;
+}
+
+// v21：dump 一个对象里「所有可能是文字的东西」——查案用，不参与正常流程
+static NSString *AIPropsOf(id v) {
+    if (!v) return @"";
+    NSMutableArray *parts = [NSMutableArray array];
+    Class cls = [v class];
+    int lv = 0;
+    while (cls && lv++ < 4) {
+        unsigned n = 0;
+        objc_property_t *ps = class_copyPropertyList(cls, &n);
+        for (unsigned i = 0; i < n && i < 80; i++) {
+            const char *pn = property_getName(ps[i]);
+            if (!pn) continue;
+            NSString *name = [[NSString alloc] initWithUTF8String:pn];
+            SEL g = NSSelectorFromString(name);
+            if (!g || ![v respondsToSelector:g]) continue;
+            @try {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                id r = [v performSelector:g];
+#pragma clang diagnostic pop
+                NSString *s = nil;
+                if ([r isKindOfClass:[NSString class]]) s = r;
+                else if ([r isKindOfClass:[NSAttributedString class]]) s = [(NSAttributedString *)r string];
+                else if ([r isKindOfClass:[NSNumber class]]) s = [(NSNumber *)r stringValue];
+                if (!s) continue;
+                if (s.length > 40) s = [[s substringToIndex:40] stringByAppendingString:@"…"];
+                [parts addObject:[NSString stringWithFormat:@"%@=%@", name, s]];
+            } @catch (id e) {}
+        }
+        if (ps) free(ps);
+        cls = class_getSuperclass(cls);
+    }
+    return [parts componentsJoinedByString:@", "];
+}
+
+static NSString *AIDumpOf(UIView *v, int depth, int maxDepth) {
+    NSMutableString *m = [NSMutableString string];
+    CGRect ab = CGRectZero;
+    @try { ab = [v convertRect:v.bounds toView:nil]; } @catch (id e) {}
+    NSMutableString *ind = [NSMutableString string];
+    for (int i = 0; i < depth; i++) [ind appendString:@"  "];
+    [m appendFormat:@"%@%@ (%.0f,%.0f %.0fx%.0f)", ind, NSStringFromClass([v class]),
+     ab.origin.x, ab.origin.y, ab.size.width, ab.size.height];
+    NSString *t = AITextOfView(v);
+    if (t.length) [m appendFormat:@"  TXT=%@", t];
+    NSString *p = AIPropsOf(v);
+    if (p.length) [m appendFormat:@"\n%@  {%@}", ind, p];
+    else [m appendString:@"\n"];
+    if (depth >= maxDepth) return m;
+    for (UIView *c in v.subviews) [m appendString:AIDumpOf(c, depth + 1, maxDepth)];
+    return m;
+}
+
+static NSString *AITextOfView(UIView *v) {
+    if (!v) return nil;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    @try {
+        if ([v respondsToSelector:@selector(text)]) {
+            id r = [v performSelector:@selector(text)];
+            if ([r isKindOfClass:[NSString class]] && [(NSString *)r length]) return (NSString *)r;
+            if ([r isKindOfClass:[NSAttributedString class]] && [(NSAttributedString *)r length])
+                return [(NSAttributedString *)r string];
+        }
+        if ([v respondsToSelector:@selector(attributedText)]) {
+            id r = [v performSelector:@selector(attributedText)];
+            if ([r isKindOfClass:[NSAttributedString class]] && [(NSAttributedString *)r length])
+                return [(NSAttributedString *)r string];
+        }
+        if ([v respondsToSelector:@selector(currentTitle)]) {
+            id r = [v performSelector:@selector(currentTitle)];
+            if ([r isKindOfClass:[NSString class]] && [(NSString *)r length]) return (NSString *)r;
+        }
+        if ([v respondsToSelector:@selector(placeholder)]) {
+            id r = [v performSelector:@selector(placeholder)];
+            if ([r isKindOfClass:[NSString class]] && [(NSString *)r length])
+                return [NSString stringWithFormat:@"[%@]", r];
+        }
+    } @catch (id e) {}
+#pragma clang diagnostic pop
+    @try { NSString *a = v.accessibilityLabel; if (a.length) return a; } @catch (id e) {}
+    @try { NSString *a = v.accessibilityValue; if (a.length) return a; } @catch (id e) {}
+    @try { NSString *a = AIRuntimeTextOf(v); if (a.length) return a; } @catch (id e) {}   // v21 自绘控件兜底
+    return nil;
+}
+
+// parentTxt：父 view 已经输出过的文本。容器常把子控件的文字抄到自己的
+// accessibilityLabel 上，不去重的话快手这种深树会刷出满屏重复行。
+static NSString *AITextListD(UIView *v, int depth, int maxDepth, NSString *parentTxt) {
+    NSMutableString *m = [NSMutableString string];
+    if (!AIBudgetTake()) return m;          // v23：预算用完就收手，绝不让主线程陷进去
+    CGRect ab = CGRectZero;
+    @try { ab = [v convertRect:v.bounds toView:nil]; } @catch (id e) {}
+    NSString *txt = AITextOfView(v);
+    // 只看屏幕内的：离屏/零尺寸的控件坐标没意义，还会把结果刷爆
+    BOOL onScreen = (ab.size.width > 0 && ab.size.height > 0 &&
+                     ab.origin.y < 900 && ab.origin.y + ab.size.height > -60);
+    if (txt.length && onScreen && ![txt isEqualToString:parentTxt]) {
+        NSString *oneLine = [txt stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+        if (oneLine.length > 60) oneLine = [oneLine substringToIndex:60];
+        [m appendFormat:@"(%d) %.0f,%.0f %.0fx%.0f | %@\n",
+         depth, ab.origin.x, ab.origin.y, ab.size.width, ab.size.height, oneLine];
+    }
+    if (depth >= maxDepth) return m;
+    NSString *pass = txt.length ? txt : parentTxt;
+    for (UIView *c in v.subviews) [m appendString:AITextListD(c, depth + 1, maxDepth, pass)];
+    return m;
+}
+
+static NSString *AITextList(UIView *v, int depth, int maxDepth) {
+    return AITextListD(v, depth, maxDepth, nil);
+}
+
 static void AIServeFd(int fd) {
     NSMutableData *req = [NSMutableData data];
     char buf[4096];
@@ -2222,15 +2761,107 @@ static void AIExecCmd(NSDictionary *cmd) {
         AIReportDict(@{@"op": @"swipe", @"ok": @(ok), @"steps": @(steps)});
         AILog(@"  [cmd] swipe -> %@", ok ? @"OK" : @"FAIL");
     } else if ([op isEqualToString:@"tree"]) {
+        int wi = cmd[@"win"] ? [cmd[@"win"] intValue] : gWinIdx;
         __block NSString *tree = @"(none)";
         AIMainSync(^{
             @try {
+                int old = gWinIdx; gWinIdx = wi;
                 UIWindow *w = AIHostWindow();
-                UIView *root = w ? (w.rootViewController.view ?: w) : nil;
-                if (root) tree = AITreeOf(root, 0, 12);
+                gWinIdx = old;
+                // v23：直接从 window 自身开始，不要只走 rootViewController.view ——
+                // 侧边栏/弹层常直接挂在 window 上，走 rootVC.view 会整个漏掉。
+                if (w) tree = AITreeOf(w, 0, 12);
             } @catch (id e) {}
         });
         AIReportDict(@{@"op": @"tree", @"ok": @YES, @"tree": tree});
+    } else if ([op isEqualToString:@"wins"]) {        // v23：宿主开了哪几个窗口，各自多少节点
+        NSMutableArray *lines = [NSMutableArray array];
+        NSArray *ws = AIHostWindows();
+        for (int i = 0; i < (int)ws.count; i++) {
+            UIWindow *w = ws[i];
+            CGRect f = w.frame;
+            [lines addObject:[NSString stringWithFormat:@"#%d %@ 框(%.0f,%.0f,%.0f,%.0f) 节点%d %@%@%@",
+                              i, NSStringFromClass([w class]),
+                              f.origin.x, f.origin.y, f.size.width, f.size.height,
+                              AICountNodes(w, 0, 14, 600),
+                              w.isKeyWindow ? @"[key]" : @"",
+                              w.hidden ? @"[hidden]" : @"",
+                              (i == gWinIdx) ? @"[已锁定]" : @""]];
+        }
+        AIReportDict(@{@"op": @"wins", @"ok": @YES, @"lock": @(gWinIdx),
+                       @"text": [lines componentsJoinedByString:@"\n"]});
+    } else if ([op isEqualToString:@"win"]) {         // v23：把后续操作锁定到某个窗口
+        int wi = [cmd[@"i"] intValue];
+        gWinIdx = (wi < 0) ? -1 : wi;
+        AIReportDict(@{@"op": @"win", @"ok": @YES, @"lock": @(gWinIdx),
+                       @"txt": [NSString stringWithFormat:@"已锁定窗口 #%d", gWinIdx]});
+    } else if ([op isEqualToString:@"gtap"]) {        // v23：手势直达，专治自绘控件点不动
+        CGFloat x = [cmd[@"x"] floatValue], y = [cmd[@"y"] floatValue];
+        __block NSDictionary *r = nil;
+        AIMainSync(^{ @try { r = AIGestureTapAt(CGPointMake(x, y)); } @catch (id e) {} });
+        NSMutableDictionary *rep = [(r ?: @{@"ok": @NO, @"err": @"异常"}) mutableCopy];
+        rep[@"op"] = @"gtap"; rep[@"x"] = @(x); rep[@"y"] = @(y);
+        AIReportDict(rep);
+        AILog(@"  [cmd] gtap (%.0f,%.0f) -> %@ %@", x, y, rep[@"ok"], rep[@"how"] ?: rep[@"err"]);
+    } else if ([op isEqualToString:@"chain"]) {       // v23：某坐标的父链 + 每层挂了什么手势
+        CGFloat x = [cmd[@"x"] floatValue], y = [cmd[@"y"] floatValue];
+        __block NSString *s = @"(none)";
+        AIMainSync(^{
+            @try {
+                UIView *hit = AIHitAtPoint(CGPointMake(x, y));
+                s = hit ? AIChainOf(hit) : @"(该坐标没命中任何 view)";
+            } @catch (id e) {}
+        });
+        AIReportDict(@{@"op": @"chain", @"ok": @YES, @"x": @(x), @"y": @(y), @"text": s});
+    } else if ([op isEqualToString:@"text"]) {        // v19：读界面文本（带窗口坐标）
+        NSString *kw = cmd[@"kw"];
+        int wi = cmd[@"win"] ? [cmd[@"win"] intValue] : gWinIdx;
+        __block NSString *txt = @"(none)";
+        AIMainSync(^{
+            @try {
+                int old = gWinIdx; gWinIdx = wi;
+                UIWindow *w = AIHostWindow();
+                gWinIdx = old;
+                if (w) txt = AITextList(w, 0, 40);
+            } @catch (id e) {}
+        });
+        if (kw.length) {
+            NSMutableString *f = [NSMutableString string];
+            for (NSString *line in [txt componentsSeparatedByString:@"\n"])
+                if (line.length && [line rangeOfString:kw options:NSCaseInsensitiveSearch].location != NSNotFound)
+                    [f appendFormat:@"%@\n", line];
+            txt = f;
+        }
+        AIReportDict(@{@"op": @"text", @"ok": @YES, @"text": txt});
+    } else if ([op isEqualToString:@"dump"]) {        // v21：按坐标挖这个对象的所有属性（查自绘控件文字藏哪）
+        CGFloat x = [cmd[@"x"] floatValue], y = [cmd[@"y"] floatValue];
+        int deep = cmd[@"deep"] ? [cmd[@"deep"] intValue] : 2;
+        __block NSString *s = @"(none)";
+        AIMainSync(^{
+            @try {
+                UIView *hit = AIHitAtPoint(CGPointMake(x, y));   // v23：跨窗口命中
+                if (hit) s = AIDumpOf(hit, 0, deep);
+                else s = @"(该坐标没命中任何 view)";
+            } @catch (id e) {}
+        });
+        AIReportDict(@{@"op": @"dump", @"ok": @YES, @"x": @(x), @"y": @(y), @"text": s});
+        AILog(@"  [cmd] dump (%.0f,%.0f) deep=%d", x, y, deep);
+    } else if ([op isEqualToString:@"update"]) {      // v20：推一份新 dylib 到手机上
+        NSString *r = AIUpdateFrom(cmd[@"url"], cmd[@"ver"]);
+        AILog(@"  [cmd] update -> %@", r);
+        AIReportDict(@{@"op": @"update", @"ok": @([r hasPrefix:@"已装"]), @"txt": r});
+    } else if ([op isEqualToString:@"core"]) {        // v20：本地已缓存的 core 一览
+        NSString *dir = AICoreDir() ?: @"(无)";
+        NSString *have = AINewerCorePath();
+        NSArray *fs = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
+        AIReportDict(@{@"op": @"core", @"ok": @YES, @"ver": kAIVer, @"dir": dir,
+                       @"files": fs ?: @[], @"pending": have ?: @""});
+    } else if ([op isEqualToString:@"ball"]) {        // v20：悬浮球显隐
+        BOOL on = cmd[@"on"] ? ([cmd[@"on"] intValue] != 0) : YES;
+        AISetFlag(@"ball", on);
+        if (on) { gFloatExpanded = NO; }
+        AIFloatApply();
+        AIReportDict(@{@"op": @"ball", @"ok": @YES, @"visible": @(on)});
     } else if ([op isEqualToString:@"overlay"]) {
         id ov = cmd[@"on"];
         BOOL vis = ov ? ([ov intValue] != 0) : NO;
@@ -2609,6 +3240,8 @@ static void AIHudApply(void) {
             gHudLabel.text = AIHudText();
             gHudLabel.textColor = (gPollOK > 0) ? [UIColor greenColor]
                                 : ((gPollErr > 0) ? [UIColor redColor] : [UIColor yellowColor]);
+            // v20：顺手把悬浮球上的心跳数字也刷一下（内部有 1.5s 节流）
+            @try { AIFloatApply(); } @catch (id e) {}
         } @catch (NSException *e) {}
     });
 }
@@ -2914,9 +3547,12 @@ static void AIBoot(void) {
     gBooted = YES;
     AILog(@"########## AgentInject2 boot ##########");
     AILog(@"boot 触发来源: %@", gBootSrc);
-    // 一进来就先盖一层「已加载」，让你立刻能确认 dylib 到底跑没跑；
-    // 自检跑完再刷新成完整报告（带复制按钮）。
-    AIShowOverlayText(@"AgentInject2 已加载 ✓\n正在自检，请稍候…", NO, nil);
+    // v20：默认不再糊一层全屏盖屏（用户吐槽太碍事），只挂一个可拖动的小悬浮球。
+    // 想要全屏诊断报告的，在悬浮球面板里把「诊断盖屏」打开。
+    @try { AIFloatApply(); } @catch (NSException *e) { AILog(@"float 异常 %@", e); }
+    if (AIFlag(@"sw1", NO)) AIShowOverlayText(@"AgentInject2 已加载 ✓\n正在自检，请稍候…", NO, nil);
+    // 后台看看仓库里有没有比我新的版本（有就先下下来，下次重开 App 生效）
+    if (AIFlag(@"autoupd", YES)) { @try { AICheckUpdateAsync(); } @catch (NSException *e) {} }
 
     @try { AIEnv(); }          @catch (NSException *e) { AILog(@"env 异常 %@", e); }
     // ★ 网络尽早起来：放在耗时的 HID 矩阵测试之前。
@@ -2955,7 +3591,8 @@ static void AIBoot(void) {
                   gBestTap, gBestShot, gMonHits, gSendEventHits, gTargetHits, gActionHits);
             if (gSrvPort) AILog(@"########## 控制: http://%@:%d/status ##########", gSrvIp ?: @"?", gSrvPort);
             @try { AIWriteReport(); } @catch (NSException *e) {}
-            @try { AIShowOverlay(); } @catch (NSException *e) {}
+            @try { AIFloatApply(); }  @catch (NSException *e) {}
+            if (AIFlag(@"sw1", NO)) { @try { AIShowOverlay(); } @catch (NSException *e) {} }
         });
     });
 }
@@ -2973,6 +3610,306 @@ static void AINotifyCb(CFNotificationCenterRef c, void *o, CFStringRef n,
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 14b. v20：内置更新（OTA）—— 注入一次，以后我推新版你只要重开 App
+//
+//   背景：用户受够了「每改一版就要 TrollFools 重新注入一遍」。
+//
+//   机制（两阶段，进程内不卸载旧 dylib）：
+//     ① 注入进去的这份 dylib 自己就是一个「引导器」：启动时去沙盒
+//        Documents/agentcore/ 里翻一翻，如果有【版本比自己新】的
+//        AgentInject2-vNN.dylib，就 dlopen 它、调它的 AgentCoreStart，
+//        然后自己直接退场（不装 hook、不起网络线程）。
+//     ② 新 dylib 从哪来？两条路：
+//        - 我主动下发 {"op":"update","ver":"21","url":"..."} 让它下载；
+//        - 它自己每次启动顺手问一句仓库里的 version.json，有新版就下载，
+//          下一次冷启动自动接管。
+//    因为不卸载旧副本，同一进程里「热切换」会让两份代码同时跑（两个心跳），
+//    所以这里刻意选择【下载后下次启动生效】—— 换来的好处是零风险：
+//    下载完先 dlopen 校验一遍，加载不了就丢弃，绝不会把 App 搞崩。
+// ---------------------------------------------------------------------------
+static NSString *AICoreDir(void) {
+    NSArray *ps = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    if (!ps.count) return nil;
+    NSString *d = [ps.firstObject stringByAppendingPathComponent:@"agentcore"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:d
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    return d;
+}
+
+// "v20" / "AgentInject2-v21.dylib" -> 20 / 21
+static int AIVerNum(NSString *s) {
+    int n = 0; BOOL dig = NO;
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if (c >= '0' && c <= '9') { dig = YES; n = n * 10 + (int)(c - '0'); }
+        else if (dig) break;
+    }
+    return n;
+}
+
+// 本地缓存里有没有比我新的 core？有就返回它的路径
+static NSString *AINewerCorePath(void) {
+    NSString *dir = AICoreDir();
+    if (!dir) return nil;
+    int my = AIVerNum(kAIVer);
+    NSArray *fs = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
+    int best = my; NSString *bp = nil;
+    for (NSString *f in fs) {
+        if (![f hasPrefix:@"AgentInject2-v"] || ![f hasSuffix:@".dylib"]) continue;
+        int n = AIVerNum(f);
+        if (n > best) { best = n; bp = [dir stringByAppendingPathComponent:f]; }
+    }
+    return bp;
+}
+
+// 把活交给本地更新的那份 core，自己不再初始化
+static BOOL AIHandoffToNewer(void) {
+    static BOOL done = NO;
+    if (done) return YES;                       // +load 和 constructor 会各调一次
+    NSString *p = AINewerCorePath();
+    if (!p) return NO;
+    void *h = dlopen([p fileSystemRepresentation], RTLD_NOW);
+    if (!h) { AILog(@"  ⚠️ 新版 %@ 加载失败: %s", p.lastPathComponent, dlerror() ?: ""); return NO; }
+    void (*start)(void) = dlsym(h, "AgentCoreStart");
+    if (!start) { AILog(@"  ⚠️ 新版 %@ 里没有 AgentCoreStart", p.lastPathComponent); return NO; }
+    done = YES;
+    AILog(@"★ 内置更新：本机 v%@ -> %@，本副本退场", kAIVer, p.lastPathComponent);
+    @try { start(); } @catch (NSException *e) { AILog(@"  新版启动异常 %@", e); }
+    return YES;
+}
+
+// 被引导器 dlopen 进来时的入口（必须是 default visibility，否则 dlsym 找不到）
+__attribute__((visibility("default")))
+void AgentCoreStart(void) { AIInstall(); }
+
+// 下载一份新 core：先存临时文件 → dlopen 校验能不能加载 → 通过才转正
+static NSString *AIUpdateFrom(NSString *urlStr, NSString *ver) {
+    if (!urlStr.length || !ver.length) return @"缺少 url / ver";
+    NSData *d = nil; NSInteger code = 0;
+    BOOL ok = AIHttpEx(urlStr, nil, 40.0, YES, nil, &d, nil, &code, nil);
+    if (!ok || !d.length) return [NSString stringWithFormat:@"下载失败 (code=%d, %luB)",
+                                  (int)code, (unsigned long)d.length];
+    if (code >= 400) return [NSString stringWithFormat:@"HTTP %d", (int)code];
+    if (d.length < 20000) return [NSString stringWithFormat:@"文件太小(%luB)，不像 dylib", (unsigned long)d.length];
+
+    NSString *dir = AICoreDir();
+    if (!dir) return @"拿不到 Documents 目录";
+    NSString *tmp = [dir stringByAppendingPathComponent:
+                     [NSString stringWithFormat:@"tmp-%d.dylib",
+                      (int)[[NSDate date] timeIntervalSince1970]]];
+    [d writeToFile:tmp atomically:YES];
+    void *h = dlopen([tmp fileSystemRepresentation], RTLD_NOW);   // ★ 先验证能加载
+    if (!h) {
+        NSString *err = [NSString stringWithUTF8String:dlerror() ?: "?"];
+        [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
+        return [@"校验失败(未生效): " stringByAppendingString:err];
+    }
+    dlclose(h);
+    NSString *dst = [dir stringByAppendingPathComponent:
+                     [NSString stringWithFormat:@"AgentInject2-v%@.dylib", ver]];
+    [[NSFileManager defaultManager] removeItemAtPath:dst error:nil];
+    NSError *e = nil;
+    [[NSFileManager defaultManager] moveItemAtPath:tmp toPath:dst error:&e];
+    if (e) return [@"落盘失败: " stringByAppendingString:e.localizedDescription];
+    return [NSString stringWithFormat:@"已装 v%@ (%luB)，重开 App 生效", ver, (unsigned long)d.length];
+}
+
+// 启动时顺手看看仓库里有没有新版（后台，失败就算了，下次启动还会再试）
+#define AI_MANIFEST @"https://raw.githubusercontent.com/857386461/poc-agent/master/version.json"
+static void AICheckUpdateAsync(void) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+        @autoreleasepool {
+            NSData *d = nil; NSInteger code = 0;
+            BOOL ok = AIHttpEx(AI_MANIFEST, nil, 20.0, YES, nil, &d, nil, &code, nil);
+            if (!ok || !d.length || code >= 400) return;
+            id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+            if (![j isKindOfClass:[NSDictionary class]]) return;
+            NSString *ver = [j objectForKey:@"ver"];
+            NSString *url = [j objectForKey:@"url"];
+            if (!ver.length || !url.length) return;
+            int nv = AIVerNum([NSString stringWithFormat:@"v%@", ver]);
+            if (nv <= AIVerNum(kAIVer)) return;                    // 不比我新
+            NSString *have = AINewerCorePath();
+            if (have && AIVerNum(have) >= nv) return;              // 已经下过了
+            NSString *r = AIUpdateFrom(url, [NSString stringWithFormat:@"%d", nv]);
+            AILog(@"  自动更新: %@", r);
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 14c. v20：悬浮球 —— 用户吐槽「盖屏太碍事」，默认只留一个小圆点
+//
+//   小圆点可拖动，点一下展开面板：版本/心跳一览 + 几个开关。
+//   开关状态存 NSUserDefaults，重开 App 也记得住。
+// ---------------------------------------------------------------------------
+@interface AIFloatTarget : NSObject
+@end
+@implementation AIFloatTarget
+- (void)ballTapped:(id)sender {
+    gFloatExpanded = !gFloatExpanded;
+    gFloatForce = YES;                  // 点了就要立刻响应，别被节流挡住
+    AIFloatApply();
+}
+- (void)ballDragged:(UIPanGestureRecognizer *)g {
+    if (!gFloatWindow) return;
+    CGPoint t = [g translationInView:gFloatWindow];
+    [g setTranslation:CGPointZero inView:gFloatWindow];
+    UIView *ball = [gFloatWindow viewWithTag:701];
+    if (!ball) return;
+    CGSize sc = [UIScreen mainScreen].bounds.size;
+    CGFloat x = MIN(MAX(ball.center.x + t.x, 30), sc.width  - 30);
+    CGFloat y = MIN(MAX(ball.center.y + t.y, 90), sc.height - 90);
+    ball.center = CGPointMake(x, y);
+    if (g.state == UIGestureRecognizerStateEnded) {
+        AISetFlag(@"fx", (x - 30) / MAX(1, sc.width  - 60));
+        AISetFlag(@"fy", (y - 90) / MAX(1, sc.height - 180));
+        // 位置存成 0~1 的比例，换机型/转屏也不会跑到屏幕外
+        [[NSUserDefaults standardUserDefaults] setFloat:(float)((x - 30) / MAX(1, sc.width  - 60)) forKey:AIK(@"fpx")];
+        [[NSUserDefaults standardUserDefaults] setFloat:(float)((y - 90) / MAX(1, sc.height - 180)) forKey:AIK(@"fpy")];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+    }
+}
+- (void)sw:(UISwitch *)s {
+    NSString *k = [NSString stringWithFormat:@"sw%d", (int)s.tag];
+    BOOL on = s.isOn;
+    AISetFlag(k, on);
+    if (s.tag == 0) { AISetHudVisible(on); AILog(@"  状态条: %@", on ? @"开" : @"关"); }
+    if (s.tag == 1) { AISetOverlayVisible(on); AILog(@"  诊断盖屏: %@", on ? @"开" : @"关"); }
+    if (s.tag == 3) { AISetFlag(@"autoupd", on); AILog(@"  自动更新: %@", on ? @"开" : @"关"); }
+    gFloatForce = YES;
+    AIFloatApply();
+}
+- (void)collapse:(id)sender { gFloatExpanded = NO; gFloatForce = YES; AIFloatApply(); }
+- (void)hideBall:(id)sender {
+    AISetFlag(@"ball", NO);
+    gFloatForce = YES;
+    AIFloatApply();
+    AIToast(@"悬浮球已隐藏（发 ball=1 找回）");
+}
+@end
+static AIFloatTarget *gFT = nil;
+
+static void AIFloatApply(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ AIFloatApply(); });
+        return;
+    }
+    // 心跳每秒都在调，别把 UI 重绘也拖成每秒一次
+    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (!gFloatForce && now - gFloatLast < 1.5) return;
+    gFloatLast = now; gFloatForce = NO;
+    @try {
+        UIApplication *app = [UIApplication sharedApplication];
+        if (!app) return;
+        if (!gFT) gFT = [AIFloatTarget new];
+        CGSize sc = [UIScreen mainScreen].bounds.size;
+
+        if (!gFloatWindow) {
+            UIWindowScene *scn = AIFirstWindowScene();
+            if (scn) gFloatWindow = [[UIWindow alloc] initWithWindowScene:scn];
+            else     gFloatWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+            gFloatWindow.windowLevel = UIWindowLevelStatusBar + 900;
+            gFloatWindow.backgroundColor = [UIColor clearColor];
+            gFloatWindow.rootViewController = [UIViewController new];
+            gFloatWindow.rootViewController.view.backgroundColor = [UIColor clearColor];
+        }
+        UIView *host = gFloatWindow.rootViewController.view;
+        for (UIView *v in host.subviews) [v removeFromSuperview];
+
+        BOOL want = AIFlag(@"ball", YES);
+        gFloatWindow.hidden = !want;
+        if (!want) return;
+
+        float px = [[NSUserDefaults standardUserDefaults] floatForKey:AIK(@"fpx")];
+        float py = [[NSUserDefaults standardUserDefaults] floatForKey:AIK(@"fpy")];
+        if (px <= 0 && py <= 0) { px = 0.86f; py = 0.42f; }        // 默认右侧中间
+        CGPoint c = CGPointMake(30 + px * (sc.width - 60), 90 + py * (sc.height - 180));
+
+        if (!gFloatExpanded) {
+            gFloatWindow.frame = CGRectMake(c.x - 30, c.y - 30, 60, 60);
+            UIView *ball = [[UIView alloc] initWithFrame:CGRectMake(2, 2, 56, 56)];
+            ball.tag = 701;
+            ball.layer.cornerRadius = 28;
+            ball.layer.masksToBounds = YES;
+            ball.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.62];
+            UILabel *lb = [[UILabel alloc] initWithFrame:ball.bounds];
+            lb.text = [NSString stringWithFormat:@"%@\n%d", kAIVer, gCmdGot];
+            lb.numberOfLines = 2; lb.textAlignment = NSTextAlignmentCenter;
+            lb.font = [UIFont boldSystemFontOfSize:13];
+            lb.textColor = (gPollErr > 0 && gPollOK == 0) ? [UIColor systemRedColor]
+                                                          : [UIColor systemGreenColor];
+            [ball addSubview:lb];
+            [ball addGestureRecognizer:[[UITapGestureRecognizer alloc]
+                                        initWithTarget:gFT action:@selector(ballTapped:)]];
+            UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
+                                           initWithTarget:gFT action:@selector(ballDragged:)];
+            [ball addGestureRecognizer:pan];
+            [host addSubview:ball];
+        } else {
+            CGFloat w = 250, h = 300;
+            CGFloat ox = MIN(MAX(c.x - w / 2, 8), sc.width  - w - 8);
+            CGFloat oy = MIN(MAX(c.y - h / 2, 80), sc.height - h - 8);
+            gFloatWindow.frame = CGRectMake(ox, oy, w, h);
+            UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
+            panel.layer.cornerRadius = 14; panel.layer.masksToBounds = YES;
+            panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.86];
+
+            UILabel *ti = [[UILabel alloc] initWithFrame:CGRectMake(12, 8, w - 60, 22)];
+            ti.text = [NSString stringWithFormat:@"AgentInject2 %@", kAIVer];
+            ti.textColor = [UIColor whiteColor]; ti.font = [UIFont boldSystemFontOfSize:14];
+            [panel addSubview:ti];
+            UIButton *cx = [UIButton buttonWithType:UIButtonTypeSystem];
+            cx.frame = CGRectMake(w - 46, 6, 40, 26);
+            [cx setTitle:@"收起" forState:UIControlStateNormal];
+            [cx addTarget:gFT action:@selector(collapse:) forControlEvents:UIControlEventTouchUpInside];
+            [panel addSubview:cx];
+
+            UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, 32, w - 24, 34)];
+            st.numberOfLines = 2; st.font = [UIFont systemFontOfSize:11];
+            st.textColor = [UIColor lightGrayColor];
+            st.text = [NSString stringWithFormat:@"%@  心跳✅%d❌%d 指令%d\n%@",
+                       gProcName ?: @"?", gPollOK, gPollErr, gCmdGot,
+                       (gLastErrText.length ? [@"最近错误: " stringByAppendingString:gLastErrText]
+                                            : @"中继已连接")];
+            [panel addSubview:st];
+
+            NSArray *items = @[@"顶端状态条", @"诊断盖屏(全屏)", @"隐藏悬浮球", @"自动检查更新"];
+            for (int i = 0; i < (int)items.count; i++) {
+                CGFloat y = 78 + i * 40;
+                UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(12, y, 150, 30)];
+                l.text = items[i]; l.textColor = [UIColor whiteColor];
+                l.font = [UIFont systemFontOfSize:13];
+                [panel addSubview:l];
+                if (i == 2) {
+                    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+                    b.frame = CGRectMake(w - 76, y, 64, 30);
+                    [b setTitle:@"隐藏" forState:UIControlStateNormal];
+                    [b addTarget:gFT action:@selector(hideBall:) forControlEvents:UIControlEventTouchUpInside];
+                    [panel addSubview:b];
+                } else {
+                    UISwitch *s = [[UISwitch alloc] initWithFrame:CGRectMake(w - 66, y, 51, 30)];
+                    s.tag = i;
+                    s.on = AIFlag([NSString stringWithFormat:@"sw%d", i],
+                                  i == 0 ? YES : (i == 3 ? YES : NO));
+                    [s addTarget:gFT action:@selector(sw:) forControlEvents:UIControlEventValueChanged];
+                    [panel addSubview:s];
+                }
+            }
+            UILabel *ft = [[UILabel alloc] initWithFrame:CGRectMake(12, h - 40, w - 24, 32)];
+            ft.numberOfLines = 2; ft.font = [UIFont systemFontOfSize:10];
+            ft.textColor = [UIColor darkGrayColor];
+            NSString *np = AINewerCorePath();
+            ft.text = np ? [NSString stringWithFormat:@"待生效新版: %@", np.lastPathComponent]
+                         : @"已是最新（更新会自动下载）";
+            [panel addSubview:ft];
+            [host addSubview:panel];
+        }
+        gFloatWindow.hidden = NO;
+    } @catch (NSException *e) { AILog(@"悬浮球异常 %@", e); }
+}
+
 // 15. 入口：constructor + ObjC +load 双保险
 //
 //  ★ 重要发现（本机实测）：用 Xcode 26 SDK 编译出来的 dylib 里【没有】
@@ -2991,6 +3928,10 @@ static void AIInstall(void) {
     if (!gLog) { gLog = [NSMutableString new]; gLogLock = [NSLock new]; }
     if ([gBootSrc isEqualToString:@"?"]) gBootSrc = @"load/constructor";
     AILog(@"install enter pid=%d", getpid());
+
+    // v20：本地有更新的 core 就让它接管，本副本不装 hook、不起网络线程。
+    // 这样以后升级不用再 TrollFools 重新注入 —— 重开 App 即可。
+    if (AIHandoffToNewer()) return;
 
     // 落一个「已加载」标记文件，用于判断 dylib 到底有没有被 dyld 装载
     @try {
