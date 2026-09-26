@@ -65,6 +65,20 @@ otool -L /tmp/hl_extern.dylib 2>/dev/null | grep -i iokit || echo "  [结论] �
 echo "--- nm -m 看未定义符号归属 ---"
 nm -m /tmp/hl_extern.dylib 2>/dev/null | grep -i ioHIDEvent | head -6 || echo "  （nm 无输出）"
 echo "--- 结论判据：(from IOKit)=真解析；dynamic_lookup=只是被放行，运行时才找 ---"
+
+# 既然 IOKit 有导出表，§2.4 的「Create 有 11/13/14 三种社区版本」就别猜了：
+# 直接把导出符号列出来，看真机上到底存在哪几个变体。
+IOK="$SDK/System/Library/Frameworks/IOKit.framework/IOKit"
+echo "=== [2c/5] IOKit 导出表（回答 §2.4 的参数个数之争） ==="
+echo "framework 文件: $(ls -la "$IOK" 2>/dev/null | awk '{print $5" "$NF}')"
+echo "--- 所有 IOHIDEventCreate* 变体 ---"
+nm -gU "$IOK" 2>/dev/null | grep -i "IOHIDEventCreate" | head -25 || echo "  （nm 不可用）"
+echo "--- 所有 IOHIDEventSystemClient* 变体 ---"
+nm -gU "$IOK" 2>/dev/null | grep -i "EventSystemClient" | head -20 || echo "  （nm 不可用）"
+echo "--- 坐标/字段写入类 ---"
+nm -gU "$IOK" 2>/dev/null | grep -iE "IOHIDEvent(Set|Append|Get)" | head -15 || echo "  （nm 不可用）"
+echo "--- 导出符号总数 ---"
+nm -gU "$IOK" 2>/dev/null | wc -l
 } 2>&1 | tee -a "$REPORT"
 
 echo "=== [3/5] 编译 HLProbe.dylib（dlsym 路线，不链 IOKit） ==="
