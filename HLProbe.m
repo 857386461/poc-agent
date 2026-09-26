@@ -104,12 +104,13 @@ static void HLLoadHID(void) {
 
 #define HL_SET_OURS 0   // AgentInject2 真机跑通用：X=0x0B0000
 #define HL_SET_SPEC 1   // 规格书 §2.4 给的：X=0x0B0030
+#define HL_SET_BEI  2   // 老贝贝逆向报告 §4.3：X=0x0B0014 / Y=0x0B0015（三套常量之一，别照抄！）
 
-static uint32_t HLFieldX(int set)         { return set == HL_SET_OURS ? 0x0B0000u : 0x0B0030u; }
-static uint32_t HLFieldY(int set)         { return set == HL_SET_OURS ? 0x0B0001u : 0x0B0031u; }
-static uint32_t HLFieldIsDisplay(int set) { return set == HL_SET_OURS ? 0x0B0019u : 0x0B002Au; }
+static uint32_t HLFieldX(int set)         { return set==HL_SET_OURS ? 0x0B0000u : (set==HL_SET_SPEC ? 0x0B0030u : 0x0B0014u); }
+static uint32_t HLFieldY(int set)         { return set==HL_SET_OURS ? 0x0B0001u : (set==HL_SET_SPEC ? 0x0B0031u : 0x0B0015u); }
+static uint32_t HLFieldIsDisplay(int set) { return set==HL_SET_OURS ? 0x0B0019u : (set==HL_SET_SPEC ? 0x0B002Au : 0x0B0019u); }
 
-static NSString *HLSetName(int set) { return set == HL_SET_OURS ? @"OURS" : @"SPEC"; }
+static NSString *HLSetName(int set) { return set==HL_SET_OURS ? @"OURS" : (set==HL_SET_SPEC ? @"SPEC" : @"BEI"); }
 
 // mask 三候选。ph: 0=down 1=move 2=up
 static uint32_t HLMask(int mi, int ph) {
@@ -203,7 +204,7 @@ static NSString *HLReadPixel(UIImage *img, CGPoint logicPoint) {
 
 #pragma mark - D. 探针 UI
 
-#define HL_TOTAL 18
+#define HL_TOTAL 27   // 3 事件形态 × 3 字段常量集(OURS/SPEC/BEI) × 3 mask
 #define K_IDX   @"hlprobe_idx"
 #define K_TRY   @"hlprobe_trying"
 #define K_RES   @"hlprobe_results"
@@ -305,7 +306,7 @@ static NSString *HLReadPixel(UIImage *img, CGPoint logicPoint) {
 }
 
 - (void)refresh {
-    int form = self.idx % 3, set = (self.idx / 3) % 2, mi = (self.idx / 6) % 3;
+    int form = self.idx % 3, set = (self.idx / 3) % 3, mi = (self.idx / 6) % 3;
     self.head.text = [NSString stringWithFormat:
         @"HLProbe %s\n符号:%@\nclient:%@\n下一个 #%d/%d  form=%@ field=%@ mask=%@",
         __DATE__, gSymReport, self.clientName ?: @"未选",
@@ -317,7 +318,7 @@ static NSString *HLReadPixel(UIImage *img, CGPoint logicPoint) {
     NSMutableString *s = [NSMutableString string];
     for (int i = 0; i < (int)r.count; i++) {
         [s appendFormat:@"#%d(%@/%@/%@)=%@  ", i, HLFormName(i % 3),
-         HLSetName((i / 3) % 2), HLMaskName((i / 6) % 3), r[i]];
+         HLSetName((i / 3) % 3), HLMaskName((i / 6) % 3), r[i]];
     }
     self.resultList.text = r.count ? s : @"（还没试过任何组合）";
 }
@@ -343,7 +344,7 @@ static NSString *HLReadPixel(UIImage *img, CGPoint logicPoint) {
 }
 
 - (void)runCombo:(int)k {
-    int form = k % 3, set = (k / 3) % 2, mi = (k / 6) % 3;
+    int form = k % 3, set = (k / 3) % 3, mi = (k / 6) % 3;
     int before = self.synthN;
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     [ud setInteger:k + 1 forKey:K_TRY];   // 崩在这里 → 下次启动判定为 CRASH
@@ -412,6 +413,11 @@ static NSString *HLReadPixel(UIImage *img, CGPoint logicPoint) {
 
 #pragma mark - E. 注入入口
 
+// ★ 关键修复：窗口必须被全局强引用。原版用 block 内局部变量 UIWindow *w，
+//   block 跑完即被 ARC 回收 → 注入后界面「不显示」。改用 static 全局攥住，
+//   与 AgentInject2 的 gFloatWindow（static UIWindow *）同一套路。
+static UIWindow *gProbeWin = nil;
+
 __attribute__((constructor))
 static void HLProbeEntry(void) {
     HLLoadHID();
@@ -422,16 +428,20 @@ static void HLProbeEntry(void) {
             if (!gProbeClient && gClientSimple) { gProbeClient = gClientSimple(kCFAllocatorDefault, 0); }
             if (!gProbeClient && gClientType)   { gProbeClient = gClientType(kCFAllocatorDefault, 0, NULL); }
 
-            UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+            // iOS 13+ 必须用 initWithWindowScene: 关联到场景，否则窗口挂不上、不显示。
+            UIWindowScene *scn = nil;
+            if (@available(iOS 13.0, *)) {
+                scn = [UIApplication sharedApplication].keyWindow.windowScene;
+            }
+            gProbeWin = scn ? [[UIWindow alloc] initWithWindowScene:scn]
+                            : [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
             HLProbeVC *vc = [HLProbeVC new];
             vc.clientName = gProbeClient ? @"已取得" : @"❌全部失败";
-            w.rootViewController = vc;
-            w.windowLevel = UIWindowLevelAlert + 1000;
-            if (@available(iOS 13.0, *)) {
-                w.windowScene = (UIWindowScene *)[UIApplication sharedApplication].keyWindow.windowScene;
-            }
-            w.hidden = NO;
-            NSLog(@"[HLProbe] UI 已建立 client=%p sym=%@", gProbeClient, gSymReport);
+            gProbeWin.rootViewController = vc;
+            gProbeWin.windowLevel = UIWindowLevelAlert + 1000;
+            gProbeWin.backgroundColor = [UIColor clearColor];
+            gProbeWin.hidden = NO;
+            NSLog(@"[HLProbe] UI 已建立 client=%p sym=%@ win=%p", gProbeClient, gSymReport, gProbeWin);
         } @catch (NSException *e) {
             NSLog(@"[HLProbe] 建 UI 失败 %@", e);
         }
