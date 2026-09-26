@@ -7,6 +7,13 @@
 set -e
 cd "$(dirname "$0")"
 
+# 诊断结论要落到产物里：runner 的 job log 沙箱下载不到，
+# 只有变成 release asset 才读得到（老坑，见 build_inject2.yml 注释）。
+mkdir -p build_hl
+REPORT=build_hl/hl_sdk_report.txt
+: > "$REPORT"
+
+{
 echo "=== [0/5] iOS SDK 诊断（规格书 §2.2） ==="
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 echo "SDK: $SDK"
@@ -49,9 +56,10 @@ else
   echo "  [结论] -framework IOKit 链接失败："; tail -8 /tmp/hl_l.log
   echo "  → 说明 iOS 上这些符号只能 dlsym 运行时取，不能链接期依赖"
 fi
+} 2>&1 | tee -a "$REPORT"
 
 echo "=== [3/5] 编译 HLProbe.dylib（dlsym 路线，不链 IOKit） ==="
-rm -rf build_hl && mkdir -p build_hl
+rm -f build_hl/HLProbe.dylib build_hl/HLProbe.zip
 xcrun -sdk iphoneos clang \
   -arch arm64 \
   -dynamiclib \
