@@ -171,6 +171,7 @@ static void AIBoot(void);
 static UIWindow *AIHostWindow(void);
 static void AISetOverlayVisible(BOOL vis);   // 盖屏按钮在它的定义之前就要用
 static void AIGuardSync(void);               // v32：罩层状态自愈（tick 每秒收敛一次）
+static void AIGuardRender(void);             // v32：guardVerify(4392) 在定义(4411)之前要用
 static void AIShowOverlay(void);            // 盖屏按钮回调里要刷新报告
 // v30 UI 三层任务态（定义见 AIFloatApply 之前）
 static void AITaskSet(NSString *name, int step, int total, NSString *state, int ok, NSString *brief);
