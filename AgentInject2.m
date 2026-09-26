@@ -107,7 +107,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v31";   // v31 = v30（版本自报 built/lib/ops + 悬浮球任务态）合并 UI 三层任务态改造
+static NSString * const kAIVer = @"v32";   // v32 = v31（版本自报 built/lib/ops + UI 三层任务态）+ 罩层真源自愈（治 idle 也挡屏 / overlay off 关不掉）
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -170,6 +170,7 @@ static void AIBoot(void);
 // AITapInProcess（约 430 行）在 AIHostWindow 定义（约 580 行）之前就要用它
 static UIWindow *AIHostWindow(void);
 static void AISetOverlayVisible(BOOL vis);   // 盖屏按钮在它的定义之前就要用
+static void AIGuardSync(void);               // v32：罩层状态自愈（tick 每秒收敛一次）
 static void AIShowOverlay(void);            // 盖屏按钮回调里要刷新报告
 // v30 UI 三层任务态（定义见 AIFloatApply 之前）
 static void AITaskSet(NSString *name, int step, int total, NSString *state, int ok, NSString *brief);
@@ -3798,6 +3799,7 @@ static void AIHudTickLoop(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         @try { AIHudApply(); } @catch (id e) {}
+        @try { AIGuardSync(); } @catch (id e) {}   // v32：罩层每秒自愈，谁偷偷显示都会被拉回真源
         AIHudTickLoop();
     });
 }
@@ -3867,14 +3869,15 @@ static void AINetLoop(void) {
                         gPollOK++; failRun = 0;
                         if (gPollOK == 1) {
                             AILog(@"  ✅ 首次轮询成功，已上线 -> %@", gActiveBase);
-                            AIShowOverlay();     // 立刻把结论刷到盖屏上，不用用户做任何操作
+                            // v32：盖屏已退役（决策②），别再自动糊一层。结论写 log / 诊断区即可。
+                            if (AIFlag(@"sw1", NO)) AIShowOverlay();
                         }
                     } else {
                         gPollErr++; failRun++;
                         gLastErrCode = pe ? pe.code : -999;
                         gLastErrText = pe.localizedDescription;
                         AILog(@"  ⚠️ 轮询失败: %@ (code=%ld)", pe.localizedDescription, (long)gLastErrCode);
-                        if (gPollErr == 1 || gPollErr == 3) AIShowOverlay();   // 首败/三败时刷一次盖屏，别让用户看旧快照
+                        if ((gPollErr == 1 || gPollErr == 3) && AIFlag(@"sw1", NO)) AIShowOverlay();  // v32：同上，仅诊断模式
                         // 域名连续挂 4 次 -> 切 IP 直连兜底（DNS 被污染时救命）
                         if (failRun >= 4 && ![gActiveBase hasPrefix:@"https://4"]) {
                             gActiveBase = @"https://49.233.240.214";
@@ -4351,17 +4354,16 @@ static void AITestTapAt(CGPoint pt, NSString *desc) {
           ok ? @"已投递" : @"失败", gActionHits - a0, gLastAction ?: @"-", gTargetHits - t0);
 
     if (hadOverlay) {
-        gOverlayWindow.hidden = NO;
-        [gOverlayWindow makeKeyAndVisible];
-        AISleep(0.2);
-        AIShowOverlay();
+        // v32：恢复也走真源（不是无条件显示）；诊断盖屏仅在 sw1 时刷
+        AIGuardSync();
+        if (AIFlag(@"sw1", NO)) AIShowOverlay();
     }
 }
 
 static void AITestTapButton(void) {
     CGPoint pt = CGPointZero;
     NSString *desc = nil;
-    if (!AIFindFirstButton(&pt, &desc)) { AILog(@"  没找到可点的 UIButton"); AIShowOverlay(); return; }
+    if (!AIFindFirstButton(&pt, &desc)) { AILog(@"  没找到可点的 UIButton"); if (AIFlag(@"sw1", NO)) AIShowOverlay(); return; }
     AITestTapAt(pt, desc);
 }
 
@@ -4386,12 +4388,17 @@ static void AIShowOverlay(void) {
 }
 - (void)guardVerify:(id)sender {
     gGuardMode = [gGuardMode isEqualToString:@"verify"] ? @"privacy" : @"verify";
-    AISetOverlayVisible(YES);                     // 重绘罩面（验证模式仍吃触摸）
+    // v32：只重绘、不 pin（pin 会让任务结束后罩层赖着不走）
+    AIGuardRender();
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gOverlayWindow) { gOverlayWindow.hidden = NO; [gOverlayWindow makeKeyAndVisible]; }
+    });
     AIToast([gGuardMode isEqualToString:@"verify"] ? @"已露出 App（仍防误触）" : @"已恢复模糊");
 }
 - (void)guardEnd:(id)sender {
     AITaskSet(nil, 0, 0, @"idle", -1, nil);
     gGuardPinned = NO;
+    AIGuardSync();                                // v32：结束任务后立刻落下，不等 tick
     AIToast(@"任务已结束");
 }
 @end
@@ -4473,14 +4480,56 @@ static void AIGuardRender(void) {
     });
 }
 
+// v32 · 罩层的唯一真源：手动 pin 或 任务进行中 → 该显示；否则必须落下。
+// 为什么要有这个：v31 实测「idle 时罩层可见且 overlay off 三次都关不掉」——
+// 老代码里 AINetLoop 首次轮询成功会无条件 AIShowOverlay()（v20 之前盖屏还是主 UI 的遗留），
+// 每次冷启动都糊一层，而且它是 dispatch_async 异步的，跟 off 命令赛跑。
+// 与其逐个追凶，不如把「该不该显示」收敛成纯函数，再让 tick 每秒自愈一次。
+static BOOL AIGuardShouldShow(void) {
+    return (gGuardPinned || gBusy > 0) ? YES : NO;
+}
+
+// 按真源收敛罩层（主线程）。幂等，可每 tick 调。
+static void AIGuardSync(void) {
+    if (gIsSpringBoard) return;
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ AIGuardSync(); });
+        return;
+    }
+    BOOL want = AIGuardShouldShow();
+    if (!want) {
+        if (gOverlayWindow && !gOverlayWindow.hidden) {
+            gOverlayWindow.hidden = YES;
+            // 把 key 交还宿主窗口，否则 App 收不到按键/触摸链
+            @try { UIWindow *h = AIHostWindow(); if (h && h != gOverlayWindow) [h makeKeyAndVisible]; }
+            @catch (id e) {}
+        }
+        return;
+    }
+    if (!gOverlayWindow || !gOverlayWindow.rootViewController) { AIGuardRender(); return; }
+    if (gOverlayWindow.hidden) { gOverlayWindow.hidden = NO; [gOverlayWindow makeKeyAndVisible]; }
+}
+
 static void AISetOverlayVisible(BOOL vis) {
-    if (!vis && !gOverlayWindow) return;
-    if (vis) AIGuardRender();
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (vis) [gOverlayWindow makeKeyAndVisible];
-        else     gOverlayWindow.hidden = YES;
-        AILog(@"  [guard] 防护罩已%@", vis ? @"升起（吃掉人类触摸；AI 点击走宿主窗口照常生效）" : @"落下");
-    });
+    // v32：vis 不再只是「改 hidden」，而是一次带语义的显式控制：
+    //   vis=YES -> 视为手动 pin（任务结束也不落）；vis=NO -> 解 pin 并按真源收敛。
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ AISetOverlayVisible(vis); });
+        return;
+    }
+    gGuardPinned = vis ? YES : NO;
+    if (vis) {
+        AIGuardRender();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!gOverlayWindow) return;
+            gOverlayWindow.hidden = NO;
+            [gOverlayWindow makeKeyAndVisible];
+            AILog(@"  [guard] 防护罩已升起（吃掉人类触摸；AI 点击走宿主窗口照常生效）");
+        });
+    } else {
+        AIGuardSync();
+        AILog(@"  [guard] 防护罩已落下（解 pin，按 busy 收敛）");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4537,6 +4586,8 @@ static void AIBoot(void) {
             @try { AIWriteReport(); } @catch (NSException *e) {}
             @try { AIFloatApply(); }  @catch (NSException *e) {}
             if (AIFlag(@"sw1", NO)) { @try { AIShowOverlay(); } @catch (NSException *e) {} }
+            // v32：冷启动收尾 —— 强制按真源收敛罩层（idle 必须是落下的）
+            @try { AIGuardSync(); } @catch (NSException *e) {}
         });
     });
 }
@@ -4809,7 +4860,8 @@ static void AITaskSet(NSString *name, int step, int total, NSString *state, int 
     gFloatForce = YES;
     AIFloatApply();
     // L2 防护罩：任务期自动升起 + 手动 pin（拍板决策 3：两者都要）
-    AISetOverlayVisible(gGuardPinned ? YES : (gBusy ? YES : NO));
+    // v32：走 AIGuardSync 而不是 AISetOverlayVisible —— 后者会把 busy 误记成 pin，任务结束赖着不走
+    AIGuardSync();
 }
 // 当前有效状态：无任务=idle；有任务但最近一步失败=fail（失败优先，别让 exec 盖住错误）
 static NSString *AITaskStateNow(void) {
@@ -4831,6 +4883,7 @@ static NSDictionary *AIUiDict(void) {
     NSString *st = AITaskStateNow();
     return @{@"float": @{@"dot": st ?: @"idle", @"line": AITaskLine()},
              @"guard": @{@"visible": (gOverlayWindow && !gOverlayWindow.hidden) ? @1 : @0,
+                         @"want":    @(AIGuardShouldShow() ? 1 : 0),   // v32：真源 vs 实际的差就是 bug
                          @"mode":    gGuardMode ?: @"privacy",
                          @"pinned":  @(gGuardPinned)},
              @"panel": @{@"open": @(gFloatExpanded ? 1 : 0)}};
