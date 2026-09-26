@@ -2036,6 +2036,8 @@ static NSString *AITreeOf(UIView *v, int depth, int maxDepth) {
 //       1) 标准控件（UILabel/UIButton/UITextField/UITextView）
 //       2) 任何「碰巧有 text / attributedText 方法」的自绘控件（performSelector 试探）
 //       3) 无障碍标签（accessibilityLabel/Value）—— 最通用的兜底
+static NSString *AITextOfView(UIView *v);            // v21：AIDumpOf 在它定义之前要调用
+
 // v21：自绘控件（快手 _TKLabel）既不继承 UILabel，也没有 accessibilityLabel，
 //      文字藏在自定义属性里。用 runtime 枚举类的属性名，挑名字像「文字」的
 //      逐个 performSelector 试探 —— 拿不到就 nil，绝不硬猜。
