@@ -16,23 +16,66 @@ from relayctl import post, get
 wayfind.DEV = "287CD2D8-3281-42F7-9B51-5AE3FF4426D4"
 DEV = wayfind.DEV
 
+# 幂等 op：超时可以安全重发。点击类（tapui/gtap/rntap/scroll/...）重发会真的
+# 执行两次，一律不重试（这些 op 不在表里，retry 会被强制归 0）。
+IDEMPOTENT = {"status", "text", "tree", "probe", "find", "chain", "wins",
+              "wininfo", "rows", "nav", "panel"}
 
-def _op(op, payload, show, timeout=90):
-    """快手侧命令普遍偏慢（text 实测 25s+），超时默认放宽到 90 秒。"""
+
+def _op(op, payload, show, timeout=90, retry=1):
+    """快手侧命令普遍偏慢（text 实测 25s+），超时默认放宽到 90 秒。
+    retry：超时后重发次数，默认 1，但只对 IDEMPOTENT 里的 op 生效。"""
+    if op not in IDEMPOTENT:
+        retry = 0
     time.sleep(0.3)
-    prev = wayfind._last_ts(op)
-    d = dict(payload); d.update({"dev": DEV, "op": op})
-    post("/cmd", d)
-    r = wayfind.wait_op(op, time.time(), timeout=timeout, after_ts=prev)
-    if not r:
-        print("  %s 超时(%ds)" % (op, timeout)); return None
-    show(r)
-    return r
+    for k in range(retry + 1):
+        prev = wayfind._last_ts(op)
+        d = dict(payload); d.update({"dev": DEV, "op": op})
+        post("/cmd", d)
+        r = wayfind.wait_op(op, time.time(), timeout=timeout, after_ts=prev)
+        if r:
+            show(r); return r
+        if k < retry:
+            print("  %s 第%d次超时(%ds)，幂等，重发一次" % (op, k + 1, timeout))
+    print("  %s 超时(%ds)" % (op, timeout)); return None
 
 
-def ver():
+def _show_status(d, stale=False):
+    tag = "[缓存快照·可能滞后]" if stale else "[实时回执]"
+    if not d:
+        print("  status: 没拿到"); return
+    print("  %s ver=%s built=%s" % (tag, d.get("ver") or "?",
+                                    d.get("built") or "?"))
+    print("     lib=%s" % (d.get("lib") or "?"))
+    print("     proc=%s pid=%s overlay=%s busy=%s"
+          % (d.get("proc"), d.get("pid"), d.get("overlay"), d.get("busy")))
+    print("     task=%s" % json.dumps(d.get("task") or {}, ensure_ascii=False)[:240])
+    print("     ui  =%s" % json.dumps(d.get("ui") or {}, ensure_ascii=False)[:320])
+
+
+def ver(live=True, timeout=20):
+    """G16：中继 /report?op=status 是手机【最后一次上报】的快照 —— 实测滞后 29 分钟，
+    拿它判版本会得出「新版没生效」的错误结论（v32/v33 就是这么被冤枉的）。
+    所以判版本必须主动发一条 status 命令取实时回执；只有实时也拿不到才退回快照。"""
+    if live:
+        prev = wayfind._last_ts("status")
+        post("/cmd", {"dev": DEV, "op": "status"})
+        d = wayfind.wait_op("status", time.time(), timeout=timeout,
+                            after_ts=prev, wd=False)
+        if d:
+            _show_status(d); return d
+        print("  实时 status 超时(%ds) —— 手机端可能 hang（G13）或不在前台" % timeout)
     d = get("/report?dev=%s&op=status" % DEV).get("data") or {}
-    print("  status:", json.dumps(d, ensure_ascii=False)[:400])
+    _show_status(d, stale=True)
+    return d
+
+
+def alive(timeout=15):
+    """只判活：手机端轮询线程还在不在。"""
+    d = wayfind.alive(dev=DEV, timeout=timeout)
+    print("  alive -> %s" % ("是（轮询线程活着）" if d else "否（hang 或 App 不在前台）"))
+    if d:
+        print("     ver=%s pid=%s" % (d.get("ver"), d.get("pid")))
     return d
 
 
@@ -61,7 +104,12 @@ def main():
             if not filt or re.search(filt, l):
                 print("   ", l)
     elif a == "status":
-        ver()
+        # ks.py status          实时（主动发 status 命令，默认）
+        # ks.py status cache    读中继缓存快照（对比滞后用）
+        ver(live=(sys.argv[2] != "cache") if len(sys.argv) > 2 else True)
+    elif a == "alive":
+        alive()
+        print("  hung(近120s内判定过hang)=%s" % wayfind.hung())
     elif a == "tree":
         t = wayfind.tree(sys.argv[2] if len(sys.argv) > 2 else None)
         print(t[:4000])
