@@ -145,6 +145,13 @@ def text(kw=None, pause=0.2, show=True):
     return t
 
 
+def dump(x, y, deep=2, pause=0.2):
+    """v21+：挖某个坐标上那个对象的所有属性（自绘控件的文字常常藏在这里）。"""
+    d = _op("dump", {"x": x, "y": y, "deep": deep},
+            lambda r: print(r.get("text", "")))
+    return (d or {}).get("text", "")
+
+
 def update(url, ver, pause=0.2):
     """v20：把一份新 dylib 推到手机上（下次重开 App 生效）。"""
     d = _op("update", {"url": url, "ver": str(ver)}, lambda r: print("  update:", r.get("txt")))

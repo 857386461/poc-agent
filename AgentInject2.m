@@ -106,7 +106,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v20";
+static NSString * const kAIVer = @"v21";
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -2036,6 +2036,97 @@ static NSString *AITreeOf(UIView *v, int depth, int maxDepth) {
 //       1) 标准控件（UILabel/UIButton/UITextField/UITextView）
 //       2) 任何「碰巧有 text / attributedText 方法」的自绘控件（performSelector 试探）
 //       3) 无障碍标签（accessibilityLabel/Value）—— 最通用的兜底
+// v21：自绘控件（快手 _TKLabel）既不继承 UILabel，也没有 accessibilityLabel，
+//      文字藏在自定义属性里。用 runtime 枚举类的属性名，挑名字像「文字」的
+//      逐个 performSelector 试探 —— 拿不到就 nil，绝不硬猜。
+static NSString *AIRuntimeTextOf(id v) {
+    if (!v) return nil;
+    Class cls = [v class];
+    int lv = 0;
+    while (cls && lv++ < 6) {
+        unsigned n = 0;
+        objc_property_t *ps = class_copyPropertyList(cls, &n);
+        for (unsigned i = 0; i < n && i < 80; i++) {
+            const char *pn = property_getName(ps[i]);
+            if (!pn) continue;
+            NSString *name = [[NSString alloc] initWithUTF8String:pn];
+            NSString *ln = [name lowercaseString];
+            if (!([ln containsString:@"text"] || [ln containsString:@"title"] ||
+                  [ln containsString:@"content"] || [ln containsString:@"string"] ||
+                  [ln containsString:@"label"] || [ln containsString:@"word"] ||
+                  [ln containsString:@"desc"])) continue;
+            SEL g = NSSelectorFromString(name);
+            if (!g || ![v respondsToSelector:g]) continue;
+            @try {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                id r = [v performSelector:g];
+#pragma clang diagnostic pop
+                if ([r isKindOfClass:[NSString class]] && [(NSString *)r length] > 0 &&
+                    [(NSString *)r length] < 300) return (NSString *)r;
+                if ([r isKindOfClass:[NSAttributedString class]] && [(NSAttributedString *)r length])
+                    return [(NSAttributedString *)r string];
+            } @catch (id e) {}
+        }
+        if (ps) free(ps);
+        cls = class_getSuperclass(cls);
+    }
+    return nil;
+}
+
+// v21：dump 一个对象里「所有可能是文字的东西」——查案用，不参与正常流程
+static NSString *AIPropsOf(id v) {
+    if (!v) return @"";
+    NSMutableArray *parts = [NSMutableArray array];
+    Class cls = [v class];
+    int lv = 0;
+    while (cls && lv++ < 4) {
+        unsigned n = 0;
+        objc_property_t *ps = class_copyPropertyList(cls, &n);
+        for (unsigned i = 0; i < n && i < 80; i++) {
+            const char *pn = property_getName(ps[i]);
+            if (!pn) continue;
+            NSString *name = [[NSString alloc] initWithUTF8String:pn];
+            SEL g = NSSelectorFromString(name);
+            if (!g || ![v respondsToSelector:g]) continue;
+            @try {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                id r = [v performSelector:g];
+#pragma clang diagnostic pop
+                NSString *s = nil;
+                if ([r isKindOfClass:[NSString class]]) s = r;
+                else if ([r isKindOfClass:[NSAttributedString class]]) s = [(NSAttributedString *)r string];
+                else if ([r isKindOfClass:[NSNumber class]]) s = [(NSNumber *)r stringValue];
+                if (!s) continue;
+                if (s.length > 40) s = [[s substringToIndex:40] stringByAppendingString:@"…"];
+                [parts addObject:[NSString stringWithFormat:@"%@=%@", name, s]];
+            } @catch (id e) {}
+        }
+        if (ps) free(ps);
+        cls = class_getSuperclass(cls);
+    }
+    return [parts componentsJoinedByString:@", "];
+}
+
+static NSString *AIDumpOf(UIView *v, int depth, int maxDepth) {
+    NSMutableString *m = [NSMutableString string];
+    CGRect ab = CGRectZero;
+    @try { ab = [v convertRect:v.bounds toView:nil]; } @catch (id e) {}
+    NSMutableString *ind = [NSMutableString string];
+    for (int i = 0; i < depth; i++) [ind appendString:@"  "];
+    [m appendFormat:@"%@%@ (%.0f,%.0f %.0fx%.0f)", ind, NSStringFromClass([v class]),
+     ab.origin.x, ab.origin.y, ab.size.width, ab.size.height];
+    NSString *t = AITextOfView(v);
+    if (t.length) [m appendFormat:@"  TXT=%@", t];
+    NSString *p = AIPropsOf(v);
+    if (p.length) [m appendFormat:@"\n%@  {%@}", ind, p];
+    else [m appendString:@"\n"];
+    if (depth >= maxDepth) return m;
+    for (UIView *c in v.subviews) [m appendString:AIDumpOf(c, depth + 1, maxDepth)];
+    return m;
+}
+
 static NSString *AITextOfView(UIView *v) {
     if (!v) return nil;
 #pragma clang diagnostic push
@@ -2065,6 +2156,7 @@ static NSString *AITextOfView(UIView *v) {
 #pragma clang diagnostic pop
     @try { NSString *a = v.accessibilityLabel; if (a.length) return a; } @catch (id e) {}
     @try { NSString *a = v.accessibilityValue; if (a.length) return a; } @catch (id e) {}
+    @try { NSString *a = AIRuntimeTextOf(v); if (a.length) return a; } @catch (id e) {}   // v21 自绘控件兜底
     return nil;
 }
 
@@ -2369,6 +2461,20 @@ static void AIExecCmd(NSDictionary *cmd) {
             txt = f;
         }
         AIReportDict(@{@"op": @"text", @"ok": @YES, @"text": txt});
+    } else if ([op isEqualToString:@"dump"]) {        // v21：按坐标挖这个对象的所有属性（查自绘控件文字藏哪）
+        CGFloat x = [cmd[@"x"] floatValue], y = [cmd[@"y"] floatValue];
+        int deep = cmd[@"deep"] ? [cmd[@"deep"] intValue] : 2;
+        __block NSString *s = @"(none)";
+        AIMainSync(^{
+            @try {
+                UIWindow *w = AIHostWindow();
+                UIView *hit = [w hitTest:CGPointMake(x, y) withEvent:nil];
+                if (hit) s = AIDumpOf(hit, 0, deep);
+                else s = @"(该坐标没命中任何 view)";
+            } @catch (id e) {}
+        });
+        AIReportDict(@{@"op": @"dump", @"ok": @YES, @"x": @(x), @"y": @(y), @"text": s});
+        AILog(@"  [cmd] dump (%.0f,%.0f) deep=%d", x, y, deep);
     } else if ([op isEqualToString:@"update"]) {      // v20：推一份新 dylib 到手机上
         NSString *r = AIUpdateFrom(cmd[@"url"], cmd[@"ver"]);
         AILog(@"  [cmd] update -> %@", r);
