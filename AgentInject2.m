@@ -106,7 +106,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v23";
+static NSString * const kAIVer = @"v24";
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -171,6 +171,9 @@ static BOOL AIBudgetTake(void);                      // v23：额度控制，定
 static NSArray *AIHostWindows(void);                 // v23：候选窗口列表（AIHitAtPoint 提前用）
 static UIView *AIHitAtPoint(CGPoint pt);             // v23：跨窗口命中测试
 static void AIBudgetReset(int n);                    // v23：额度重置，定义在 ~2410 行
+static BOOL AIMemSafe(void);                         // v24：内存水位阀，定义在 ~2436 行
+static int  AIMemMB(void);                           // v24：当前常驻内存 MB
+static id   AISafeObjGet(id v, SEL g);               // v24：只接受对象返回值的 selector 调用
 static NSDictionary *AIPickTextViaGesture(NSString *kw);  // v23：按文字触发手势，定义在 ~1339 行
 static NSDictionary *AIScrollAt(CGPoint pt, double dy, double dx, BOOL anim);  // v17
 static NSString *AIBack(void);                  // v18：AIRunMacro(~1057) 在它定义之前要调用
@@ -1088,7 +1091,7 @@ static NSDictionary *AIGestureTapAt(CGPoint pt) {
 // 递归收集 view 里的可见文本（标签/输入框），用来判断这一行是不是我要找的
 static void AICollectTexts(UIView *v, NSMutableArray *a, int depth, int maxDepth) {
     if (!v || depth > maxDepth || !v.window) return;
-    if (!AIBudgetTake()) return;            // v23：同上
+    if (!AIBudgetTake() || !AIMemSafe()) return;   // v24：额度 + 内存双阀
     @try {
         NSString *t = nil;
         if ([v isKindOfClass:[UILabel class]])          t = ((UILabel *)v).text;
@@ -1322,7 +1325,7 @@ static NSString *AITextOfView(UIView *v);   // v23：本文件后面定义，这
 // v23：界面上「文字在哪」的递归查找。快手把文字画在 _TKLabel 里，
 //      标准 tree/rows 都看不到，只能靠 AITextOfView 一个个问出来。
 static void AIFindTextRec(UIView *v, NSString *kw, NSMutableArray *out) {
-    if (!v || out.count > 200 || !AIBudgetTake()) return;
+    if (!v || out.count > 200 || !AIBudgetTake() || !AIMemSafe()) return;   // v24：双阀
     @try {
         NSString *t = AITextOfView(v);
         if (t.length && [t rangeOfString:kw options:NSCaseInsensitiveSearch].location != NSNotFound) {
@@ -2418,6 +2421,31 @@ static BOOL AIBudgetTake(void) {
     return YES;
 }
 
+// ---------------------------------------------------------------------------
+// v24：内存水位阀。
+//   闪退还有一种成因是 OOM —— 快手本身是视频流 App，内存水位本来就高，
+//   我们再叠一层深度遍历很容易把它顶过 Jetsam 阈值，系统直接杀进程，
+//   用户看到的就是「闪退」。所以遍历过程中定期看一眼自己吃了多少内存，
+//   超过上限立刻收手。宁可少报几条文字，也不把宿主 App 搞死。
+// ---------------------------------------------------------------------------
+static int AIMemMB(void) {
+    struct mach_task_basic_info info;
+    mach_msg_type_number_t n = MACH_TASK_BASIC_INFO_COUNT;
+    kern_return_t k = task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                                (task_info_t)&info, &n);
+    if (k != KERN_SUCCESS) return 0;
+    return (int)(info.resident_size / (1024 * 1024));
+}
+static BOOL AIMemSafe(void) {
+    static int peak = 0;                 // 记录本次命令期间见到的最高水位
+    if ((gTextBudget & 0x3F) != 0) return YES;   // 每 64 个 view 才查一次，别自己拖慢
+    int m = AIMemMB();
+    if (m <= 0) return YES;
+    if (m > peak) peak = m;
+    return m < 1100;                     // 1.1GB 以上就停手
+}
+static int AIMemPeak(void) { return AIMemMB(); }
+
 // 某个类（含父类链 5 层）里「名字像文字」的属性名，只枚举一次并缓存
 static NSArray *AITextPropNames(Class cls) {
     if (!cls) return @[];
@@ -2449,20 +2477,52 @@ static NSArray *AITextPropNames(Class cls) {
     return m;
 }
 
+// ---------------------------------------------------------------------------
+// v24：闪退的真正元凶 —— performSelector 遇上【返回标量】的 getter
+//
+//   快手 _TKLabel 的属性里混着 isRichText(BOOL)、textLineCount(NSInteger)、
+//   labelWidth(CGFloat) 这类返回值不是对象的 getter。
+//   `id r = [v performSelector:g]` 拿到的就是一个垃圾整数值当指针用，
+//   紧接着的 [r isKindOfClass:] 直接 EXC_BAD_ACCESS。
+//   这是 Mach 异常，@try/@catch 抓不住 —— 表现就是 App 当场闪退。
+//
+//   修法：调用前先问 methodSignature 的返回类型，只接受对象（'@'），
+//   并用 NSInvocation 取回返回值。标量 getter 一律跳过，永不调用。
+// ---------------------------------------------------------------------------
+static id AISafeObjGet(id v, SEL g) {
+    if (!v || !g) return nil;
+    NSMethodSignature *sig = nil;
+    @try { sig = [v methodSignatureForSelector:g]; } @catch (id e) { return nil; }
+    if (!sig) return nil;
+    const char *rt = sig.methodReturnType;
+    if (!rt || !*rt) return nil;
+    // 跳过类型修饰符：r(const) n(in) N(inout) o(out) O(bycopy) R(byref) V(oneway)
+    const char *p = rt;
+    while (*p && strchr("rnNoORV", *p)) p++;
+    if (*p != '@') return nil;            // 只接受对象返回；B/i/f/d/{struct}/^v 全部拒绝
+    @try {
+        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+        inv.selector = g;
+        [inv invokeWithTarget:v];
+        __unsafe_unretained id r = nil;
+        [inv getReturnValue:&r];
+        return r;
+    } @catch (id e) { return nil; }
+}
+
 // v21：自绘控件（快手 _TKLabel）既不继承 UILabel，也没有 accessibilityLabel，
 //      文字藏在自定义属性里。用 runtime 枚举类的属性名，挑名字像「文字」的
-//      逐个 performSelector 试探 —— 拿不到就 nil，绝不硬猜。
-// v23：属性名单改为按类缓存，不再每个实例重复枚举（这是卡死的元凶）。
+//      逐个试探 —— 拿不到就 nil，绝不硬猜。
+// v23：属性名单改为按类缓存，不再每个实例重复枚举。
+// v24：改用 AISafeObjGet，杜绝标量返回值导致的闪退。
 static NSString *AIRuntimeTextOf(id v) {
     if (!v) return nil;
     for (NSString *name in AITextPropNames([v class])) {
         SEL g = NSSelectorFromString(name);
         if (!g || ![v respondsToSelector:g]) continue;
+        id r = AISafeObjGet(v, g);
+        if (!r) continue;
         @try {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            id r = [v performSelector:g];
-#pragma clang diagnostic pop
             if ([r isKindOfClass:[NSString class]] && [(NSString *)r length] > 0 &&
                 [(NSString *)r length] < 300) return (NSString *)r;
             if ([r isKindOfClass:[NSAttributedString class]] && [(NSAttributedString *)r length])
@@ -2487,11 +2547,9 @@ static NSString *AIPropsOf(id v) {
             NSString *name = [[NSString alloc] initWithUTF8String:pn];
             SEL g = NSSelectorFromString(name);
             if (!g || ![v respondsToSelector:g]) continue;
+            id r = AISafeObjGet(v, g);       // v24：同样只接受对象返回，绝不碰标量 getter
+            if (!r) continue;
             @try {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                id r = [v performSelector:g];
-#pragma clang diagnostic pop
                 NSString *s = nil;
                 if ([r isKindOfClass:[NSString class]]) s = r;
                 else if ([r isKindOfClass:[NSAttributedString class]]) s = [(NSAttributedString *)r string];
@@ -2527,34 +2585,33 @@ static NSString *AIDumpOf(UIView *v, int depth, int maxDepth) {
 
 static NSString *AITextOfView(UIView *v) {
     if (!v) return nil;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    // v24：全部改走 AISafeObjGet。即使是 text / currentTitle 这种「看起来肯定返回
+    //      NSString」的方法，自绘类也可能把它实现成返回 BOOL/NSInteger，照样闪退。
     @try {
-        if ([v respondsToSelector:@selector(text)]) {
-            id r = [v performSelector:@selector(text)];
-            if ([r isKindOfClass:[NSString class]] && [(NSString *)r length]) return (NSString *)r;
-            if ([r isKindOfClass:[NSAttributedString class]] && [(NSAttributedString *)r length])
-                return [(NSAttributedString *)r string];
-        }
-        if ([v respondsToSelector:@selector(attributedText)]) {
-            id r = [v performSelector:@selector(attributedText)];
-            if ([r isKindOfClass:[NSAttributedString class]] && [(NSAttributedString *)r length])
-                return [(NSAttributedString *)r string];
-        }
-        if ([v respondsToSelector:@selector(currentTitle)]) {
-            id r = [v performSelector:@selector(currentTitle)];
-            if ([r isKindOfClass:[NSString class]] && [(NSString *)r length]) return (NSString *)r;
-        }
-        if ([v respondsToSelector:@selector(placeholder)]) {
-            id r = [v performSelector:@selector(placeholder)];
-            if ([r isKindOfClass:[NSString class]] && [(NSString *)r length])
-                return [NSString stringWithFormat:@"[%@]", r];
-        }
+        id r = AISafeObjGet(v, @selector(text));
+        if ([r isKindOfClass:[NSString class]] && [(NSString *)r length]) return (NSString *)r;
+        if ([r isKindOfClass:[NSAttributedString class]] && [(NSAttributedString *)r length])
+            return [(NSAttributedString *)r string];
+
+        r = AISafeObjGet(v, @selector(attributedText));
+        if ([r isKindOfClass:[NSAttributedString class]] && [(NSAttributedString *)r length])
+            return [(NSAttributedString *)r string];
+
+        r = AISafeObjGet(v, @selector(currentTitle));
+        if ([r isKindOfClass:[NSString class]] && [(NSString *)r length]) return (NSString *)r;
+
+        r = AISafeObjGet(v, @selector(placeholder));
+        if ([r isKindOfClass:[NSString class]] && [(NSString *)r length])
+            return [NSString stringWithFormat:@"[%@]", r];
     } @catch (id e) {}
-#pragma clang diagnostic pop
     @try { NSString *a = v.accessibilityLabel; if (a.length) return a; } @catch (id e) {}
     @try { NSString *a = v.accessibilityValue; if (a.length) return a; } @catch (id e) {}
-    @try { NSString *a = AIRuntimeTextOf(v); if (a.length) return a; } @catch (id e) {}   // v21 自绘控件兜底
+    // v24：runtime 试探是最贵也最危险的一步（要真调用对方的方法），
+    //      只在「叶子/接近叶子」的 view 上做。文字控件基本都是叶子，
+    //      容器类被跳过 —— 触达面从上千个 view 掉到几十个，风险与开销同时降两个量级。
+    if (v.subviews.count <= 2) {
+        @try { NSString *a = AIRuntimeTextOf(v); if (a.length) return a; } @catch (id e) {}
+    }
     return nil;
 }
 
@@ -2562,7 +2619,7 @@ static NSString *AITextOfView(UIView *v) {
 // accessibilityLabel 上，不去重的话快手这种深树会刷出满屏重复行。
 static NSString *AITextListD(UIView *v, int depth, int maxDepth, NSString *parentTxt) {
     NSMutableString *m = [NSMutableString string];
-    if (!AIBudgetTake()) return m;          // v23：预算用完就收手，绝不让主线程陷进去
+    if (!AIBudgetTake() || !AIMemSafe()) return m;   // v24：额度 + 内存双阀
     CGRect ab = CGRectZero;
     @try { ab = [v convertRect:v.bounds toView:nil]; } @catch (id e) {}
     NSString *txt = AITextOfView(v);
@@ -2946,6 +3003,7 @@ static void AIExecCmd(NSDictionary *cmd) {
                        @"tap": @(gBestTap), @"shot": @(gBestShot),
                        @"mon": @(gMonHits), @"se": @(gSendEventHits),
                        @"tvhits": @(gTargetHits), @"act": @(gActionHits),
+                       @"mem": @(AIMemMB()),          // v24：常驻内存 MB，判断 OOM 用
                        @"overlay": (gOverlayWindow && !gOverlayWindow.hidden) ? @"on" : @"off"});
     } else if ([op isEqualToString:@"log"]) {
         NSString *t = AILogSnapshot();
