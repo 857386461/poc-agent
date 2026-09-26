@@ -56,6 +56,15 @@ else
   echo "  [结论] -framework IOKit 链接失败："; tail -8 /tmp/hl_l.log
   echo "  → 说明 iOS 上这些符号只能 dlsym 运行时取，不能链接期依赖"
 fi
+
+# ⚠️ 陷阱排查：iOS dylib 默认 -undefined dynamic_lookup，链接"通过"可能只是
+#    未定义符号被放行，并不代表符号真的解析到了 IOKit。必须看 nm 的归属标注。
+echo "=== [2b/5] 链接通过 ≠ 符号真解析：查 nm 归属 ==="
+echo "--- otool -L（是否真链上 IOKit） ---"
+otool -L /tmp/hl_extern.dylib 2>/dev/null | grep -i iokit || echo "  [结论] 产物并没有记录对 IOKit 的依赖"
+echo "--- nm -m 看未定义符号归属 ---"
+nm -m /tmp/hl_extern.dylib 2>/dev/null | grep -i ioHIDEvent | head -6 || echo "  （nm 无输出）"
+echo "--- 结论判据：(from IOKit)=真解析；dynamic_lookup=只是被放行，运行时才找 ---"
 } 2>&1 | tee -a "$REPORT"
 
 echo "=== [3/5] 编译 HLProbe.dylib（dlsym 路线，不链 IOKit） ==="
