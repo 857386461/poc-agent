@@ -179,7 +179,7 @@ static NSString *AIRuntimeTextOf(id v);              // v27：AIFindViewsAt 要�
 static BOOL AITapUIControlAt(CGPoint pt, NSString **outDesc);  // v28：AIDismiss 要用，定义在 ~1137 行
 static NSArray   *AIFindViewsAt(CGPoint pt, int maxN);   // v27：按坐标精确命中（躲开 hitTest）
 static NSDictionary *AIPickTextViaGesture(NSString *kw);  // v23：按文字触发手势，定义在 ~1339 行
-static NSDictionary *AIScrollAt(CGPoint pt, double dy, double dx, BOOL anim);  // v17
+static NSDictionary *AIScrollAt(CGPoint pt, double dy, double dx, BOOL anim, int fire);  // v29：fire=手动触发分页回调
 static NSString *AIBack(void);                  // v18：AIRunMacro(~1057) 在它定义之前要调用
 static NSString *AINavInfo(void);               // v18
 // v20 自更新：AIInstall（~3060 行）在它们的定义之前要调用
