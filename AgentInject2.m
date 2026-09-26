@@ -107,7 +107,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v29";
+static NSString * const kAIVer = @"v30";
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -117,7 +117,7 @@ static NSString        *gToastText   = nil;   // 我从中继下发的一句话
 static NSString        *gDiagText    = nil;   // 网络自检结果
 static UIWindow        *gHudWindow   = nil;   // 顶端常驻状态条（独立于盖屏，收起盖屏也还在）
 static UILabel         *gHudLabel    = nil;
-static BOOL             gHudWanted   = YES;
+static BOOL             gHudWanted   = NO;    // v30：默认完全隐藏（诊断计数走云端 log/status，屏幕只留悬浮球）
 static NSString        *gActiveBase  = nil;   // 当前实际在用的中继地址（可能是 IP 兜底）
 // 注意：不能用 UIBackgroundTaskInvalid 初始化 —— 它不是编译期常量，
 // static 变量拿它当 initializer 会直接报 "initializer element is not a compile-time constant"。
@@ -131,6 +131,14 @@ static BOOL gBgActive = NO;
 static UIWindow *gOverlayWindow = nil;
 static UIWindow *gFloatWindow   = nil;   // v20 悬浮球（替代碍事的全屏盖屏，默认只留这个）
 static BOOL      gFloatExpanded = NO;    // 悬浮球是否展开了面板
+
+// v30：任务态 —— 云端 task op 下发，悬浮球显示「任务名 进度 / 当前动作」。
+// 屏幕上用户只需要看这个；其余诊断信息全部走云端（status 自报 / log 拉取），不再上屏。
+static NSString *gTaskName = nil;        // 任务名，如「刷视频」
+static NSString *gTaskStep = nil;        // 当前动作，如「上滑切下一个」
+static int      gTaskIdx   = 0;          // 第几步（1-based）
+static int      gTaskTotal = 0;          // 共几步；0 = 无任务（悬浮球回落显示版本/心跳）
+static int      gTaskOk    = -1;         // -1 执行中 / 1 最近一步成功 / 0 最近一步失败
 static BOOL      gFloatForce    = NO;    // 交互操作要立刻重绘，跳过节流
 static CFTimeInterval gFloatLast = 0;
 
@@ -179,7 +187,7 @@ static NSString *AIRuntimeTextOf(id v);              // v27：AIFindViewsAt 要�
 static BOOL AITapUIControlAt(CGPoint pt, NSString **outDesc);  // v28：AIDismiss 要用，定义在 ~1137 行
 static NSArray   *AIFindViewsAt(CGPoint pt, int maxN);   // v27：按坐标精确命中（躲开 hitTest）
 static NSDictionary *AIPickTextViaGesture(NSString *kw);  // v23：按文字触发手势，定义在 ~1339 行
-static NSDictionary *AIScrollAt(CGPoint pt, double dy, double dx, BOOL anim, int fire);  // v29：fire=手动触发分页回调
+static NSDictionary *AIScrollAt(CGPoint pt, double dy, double dx, BOOL anim, int fire);  // v17（v29 定义加 fire，声明同步，治 conflicting types）
 static NSString *AIBack(void);                  // v18：AIRunMacro(~1057) 在它定义之前要调用
 static NSString *AINavInfo(void);               // v18
 // v20 自更新：AIInstall（~3060 行）在它们的定义之前要调用
@@ -3620,7 +3628,20 @@ static void AIExecCmd(NSDictionary *cmd) {
         AISetOverlayVisible(vis);
         AIReportDict(@{@"op": @"overlay", @"ok": @YES, @"visible": @(vis)});
     } else if ([op isEqualToString:@"status"]) {
+        // v30：自报「我是谁」—— 本 dylib 在手机上的真实路径 + 构建时刻 + op 集。
+        // 背景：v28 起存档把「源码版本」当「注入版本」写，导致 v27/v28 之争；
+        // 以后 status 一次看清手机跑的到底是什么。
+        NSString *libPath = @"?";
+        Dl_info di;
+        if (dladdr((void *)&AIExecCmd, &di) && di.dli_fname)
+            libPath = [NSString stringWithUTF8String:di.dli_fname];
         AIReportDict(@{@"op": @"status", @"ok": @YES, @"ver": kAIVer,
+                       @"built": @(__DATE__ " " __TIME__),        // v30：编译器固化的构建时刻
+                       @"lib": libPath,                            // v30：注入文件真实路径
+                       @"ops": @"wait pick picktxt tapui tap scroll swipe rows tree toast probe "
+                               @"back nav find rntap dismiss uioff uion gdtap wintap schemes open "
+                               @"shot wins win gtap chain text dump update core ball overlay "
+                               @"status log hud task macro diag",
                        @"proc": gProcName, @"bundle": gBundleId, @"pid": @(getpid()),
                        @"tap": @(gBestTap), @"shot": @(gBestShot),
                        @"mon": @(gMonHits), @"se": @(gSendEventHits),
@@ -3639,6 +3660,20 @@ static void AIExecCmd(NSDictionary *cmd) {
         BOOL v = cmd[@"on"] ? ([cmd[@"on"] intValue] != 0) : YES;
         AISetHudVisible(v);
         AIReportDict(@{@"op": @"hud", @"ok": @YES, @"visible": @(v)});
+    } else if ([op isEqualToString:@"task"]) {      // v30：任务态 -> 悬浮球
+        id nm = cmd[@"name"], st = cmd[@"step"];
+        gTaskName  = [nm isKindOfClass:[NSString class]] ? nm : @"";
+        gTaskStep  = [st isKindOfClass:[NSString class]] ? st : @"";
+        gTaskIdx   = [cmd[@"idx"] intValue];
+        gTaskTotal = [cmd[@"total"] intValue];
+        gTaskOk    = cmd[@"ok"] ? [cmd[@"ok"] intValue] : -1;
+        gFloatForce = YES;                          // 立刻刷新，别等 1.5s 节流
+        AIFloatApply();
+        AIReportDict(@{@"op": @"task", @"ok": @YES, @"show": @(gTaskTotal > 0),
+                       @"text": gTaskTotal > 0
+                           ? [NSString stringWithFormat:@"%@ %d/%d %@", gTaskName, gTaskIdx,
+                              gTaskTotal, gTaskStep ?: @""]
+                           : @"(空闲)"});
     } else if ([op isEqualToString:@"probe"]) {
         // 我得先看清「这个坐标上到底是什么」，再决定怎么点
         CGFloat x = [cmd[@"x"] floatValue], y = [cmd[@"y"] floatValue];
@@ -4599,11 +4634,25 @@ static void AIFloatApply(void) {
             ball.layer.masksToBounds = YES;
             ball.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.62];
             UILabel *lb = [[UILabel alloc] initWithFrame:ball.bounds];
-            lb.text = [NSString stringWithFormat:@"%@\n%d", kAIVer, gCmdGot];
+            // v30：悬浮球 = 给用户看的唯一入口 —— 任务名 / 进度 / 当前动作 / 最近结果
+            if (gTaskTotal > 0) {
+                lb.text = [NSString stringWithFormat:@"%@ %d/%d\n%@",
+                           gTaskName ?: @"", gTaskIdx, gTaskTotal, gTaskStep ?: @""];
+            } else {
+                lb.text = [NSString stringWithFormat:@"%@\n令%d", kAIVer, gCmdGot];
+            }
             lb.numberOfLines = 2; lb.textAlignment = NSTextAlignmentCenter;
-            lb.font = [UIFont boldSystemFontOfSize:13];
-            lb.textColor = (gPollErr > 0 && gPollOK == 0) ? [UIColor systemRedColor]
-                                                          : [UIColor systemGreenColor];
+            lb.font = [UIFont boldSystemFontOfSize:12];
+            UIColor *ballCol;
+            if (gTaskTotal > 0) {
+                ballCol = (gTaskOk == 0) ? [UIColor systemRedColor]
+                        : ((gTaskOk == 1) ? [UIColor systemGreenColor]
+                                          : [UIColor systemBlueColor]);   // 执行中
+            } else {
+                ballCol = (gPollErr > 0 && gPollOK == 0) ? [UIColor systemRedColor]
+                                                         : [UIColor systemGreenColor];
+            }
+            lb.textColor = ballCol;
             [ball addSubview:lb];
             [ball addGestureRecognizer:[[UITapGestureRecognizer alloc]
                                         initWithTarget:gFT action:@selector(ballTapped:)]];
