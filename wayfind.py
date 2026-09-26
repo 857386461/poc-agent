@@ -128,7 +128,8 @@ def has(kw):
 
 
 # ---- v19：读界面文本（带窗口坐标），陌生 App 导航刚需 ----
-def text(kw=None, pause=0.2):
+def text(kw=None, pause=0.2, show=True):
+    """v19+：读界面上所有文字（带屏幕坐标）。陌生 App 导航全靠它。"""
     time.sleep(pause)
     prev = _last_ts("text")
     post("/cmd", {"dev": DEV, "op": "text", **({"kw": kw} if kw else {})})
@@ -136,7 +137,30 @@ def text(kw=None, pause=0.2):
     d = wait_op("text", t0, after_ts=prev)
     if not d:
         print("  text 超时"); return ""
-    return d.get("text", "") or ""
+    t = d.get("text", "") or ""
+    if show:
+        print("  text: %d 行" % len([l for l in t.splitlines() if l.strip()]))
+        for l in t.splitlines()[:60]:
+            print("   ", l)
+    return t
+
+
+def update(url, ver, pause=0.2):
+    """v20：把一份新 dylib 推到手机上（下次重开 App 生效）。"""
+    d = _op("update", {"url": url, "ver": str(ver)}, lambda r: print("  update:", r.get("txt")))
+    return (d or {}).get("txt", "")
+
+
+def core(pause=0.2):
+    """v20：看手机本地缓存了哪些 core 版本。"""
+    d = _op("core", {}, lambda r: print("  core: 当前=%s 待生效=%s 文件=%s"
+                                        % (r.get("ver"), r.get("pending") or "-", r.get("files"))))
+    return d or {}
+
+
+def ball(on=True, pause=0.2):
+    """v20：悬浮球显隐。"""
+    return _op("ball", {"on": 1 if on else 0}, lambda r: print("  ball:", r.get("visible")))
 
 
 # ---- v15：看行 / 点行（表格行不是 UIControl，必须走 delegate）----

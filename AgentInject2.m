@@ -106,7 +106,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v19";
+static NSString * const kAIVer = @"v20";
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -128,6 +128,22 @@ static BOOL gBgActive = NO;
 // 同时它必须在文件靠前的位置声明 —— v3 的伪造 Touch 分发代码（约 530 行）
 // 会用到它，声明放在 13 节会导致 "use of undeclared identifier"。
 static UIWindow *gOverlayWindow = nil;
+static UIWindow *gFloatWindow   = nil;   // v20 悬浮球（替代碍事的全屏盖屏，默认只留这个）
+static BOOL      gFloatExpanded = NO;    // 悬浮球是否展开了面板
+static BOOL      gFloatForce    = NO;    // 交互操作要立刻重绘，跳过节流
+static CFTimeInterval gFloatLast = 0;
+
+// v20 开关项：状态存 NSUserDefaults，杀 App 重开也记得住。
+// 放在文件靠前的位置 —— AIExecCmd（~2200 行）在它定义之前就要用。
+#define AIK(k) [@"ai2_" stringByAppendingString:(k)]
+static BOOL AIFlag(NSString *k, BOOL def) {
+    id v = [[NSUserDefaults standardUserDefaults] objectForKey:AIK(k)];
+    return v ? [v boolValue] : def;
+}
+static void AISetFlag(NSString *k, BOOL b) {
+    [[NSUserDefaults standardUserDefaults] setBool:b forKey:AIK(k)];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
 
 // 前向声明：sendEvent hook 里要在定义之前调用 AIBoot
 static void AIBoot(void);
@@ -154,6 +170,11 @@ static NSString *AITextList(UIView *v, int depth, int maxDepth);  // v19：读�
 static NSDictionary *AIScrollAt(CGPoint pt, double dy, double dx, BOOL anim);  // v17
 static NSString *AIBack(void);                  // v18：AIRunMacro(~1057) 在它定义之前要调用
 static NSString *AINavInfo(void);               // v18
+// v20 自更新：AIInstall（~3060 行）在它们的定义之前要调用
+static NSString *AICoreDir(void);
+static BOOL  AIHandoffToNewer(void);
+static NSString *AIUpdateFrom(NSString *url, NSString *ver);
+static void  AIFloatApply(void);
 
 // ---------------------------------------------------------------------------
 // 2. HID 私有符号（全部 dlsym，不做链接期依赖）
@@ -837,21 +858,47 @@ static NSArray *AIAllWindows(void) {
     return out;
 }
 
+// v20：数一棵视图树有多少个「可见」节点 —— 用来判断哪个窗口才是 App 真正在显示的。
+//
+//   ★ 踩坑（快手）：快手上有一个【全屏但内容为空】的窗口抢到了 isKeyWindow，
+//     旧逻辑「见到 keyWindow 就 return」于是 tree / text 全抓到一个光秃秃的
+//     UIView (0,0,390,844)，界面文字一条都读不到。微信目前侥幸没踩到，
+//     但只要宿主 App 多开一个空窗口就会复现，所以这里改成按内容量选。
+static int AICountNodes(UIView *v, int depth, int maxDepth, int cap) {
+    if (!v || depth > maxDepth) return 0;
+    if (v.hidden || v.alpha < 0.01) return 0;
+    int n = 1;
+    for (UIView *c in v.subviews) {
+        n += AICountNodes(c, depth + 1, maxDepth, cap);
+        if (n >= cap) break;                 // 够多就打住，别把主线程拖住
+    }
+    return n;
+}
+
 // 找「App 自己的」窗口：排除我们盖的屏、排除键盘/文本特效窗口
 static UIWindow *AIHostWindow(void) {
-    UIWindow *fallback = nil;
+    UIWindow *best = nil, *key = nil;
+    int bestN = 0;
     for (UIWindow *w in AIAllWindows()) {
         if (w == gOverlayWindow) continue;
         if (w == gHudWindow) continue;          // v10 顶端状态条，别让它冒充 App 窗口
+        if (w == gFloatWindow) continue;        // v20 悬浮球
         NSString *cn = NSStringFromClass([w class]);
         if ([cn rangeOfString:@"TextEffects"].location != NSNotFound) continue;
         if ([cn rangeOfString:@"RemoteKeyboard"].location != NSNotFound) continue;
         if (w.hidden || w.alpha < 0.01) continue;
-        if (!fallback) fallback = w;
-        if (w.isKeyWindow) return w;
-        if (w.rootViewController && w.rootViewController.view.window == w) return w;
+        int n = AICountNodes(w, 0, 14, 600);
+        if (w.isKeyWindow) key = w;
+        if (n > bestN) { bestN = n; best = w; }
     }
-    return fallback ?: gOverlayWindow;
+    // keyWindow 只要不是空壳（≥8 个节点）就尊重它，否则退回「内容最多」的那个
+    if (key) {
+        int kn = AICountNodes(key, 0, 14, 600);
+        if (kn >= 8) return key;
+        AILog(@"  ⚠️ keyWindow %@ 只有 %d 个节点（空壳），改用内容最多的窗口(%d)",
+              NSStringFromClass([key class]), kn, bestN);
+    }
+    return best ?: key ?: gOverlayWindow;
 }
 
 // ---------------------------------------------------------------------------
@@ -1978,30 +2025,70 @@ static NSString *AITreeOf(UIView *v, int depth, int maxDepth) {
 // v19：递归收集界面上所有「带文字」的控件，附带窗口坐标。
 // 微信的 UITableView 能用 rows 读行文本，但快手这类自研列表（TKListView）不行，
 // tree 也只打类名不给文本 —— 没有文本就无法在陌生 App 里导航。这个命令补上缺口。
-static NSString *AITextList(UIView *v, int depth, int maxDepth) {
+// v20：从一个 view 上尽量榨出「它显示的文字」。
+//
+//   ★ 踩坑（快手）：快手侧边栏的文字在 `_TKLabel` 里，它是自绘控件、
+//     不继承 UILabel，所以 v19 只认 UILabel/UIButton 的写法一条都读不到
+//     （text 命令返回空字符串）。跨 App 想普适，必须三路兜底：
+//       1) 标准控件（UILabel/UIButton/UITextField/UITextView）
+//       2) 任何「碰巧有 text / attributedText 方法」的自绘控件（performSelector 试探）
+//       3) 无障碍标签（accessibilityLabel/Value）—— 最通用的兜底
+static NSString *AITextOfView(UIView *v) {
+    if (!v) return nil;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    @try {
+        if ([v respondsToSelector:@selector(text)]) {
+            id r = [v performSelector:@selector(text)];
+            if ([r isKindOfClass:[NSString class]] && [(NSString *)r length]) return (NSString *)r;
+            if ([r isKindOfClass:[NSAttributedString class]] && [(NSAttributedString *)r length])
+                return [(NSAttributedString *)r string];
+        }
+        if ([v respondsToSelector:@selector(attributedText)]) {
+            id r = [v performSelector:@selector(attributedText)];
+            if ([r isKindOfClass:[NSAttributedString class]] && [(NSAttributedString *)r length])
+                return [(NSAttributedString *)r string];
+        }
+        if ([v respondsToSelector:@selector(currentTitle)]) {
+            id r = [v performSelector:@selector(currentTitle)];
+            if ([r isKindOfClass:[NSString class]] && [(NSString *)r length]) return (NSString *)r;
+        }
+        if ([v respondsToSelector:@selector(placeholder)]) {
+            id r = [v performSelector:@selector(placeholder)];
+            if ([r isKindOfClass:[NSString class]] && [(NSString *)r length])
+                return [NSString stringWithFormat:@"[%@]", r];
+        }
+    } @catch (id e) {}
+#pragma clang diagnostic pop
+    @try { NSString *a = v.accessibilityLabel; if (a.length) return a; } @catch (id e) {}
+    @try { NSString *a = v.accessibilityValue; if (a.length) return a; } @catch (id e) {}
+    return nil;
+}
+
+// parentTxt：父 view 已经输出过的文本。容器常把子控件的文字抄到自己的
+// accessibilityLabel 上，不去重的话快手这种深树会刷出满屏重复行。
+static NSString *AITextListD(UIView *v, int depth, int maxDepth, NSString *parentTxt) {
     NSMutableString *m = [NSMutableString string];
     CGRect ab = CGRectZero;
     @try { ab = [v convertRect:v.bounds toView:nil]; } @catch (id e) {}
-    NSString *txt = nil;
-    if ([v isKindOfClass:[UILabel class]]) {
-        txt = ((UILabel *)v).text;
-    } else if ([v isKindOfClass:[UIButton class]]) {
-        UIButton *b = (UIButton *)v;
-        txt = b.titleLabel.text ?: [b currentTitle];
-    } else if ([v isKindOfClass:[UITextField class]]) {
-        txt = ((UITextField *)v).text ?: ((UITextField *)v).placeholder;
-    } else if ([v isKindOfClass:[UITextView class]]) {
-        txt = ((UITextView *)v).text;
-    }
-    if (!txt.length) { NSString *a = v.accessibilityLabel; if (a.length) txt = a; }
-    if (txt.length) {
-        for (int i = 0; i < depth; i++) [m appendString:@"  "];
-        [m appendFormat:@"%@ @ (%.0f,%.0f,%.0f,%.0f) %@\n", txt,
-         ab.origin.x, ab.origin.y, ab.size.width, ab.size.height, NSStringFromClass([v class])];
+    NSString *txt = AITextOfView(v);
+    // 只看屏幕内的：离屏/零尺寸的控件坐标没意义，还会把结果刷爆
+    BOOL onScreen = (ab.size.width > 0 && ab.size.height > 0 &&
+                     ab.origin.y < 900 && ab.origin.y + ab.size.height > -60);
+    if (txt.length && onScreen && ![txt isEqualToString:parentTxt]) {
+        NSString *oneLine = [txt stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+        if (oneLine.length > 60) oneLine = [oneLine substringToIndex:60];
+        [m appendFormat:@"(%d) %.0f,%.0f %.0fx%.0f | %@\n",
+         depth, ab.origin.x, ab.origin.y, ab.size.width, ab.size.height, oneLine];
     }
     if (depth >= maxDepth) return m;
-    for (UIView *c in v.subviews) [m appendString:AITextList(c, depth + 1, maxDepth)];
+    NSString *pass = txt.length ? txt : parentTxt;
+    for (UIView *c in v.subviews) [m appendString:AITextListD(c, depth + 1, maxDepth, pass)];
     return m;
+}
+
+static NSString *AITextList(UIView *v, int depth, int maxDepth) {
+    return AITextListD(v, depth, maxDepth, nil);
 }
 
 static void AIServeFd(int fd) {
@@ -2279,6 +2366,22 @@ static void AIExecCmd(NSDictionary *cmd) {
             txt = f;
         }
         AIReportDict(@{@"op": @"text", @"ok": @YES, @"text": txt});
+    } else if ([op isEqualToString:@"update"]) {      // v20：推一份新 dylib 到手机上
+        NSString *r = AIUpdateFrom(cmd[@"url"], cmd[@"ver"]);
+        AILog(@"  [cmd] update -> %@", r);
+        AIReportDict(@{@"op": @"update", @"ok": @([r hasPrefix:@"已装"]), @"txt": r});
+    } else if ([op isEqualToString:@"core"]) {        // v20：本地已缓存的 core 一览
+        NSString *dir = AICoreDir() ?: @"(无)";
+        NSString *have = AINewerCorePath();
+        NSArray *fs = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
+        AIReportDict(@{@"op": @"core", @"ok": @YES, @"ver": kAIVer, @"dir": dir,
+                       @"files": fs ?: @[], @"pending": have ?: @""});
+    } else if ([op isEqualToString:@"ball"]) {        // v20：悬浮球显隐
+        BOOL on = cmd[@"on"] ? ([cmd[@"on"] intValue] != 0) : YES;
+        AISetFlag(@"ball", on);
+        if (on) { gFloatExpanded = NO; }
+        AIFloatApply();
+        AIReportDict(@{@"op": @"ball", @"ok": @YES, @"visible": @(on)});
     } else if ([op isEqualToString:@"overlay"]) {
         id ov = cmd[@"on"];
         BOOL vis = ov ? ([ov intValue] != 0) : NO;
@@ -2657,6 +2760,8 @@ static void AIHudApply(void) {
             gHudLabel.text = AIHudText();
             gHudLabel.textColor = (gPollOK > 0) ? [UIColor greenColor]
                                 : ((gPollErr > 0) ? [UIColor redColor] : [UIColor yellowColor]);
+            // v20：顺手把悬浮球上的心跳数字也刷一下（内部有 1.5s 节流）
+            @try { AIFloatApply(); } @catch (id e) {}
         } @catch (NSException *e) {}
     });
 }
@@ -2962,9 +3067,12 @@ static void AIBoot(void) {
     gBooted = YES;
     AILog(@"########## AgentInject2 boot ##########");
     AILog(@"boot 触发来源: %@", gBootSrc);
-    // 一进来就先盖一层「已加载」，让你立刻能确认 dylib 到底跑没跑；
-    // 自检跑完再刷新成完整报告（带复制按钮）。
-    AIShowOverlayText(@"AgentInject2 已加载 ✓\n正在自检，请稍候…", NO, nil);
+    // v20：默认不再糊一层全屏盖屏（用户吐槽太碍事），只挂一个可拖动的小悬浮球。
+    // 想要全屏诊断报告的，在悬浮球面板里把「诊断盖屏」打开。
+    @try { AIFloatApply(); } @catch (NSException *e) { AILog(@"float 异常 %@", e); }
+    if (AIFlag(@"sw1", NO)) AIShowOverlayText(@"AgentInject2 已加载 ✓\n正在自检，请稍候…", NO, nil);
+    // 后台看看仓库里有没有比我新的版本（有就先下下来，下次重开 App 生效）
+    if (AIFlag(@"autoupd", YES)) { @try { AICheckUpdateAsync(); } @catch (NSException *e) {} }
 
     @try { AIEnv(); }          @catch (NSException *e) { AILog(@"env 异常 %@", e); }
     // ★ 网络尽早起来：放在耗时的 HID 矩阵测试之前。
@@ -3003,7 +3111,8 @@ static void AIBoot(void) {
                   gBestTap, gBestShot, gMonHits, gSendEventHits, gTargetHits, gActionHits);
             if (gSrvPort) AILog(@"########## 控制: http://%@:%d/status ##########", gSrvIp ?: @"?", gSrvPort);
             @try { AIWriteReport(); } @catch (NSException *e) {}
-            @try { AIShowOverlay(); } @catch (NSException *e) {}
+            @try { AIFloatApply(); }  @catch (NSException *e) {}
+            if (AIFlag(@"sw1", NO)) { @try { AIShowOverlay(); } @catch (NSException *e) {} }
         });
     });
 }
@@ -3021,6 +3130,306 @@ static void AINotifyCb(CFNotificationCenterRef c, void *o, CFStringRef n,
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 14b. v20：内置更新（OTA）—— 注入一次，以后我推新版你只要重开 App
+//
+//   背景：用户受够了「每改一版就要 TrollFools 重新注入一遍」。
+//
+//   机制（两阶段，进程内不卸载旧 dylib）：
+//     ① 注入进去的这份 dylib 自己就是一个「引导器」：启动时去沙盒
+//        Documents/agentcore/ 里翻一翻，如果有【版本比自己新】的
+//        AgentInject2-vNN.dylib，就 dlopen 它、调它的 AgentCoreStart，
+//        然后自己直接退场（不装 hook、不起网络线程）。
+//     ② 新 dylib 从哪来？两条路：
+//        - 我主动下发 {"op":"update","ver":"21","url":"..."} 让它下载；
+//        - 它自己每次启动顺手问一句仓库里的 version.json，有新版就下载，
+//          下一次冷启动自动接管。
+//    因为不卸载旧副本，同一进程里「热切换」会让两份代码同时跑（两个心跳），
+//    所以这里刻意选择【下载后下次启动生效】—— 换来的好处是零风险：
+//    下载完先 dlopen 校验一遍，加载不了就丢弃，绝不会把 App 搞崩。
+// ---------------------------------------------------------------------------
+static NSString *AICoreDir(void) {
+    NSArray *ps = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    if (!ps.count) return nil;
+    NSString *d = [ps.firstObject stringByAppendingPathComponent:@"agentcore"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:d
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    return d;
+}
+
+// "v20" / "AgentInject2-v21.dylib" -> 20 / 21
+static int AIVerNum(NSString *s) {
+    int n = 0; BOOL dig = NO;
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if (c >= '0' && c <= '9') { dig = YES; n = n * 10 + (int)(c - '0'); }
+        else if (dig) break;
+    }
+    return n;
+}
+
+// 本地缓存里有没有比我新的 core？有就返回它的路径
+static NSString *AINewerCorePath(void) {
+    NSString *dir = AICoreDir();
+    if (!dir) return nil;
+    int my = AIVerNum(kAIVer);
+    NSArray *fs = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
+    int best = my; NSString *bp = nil;
+    for (NSString *f in fs) {
+        if (![f hasPrefix:@"AgentInject2-v"] || ![f hasSuffix:@".dylib"]) continue;
+        int n = AIVerNum(f);
+        if (n > best) { best = n; bp = [dir stringByAppendingPathComponent:f]; }
+    }
+    return bp;
+}
+
+// 把活交给本地更新的那份 core，自己不再初始化
+static BOOL AIHandoffToNewer(void) {
+    static BOOL done = NO;
+    if (done) return YES;                       // +load 和 constructor 会各调一次
+    NSString *p = AINewerCorePath();
+    if (!p) return NO;
+    void *h = dlopen([p fileSystemRepresentation], RTLD_NOW);
+    if (!h) { AILog(@"  ⚠️ 新版 %@ 加载失败: %s", p.lastPathComponent, dlerror() ?: ""); return NO; }
+    void (*start)(void) = dlsym(h, "AgentCoreStart");
+    if (!start) { AILog(@"  ⚠️ 新版 %@ 里没有 AgentCoreStart", p.lastPathComponent); return NO; }
+    done = YES;
+    AILog(@"★ 内置更新：本机 v%@ -> %@，本副本退场", kAIVer, p.lastPathComponent);
+    @try { start(); } @catch (NSException *e) { AILog(@"  新版启动异常 %@", e); }
+    return YES;
+}
+
+// 被引导器 dlopen 进来时的入口（必须是 default visibility，否则 dlsym 找不到）
+__attribute__((visibility("default")))
+void AgentCoreStart(void) { AIInstall(); }
+
+// 下载一份新 core：先存临时文件 → dlopen 校验能不能加载 → 通过才转正
+static NSString *AIUpdateFrom(NSString *urlStr, NSString *ver) {
+    if (!urlStr.length || !ver.length) return @"缺少 url / ver";
+    NSData *d = nil; NSInteger code = 0;
+    BOOL ok = AIHttpEx(urlStr, nil, 40.0, YES, nil, &d, nil, &code, nil);
+    if (!ok || !d.length) return [NSString stringWithFormat:@"下载失败 (code=%d, %luB)",
+                                  (int)code, (unsigned long)d.length];
+    if (code >= 400) return [NSString stringWithFormat:@"HTTP %d", (int)code];
+    if (d.length < 20000) return [NSString stringWithFormat:@"文件太小(%luB)，不像 dylib", (unsigned long)d.length];
+
+    NSString *dir = AICoreDir();
+    if (!dir) return @"拿不到 Documents 目录";
+    NSString *tmp = [dir stringByAppendingPathComponent:
+                     [NSString stringWithFormat:@"tmp-%d.dylib",
+                      (int)[[NSDate date] timeIntervalSince1970]]];
+    [d writeToFile:tmp atomically:YES];
+    void *h = dlopen([tmp fileSystemRepresentation], RTLD_NOW);   // ★ 先验证能加载
+    if (!h) {
+        NSString *err = [NSString stringWithUTF8String:dlerror() ?: "?"];
+        [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
+        return [@"校验失败(未生效): " stringByAppendingString:err];
+    }
+    dlclose(h);
+    NSString *dst = [dir stringByAppendingPathComponent:
+                     [NSString stringWithFormat:@"AgentInject2-v%@.dylib", ver]];
+    [[NSFileManager defaultManager] removeItemAtPath:dst error:nil];
+    NSError *e = nil;
+    [[NSFileManager defaultManager] moveItemAtPath:tmp toPath:dst error:&e];
+    if (e) return [@"落盘失败: " stringByAppendingString:e.localizedDescription];
+    return [NSString stringWithFormat:@"已装 v%@ (%luB)，重开 App 生效", ver, (unsigned long)d.length];
+}
+
+// 启动时顺手看看仓库里有没有新版（后台，失败就算了，下次启动还会再试）
+#define AI_MANIFEST @"https://raw.githubusercontent.com/857386461/poc-agent/master/version.json"
+static void AICheckUpdateAsync(void) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+        @autoreleasepool {
+            NSData *d = nil; NSInteger code = 0;
+            BOOL ok = AIHttpEx(AI_MANIFEST, nil, 20.0, YES, nil, &d, nil, &code, nil);
+            if (!ok || !d.length || code >= 400) return;
+            id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+            if (![j isKindOfClass:[NSDictionary class]]) return;
+            NSString *ver = [j objectForKey:@"ver"];
+            NSString *url = [j objectForKey:@"url"];
+            if (!ver.length || !url.length) return;
+            int nv = AIVerNum([NSString stringWithFormat:@"v%@", ver]);
+            if (nv <= AIVerNum(kAIVer)) return;                    // 不比我新
+            NSString *have = AINewerCorePath();
+            if (have && AIVerNum(have) >= nv) return;              // 已经下过了
+            NSString *r = AIUpdateFrom(url, [NSString stringWithFormat:@"%d", nv]);
+            AILog(@"  自动更新: %@", r);
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 14c. v20：悬浮球 —— 用户吐槽「盖屏太碍事」，默认只留一个小圆点
+//
+//   小圆点可拖动，点一下展开面板：版本/心跳一览 + 几个开关。
+//   开关状态存 NSUserDefaults，重开 App 也记得住。
+// ---------------------------------------------------------------------------
+@interface AIFloatTarget : NSObject
+@end
+@implementation AIFloatTarget
+- (void)ballTapped:(id)sender {
+    gFloatExpanded = !gFloatExpanded;
+    gFloatForce = YES;                  // 点了就要立刻响应，别被节流挡住
+    AIFloatApply();
+}
+- (void)ballDragged:(UIPanGestureRecognizer *)g {
+    if (!gFloatWindow) return;
+    CGPoint t = [g translationInView:gFloatWindow];
+    [g setTranslation:CGPointZero inView:gFloatWindow];
+    UIView *ball = [gFloatWindow viewWithTag:701];
+    if (!ball) return;
+    CGSize sc = [UIScreen mainScreen].bounds.size;
+    CGFloat x = MIN(MAX(ball.center.x + t.x, 30), sc.width  - 30);
+    CGFloat y = MIN(MAX(ball.center.y + t.y, 90), sc.height - 90);
+    ball.center = CGPointMake(x, y);
+    if (g.state == UIGestureRecognizerStateEnded) {
+        AISetFlag(@"fx", (x - 30) / MAX(1, sc.width  - 60));
+        AISetFlag(@"fy", (y - 90) / MAX(1, sc.height - 180));
+        // 位置存成 0~1 的比例，换机型/转屏也不会跑到屏幕外
+        [[NSUserDefaults standardUserDefaults] setFloat:(float)((x - 30) / MAX(1, sc.width  - 60)) forKey:AIK(@"fpx")];
+        [[NSUserDefaults standardUserDefaults] setFloat:(float)((y - 90) / MAX(1, sc.height - 180)) forKey:AIK(@"fpy")];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+    }
+}
+- (void)sw:(UISwitch *)s {
+    NSString *k = [NSString stringWithFormat:@"sw%d", (int)s.tag];
+    BOOL on = s.isOn;
+    AISetFlag(k, on);
+    if (s.tag == 0) { AISetHudVisible(on); AILog(@"  状态条: %@", on ? @"开" : @"关"); }
+    if (s.tag == 1) { AISetOverlayVisible(on); AILog(@"  诊断盖屏: %@", on ? @"开" : @"关"); }
+    if (s.tag == 3) { AISetFlag(@"autoupd", on); AILog(@"  自动更新: %@", on ? @"开" : @"关"); }
+    gFloatForce = YES;
+    AIFloatApply();
+}
+- (void)collapse:(id)sender { gFloatExpanded = NO; gFloatForce = YES; AIFloatApply(); }
+- (void)hideBall:(id)sender {
+    AISetFlag(@"ball", NO);
+    gFloatForce = YES;
+    AIFloatApply();
+    AIToast(@"悬浮球已隐藏（发 ball=1 找回）");
+}
+@end
+static AIFloatTarget *gFT = nil;
+
+static void AIFloatApply(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ AIFloatApply(); });
+        return;
+    }
+    // 心跳每秒都在调，别把 UI 重绘也拖成每秒一次
+    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (!gFloatForce && now - gFloatLast < 1.5) return;
+    gFloatLast = now; gFloatForce = NO;
+    @try {
+        UIApplication *app = [UIApplication sharedApplication];
+        if (!app) return;
+        if (!gFT) gFT = [AIFloatTarget new];
+        CGSize sc = [UIScreen mainScreen].bounds.size;
+
+        if (!gFloatWindow) {
+            UIWindowScene *scn = AIFirstWindowScene();
+            if (scn) gFloatWindow = [[UIWindow alloc] initWithWindowScene:scn];
+            else     gFloatWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+            gFloatWindow.windowLevel = UIWindowLevelStatusBar + 900;
+            gFloatWindow.backgroundColor = [UIColor clearColor];
+            gFloatWindow.rootViewController = [UIViewController new];
+            gFloatWindow.rootViewController.view.backgroundColor = [UIColor clearColor];
+        }
+        UIView *host = gFloatWindow.rootViewController.view;
+        for (UIView *v in host.subviews) [v removeFromSuperview];
+
+        BOOL want = AIFlag(@"ball", YES);
+        gFloatWindow.hidden = !want;
+        if (!want) return;
+
+        float px = [[NSUserDefaults standardUserDefaults] floatForKey:AIK(@"fpx")];
+        float py = [[NSUserDefaults standardUserDefaults] floatForKey:AIK(@"fpy")];
+        if (px <= 0 && py <= 0) { px = 0.86f; py = 0.42f; }        // 默认右侧中间
+        CGPoint c = CGPointMake(30 + px * (sc.width - 60), 90 + py * (sc.height - 180));
+
+        if (!gFloatExpanded) {
+            gFloatWindow.frame = CGRectMake(c.x - 30, c.y - 30, 60, 60);
+            UIView *ball = [[UIView alloc] initWithFrame:CGRectMake(2, 2, 56, 56)];
+            ball.tag = 701;
+            ball.layer.cornerRadius = 28;
+            ball.layer.masksToBounds = YES;
+            ball.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.62];
+            UILabel *lb = [[UILabel alloc] initWithFrame:ball.bounds];
+            lb.text = [NSString stringWithFormat:@"%@\n%d", kAIVer, gCmdGot];
+            lb.numberOfLines = 2; lb.textAlignment = NSTextAlignmentCenter;
+            lb.font = [UIFont boldSystemFontOfSize:13];
+            lb.textColor = (gPollErr > 0 && gPollOK == 0) ? [UIColor systemRedColor]
+                                                          : [UIColor systemGreenColor];
+            [ball addSubview:lb];
+            [ball addGestureRecognizer:[[UITapGestureRecognizer alloc]
+                                        initWithTarget:gFT action:@selector(ballTapped:)]];
+            UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
+                                           initWithTarget:gFT action:@selector(ballDragged:)];
+            [ball addGestureRecognizer:pan];
+            [host addSubview:ball];
+        } else {
+            CGFloat w = 250, h = 300;
+            CGFloat ox = MIN(MAX(c.x - w / 2, 8), sc.width  - w - 8);
+            CGFloat oy = MIN(MAX(c.y - h / 2, 80), sc.height - h - 8);
+            gFloatWindow.frame = CGRectMake(ox, oy, w, h);
+            UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
+            panel.layer.cornerRadius = 14; panel.layer.masksToBounds = YES;
+            panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.86];
+
+            UILabel *ti = [[UILabel alloc] initWithFrame:CGRectMake(12, 8, w - 60, 22)];
+            ti.text = [NSString stringWithFormat:@"AgentInject2 %@", kAIVer];
+            ti.textColor = [UIColor whiteColor]; ti.font = [UIFont boldSystemFontOfSize:14];
+            [panel addSubview:ti];
+            UIButton *cx = [UIButton buttonWithType:UIButtonTypeSystem];
+            cx.frame = CGRectMake(w - 46, 6, 40, 26);
+            [cx setTitle:@"收起" forState:UIControlStateNormal];
+            [cx addTarget:gFT action:@selector(collapse:) forControlEvents:UIControlEventTouchUpInside];
+            [panel addSubview:cx];
+
+            UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, 32, w - 24, 34)];
+            st.numberOfLines = 2; st.font = [UIFont systemFontOfSize:11];
+            st.textColor = [UIColor lightGrayColor];
+            st.text = [NSString stringWithFormat:@"%@  心跳✅%d❌%d 指令%d\n%@",
+                       gProcName ?: @"?", gPollOK, gPollErr, gCmdGot,
+                       (gLastErrText.length ? [@"最近错误: " stringByAppendingString:gLastErrText]
+                                            : @"中继已连接")];
+            [panel addSubview:st];
+
+            NSArray *items = @[@"顶端状态条", @"诊断盖屏(全屏)", @"隐藏悬浮球", @"自动检查更新"];
+            for (int i = 0; i < (int)items.count; i++) {
+                CGFloat y = 78 + i * 40;
+                UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(12, y, 150, 30)];
+                l.text = items[i]; l.textColor = [UIColor whiteColor];
+                l.font = [UIFont systemFontOfSize:13];
+                [panel addSubview:l];
+                if (i == 2) {
+                    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+                    b.frame = CGRectMake(w - 76, y, 64, 30);
+                    [b setTitle:@"隐藏" forState:UIControlStateNormal];
+                    [b addTarget:gFT action:@selector(hideBall:) forControlEvents:UIControlEventTouchUpInside];
+                    [panel addSubview:b];
+                } else {
+                    UISwitch *s = [[UISwitch alloc] initWithFrame:CGRectMake(w - 66, y, 51, 30)];
+                    s.tag = i;
+                    s.on = AIFlag([NSString stringWithFormat:@"sw%d", i],
+                                  i == 0 ? YES : (i == 3 ? YES : NO));
+                    [s addTarget:gFT action:@selector(sw:) forControlEvents:UIControlEventValueChanged];
+                    [panel addSubview:s];
+                }
+            }
+            UILabel *ft = [[UILabel alloc] initWithFrame:CGRectMake(12, h - 40, w - 24, 32)];
+            ft.numberOfLines = 2; ft.font = [UIFont systemFontOfSize:10];
+            ft.textColor = [UIColor darkGrayColor];
+            NSString *np = AINewerCorePath();
+            ft.text = np ? [NSString stringWithFormat:@"待生效新版: %@", np.lastPathComponent]
+                         : @"已是最新（更新会自动下载）";
+            [panel addSubview:ft];
+            [host addSubview:panel];
+        }
+        gFloatWindow.hidden = NO;
+    } @catch (NSException *e) { AILog(@"悬浮球异常 %@", e); }
+}
+
 // 15. 入口：constructor + ObjC +load 双保险
 //
 //  ★ 重要发现（本机实测）：用 Xcode 26 SDK 编译出来的 dylib 里【没有】
@@ -3039,6 +3448,10 @@ static void AIInstall(void) {
     if (!gLog) { gLog = [NSMutableString new]; gLogLock = [NSLock new]; }
     if ([gBootSrc isEqualToString:@"?"]) gBootSrc = @"load/constructor";
     AILog(@"install enter pid=%d", getpid());
+
+    // v20：本地有更新的 core 就让它接管，本副本不装 hook、不起网络线程。
+    // 这样以后升级不用再 TrollFools 重新注入 —— 重开 App 即可。
+    if (AIHandoffToNewer()) return;
 
     // 落一个「已加载」标记文件，用于判断 dylib 到底有没有被 dyld 装载
     @try {
