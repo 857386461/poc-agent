@@ -1,0 +1,63 @@
+name: Build HLProbe dylib
+
+# 老贝贝底座运行时探针。与 build_inject2.yml 完全独立：
+# 只编 HLProbe.m，不碰 AgentInject2.m —— 避免和并行会话的改动互相覆盖。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build HLProbe
+        run: |
+          set -o pipefail
+          chmod +x build_hlprobe.sh
+          bash build_hlprobe.sh 2>&1 | tee /tmp/hlprobe_build.txt
+
+      - name: Ad-hoc sign
+        if: success()
+        run: |
+          codesign --force --sign - build_hl/HLProbe.dylib 2>&1 | tail -3 || \
+            ldid -S build_hl/HLProbe.dylib 2>&1 | tail -3 || true
+          codesign -dv build_hl/HLProbe.dylib 2>&1 | head -3 || true
+
+      - name: Upload artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HLProbe.dylib
+          path: build_hl/HLProbe.dylib
+
+      - name: Publish release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="hlprobe-${{ github.run_number }}"
+          gh release create "$TAG" \
+            build_hl/HLProbe.dylib \
+            build_hl/HLProbe.zip \
+            --title "HLProbe dylib $TAG" \
+            --notes "TrollFools 注入任意 App → 等 5 秒出探针界面 → 先手动点中间按钮看计数 +1 → 点「自动遍历」跑完 18 种组合 → 点「取色」验 RGB"
+
+      - name: Upload build log on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="hlprobelog-${{ github.run_number }}"
+          gh release delete "$TAG" -y 2>/dev/null || true
+          grep -nE "(error|fatal|ld:|clang:)" /tmp/hlprobe_build.txt | head -60 > /tmp/errs.txt
+          B64=$( { echo "=== ERROR LINES ==="; cat /tmp/errs.txt;
+                   echo "=== TAIL ==="; tail -c 2000 /tmp/hlprobe_build.txt; } | base64 | tr -d '\n')
+          gh release create "$TAG" \
+            --title "HLProbe build log $TAG" \
+            --notes "编译失败日志（base64）:
+          $B64" || true
