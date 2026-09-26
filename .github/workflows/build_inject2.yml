@@ -22,6 +22,16 @@ jobs:
           bash build_inject2.sh 2>&1 | tee /tmp/dylib_build.txt
           echo "BUILD_OK_MARK=$(grep -c BUILD_OK /tmp/dylib_build.txt)" >> $GITHUB_OUTPUT
 
+      - name: Ad-hoc sign (OTA 需要)
+        if: success()
+        run: |
+          # 手机 OTA 下载的 dylib 要过 dlopen：未签名的会被 AMFI 拒
+          # ("code signature invalid")。ad-hoc 签名让签名槽有效。
+          codesign --force --sign - build/AgentInject2.dylib 2>&1 | tail -3 || \
+            ldid -S build/AgentInject2.dylib 2>&1 | tail -3 || true
+          codesign -dv build/AgentInject2.dylib 2>&1 | head -3 || true
+          ls -la build/AgentInject2.dylib
+
       - name: Upload dylib
         if: success()
         uses: actions/upload-artifact@v4
