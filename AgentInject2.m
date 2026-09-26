@@ -167,6 +167,9 @@ static BOOL AIFakeSwipe(CGPoint a, CGPoint b, int steps, double dur);
 static void AIMainSync(void (^b)(void));
 static NSString *AITreeOf(UIView *v, int depth, int maxDepth);
 static NSString *AITextList(UIView *v, int depth, int maxDepth);  // v19：读界面文本（陌生 App 导航刚需）
+static BOOL AIBudgetTake(void);                      // v23：额度控制，定义在 ~2340 行
+static NSArray *AIHostWindows(void);                 // v23：候选窗口列表（AIHitAtPoint 提前用）
+static UIView *AIHitAtPoint(CGPoint pt);             // v23：跨窗口命中测试
 static NSDictionary *AIScrollAt(CGPoint pt, double dy, double dx, BOOL anim);  // v17
 static NSString *AIBack(void);                  // v18：AIRunMacro(~1057) 在它定义之前要调用
 static NSString *AINavInfo(void);               // v18
@@ -1372,7 +1375,9 @@ static NSDictionary *AIPickByText(NSString *kw) {
                 [cands addObject:c];
         }
     }
-    if (!cands.count) return @{@"ok": @NO, @"err": [@"没找到含文本的行: " stringByAppendingString:kw], @"cands": @0};
+    // v23：一个标准 Cell 都没找到 —— 快手侧边栏这种自绘 UI 走这条路。
+    //      直接按文字在界面上定位控件，再沿父链触发 tap 手势。
+    if (!cands.count) return AIPickTextViaGesture(kw);
     UIView *best = nil; CGFloat by = 1e9;
     for (UIView *c in cands) {
         CGFloat y = CGRectGetMinY([c convertRect:c.bounds toView:nil]);
@@ -2822,7 +2827,8 @@ static void AIExecCmd(NSDictionary *cmd) {
                 int old = gWinIdx; gWinIdx = wi;
                 UIWindow *w = AIHostWindow();
                 gWinIdx = old;
-                if (w) txt = AITextList(w, 0, 40);
+                AIBudgetReset(2500);        // v23：快手单页上千 view，必须设上限
+                if (w) txt = AITextList(w, 0, 30);
             } @catch (id e) {}
         });
         if (kw.length) {
@@ -2905,7 +2911,7 @@ static void AIExecCmd(NSDictionary *cmd) {
     } else if ([op isEqualToString:@"rows"]) {
         // v15：一眼看清屏幕上有哪些表格行 + 每行的屏幕中心点
         __block NSString *s = @"(none)";
-        AIMainSync(^{ @try { s = AIRowsInfo(); } @catch (id e) {} });
+        AIMainSync(^{ @try { AIBudgetReset(3000); s = AIRowsInfo(); } @catch (id e) {} });
         AIReportDict(@{@"op": @"rows", @"ok": @YES, @"text": s});
         AILog(@"  [cmd] rows -> %lu 行", (unsigned long)[s componentsSeparatedByString:@"\n"].count);
     } else if ([op isEqualToString:@"pick"]) {
@@ -2919,7 +2925,7 @@ static void AIExecCmd(NSDictionary *cmd) {
         // v15：按文本选中一行 —— 走位最省事的一条指令
         NSString *kw = cmd[@"text"] ?: @"";
         __block NSDictionary *d = nil;
-        AIMainSync(^{ @try { d = AIPickByText(kw); } @catch (id e) {} });
+        AIMainSync(^{ @try { AIBudgetReset(3000); d = AIPickByText(kw); } @catch (id e) {} });
         AILog(@"  [cmd] picktxt '%@' -> %@", kw, d);
         AIReportDict(@{@"op": @"picktxt", @"text": kw, @"info": d ?: @{@"err": @"picktxt 返回 nil"}});
     } else if ([op isEqualToString:@"macro"]) {
