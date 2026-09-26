@@ -107,10 +107,22 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v34";   // v33 = v32（罩层真源自愈）+ 悬浮球自愈/可观测（治「球不见了」）+ wininfo 体检（版本自报 built/lib/ops + UI 三层任务态）+ 罩层真源自愈（治 idle 也挡屏 / overlay off 关不掉）
+static NSString * const kAIVer = @"v35";   // v35 = v34 + G13 轮询看门狗自愈（轮询线程 hang 死时自动起新一代，不用再杀进程重开）+ 主线程卡死探测；status 新增 wd{} 可观测
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
+// ---- v35：G13 轮询看门狗 ----
+// 坑：轮询线程偶尔 hang 死（卡在 NSURLSession 里不回），从此命令全不回执、
+// 心跳也停，唯一恢复办法是杀进程重开 —— 用户在外面根本不知道发生了什么。
+// 做法：轮询线程每完成一趟就打一个 tick；看门狗发现 tick 超过 WD_HANG_SEC 没动，
+// 就起一条「新一代」轮询线程接管，旧线程若哪天醒过来发现代次变了自行退出。
+#define AI_WD_HANG_SEC  45.0     // 一趟最长 2.5s(gap)+8s(超时)=10.5s，45s 足够宽松（后台挂起也容许）
+#define AI_WD_MAX_RETRY 8        // 自愈重启上限，防止线程泄漏式暴涨
+static volatile double gPollTick  = 0;    // 轮询线程最后一次「走完一趟」的时刻
+static volatile int32_t gPollGen  = 0;    // 轮询线程代次（只有最新一代继续跑）
+static volatile int32_t gPollRst  = 0;    // 看门狗已重启过几次
+static volatile double gMainTick  = 0;    // 主线程最后一次响应看门狗 ping 的时刻
+static volatile double gMainLag   = 0;    // 主线程卡了多久（秒），0 = 正常
 static long             gLastErrCode = 0;
 static NSString        *gLastErrText = nil;
 static NSString        *gToastText   = nil;   // 我从中继下发的一句话
@@ -3709,6 +3721,12 @@ static void AIExecCmd(NSDictionary *cmd) {
                        @"overlay": (gOverlayWindow && !gOverlayWindow.hidden) ? @"on" : @"off",
                        // v30 UI 三层：task{}/ui{} 是唯一状态源（旧字段保留供诊断，不进屏）
                        @"busy": @(gBusy),
+                       // v35：G13 看门狗可观测 —— gen=轮询线程第几代 / rst=自愈重启过几次 /
+                       //      age=轮询 tick 多少秒没动 / mainLag=主线程卡了多少秒
+                       @"wd": @{@"gen": @(gPollGen), @"rst": @(gPollRst),
+                                @"age": @((long long)(gPollTick > 0
+                                          ? ([[NSDate date] timeIntervalSince1970] - gPollTick) : -1.0)),
+                                @"mainLag": @((long long)gMainLag)},
                        @"task": AITaskDict(),
                        @"ui":   AIUiDict()});
     } else if ([op isEqualToString:@"log"]) {
@@ -3849,56 +3867,21 @@ static BOOL gNetStarted = NO;
 static double gPollGap = 2.0;
 static double gLastBeat = 0;
 
-static void AINetLoop(void) {
-    if (gNetStarted) return;    // 幂等：早期先起一次网络，后面再调不会重复启动
-    gNetStarted = YES;
-    AILog(@"==== [6] 控制通道 ====");
-
-    // 开机先做一次裸 TCP 探测，结论直接写到状态条上 —— 不用等用户点任何按钮。
-    // 这样即使 NSURLSession 全程 -1009，我也能立刻知道 TCP 层到底通不通。
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        @autoreleasepool {
-            NSString *t1 = AITcpTest("49.233.240.214", 443, 6.0);
-            NSString *t2 = AITcpTest("220.181.38.148", 443, 6.0);
-            gDiagText = [NSString stringWithFormat:@"⓪裸TCP 中继%@ 百度%@", t1, t2];
-            AILog(@"  [0c] 裸 TCP 探测: 中继(%@) 百度(%@)", t1, t2);
-            AIHudApply();
-        }
-    });
-    @try { AIStartServer(); AISleep(0.6); } @catch (NSException *e) { AILog(@"  服务启动异常 %@", e); }  // 等端口真正 bind 上再打印
-    gBase = AIBase();
-    gActiveBase = gBase;
-    AILog(@"  版本=%@ 中继: %@", kAIVer, gBase);
-    if ([gBase containsString:@"invalid"]) { AILog(@"  地址无效，轮询不启动"); AIHudApply(); return; }
-
-    // 后台任务：锁屏/切走后尽量多撑一会儿，别一退后台就断线
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @try {
-            UIApplication *ap = [UIApplication sharedApplication];
-            gBgTask = [ap beginBackgroundTaskWithName:@"AIPoll" expirationHandler:^{
-                @try { if (gBgActive) [ap endBackgroundTask:gBgTask]; } @catch (id e) {}
-                gBgActive = NO; gBgTask = 0;
-            }];
-            gBgActive = (gBgTask != 0);
-            AILog(@"  后台任务: %@", gBgActive ? @"已申请（锁屏后能多撑一会儿）" : @"申请失败");
-        } @catch (id e) {}
-    });
-
-    AIHudApply();
-    AIHudTickLoop();
-
-    // 上线即报到：我在中继那边 GET /peek 就能看到这台设备的 dev id
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
-        AIReportDict(@{@"op": @"hello", @"proc": gProcName, @"bundle": gBundleId,
-                       @"pid": @(getpid()), @"ver": kAIVer, @"tap": @(gBestTap), @"shot": @(gBestShot),
-                       @"tvhits": @(gTargetHits), @"act": @(gActionHits)});
-        AILog(@"  已向中继报到 dev=%@  中继=%@", gDevId, gBase);
-    });
+// v35：轮询循环独立成函数 —— 看门狗要能在不重跑 AINetLoop（裸 TCP 探测 / hello
+// 报到 / 起本地服务）的前提下，单独把这一条线程换掉。
+static void AIPollLoop(void) {
+    int32_t myGen = __sync_add_and_fetch((int32_t *)&gPollGen, 1);
+    gPollTick = [[NSDate date] timeIntervalSince1970];
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
         int failRun = 0;
         while (1) {
             @autoreleasepool {
                 @try {
+                    // 被看门狗起的新一代取代了 —— 别再和新线程抢同一个命令队列
+                    if (myGen != gPollGen) {
+                        AILog(@"  轮询线程第%d代退出（已由第%d代接管）", myGen, gPollGen);
+                        return;
+                    }
                     NSString *u = [gActiveBase stringByAppendingFormat:@"/poll?dev=%@", gDevId];
                     NSError *pe = nil; NSData *d = nil;
                     BOOL ok = AIHttpEx(u, nil, 8.0,
@@ -3951,8 +3934,10 @@ static void AINetLoop(void) {
                     else        gPollGap = MIN(gPollGap * 1.7, 2.5);
                 } @catch (NSException *e) {}
             }
-            // beat 改成按时间（20 秒一次），不再按轮询次数 —— 次数会随 gap 变化而失控
             double now = [[NSDate date] timeIntervalSince1970];
+            gPollTick = now;                    // v35：看门狗的判活心跳
+            if (myGen != gPollGen) { AILog(@"  轮询线程第%d代退出", myGen); return; }
+            // beat 改成按时间（20 秒一次），不再按轮询次数 —— 次数会随 gap 变化而失控
             if (now - gLastBeat > 20) {
                 gLastBeat = now;
                 AIReportDict(@{@"op": @"beat", @"ver": kAIVer, @"tap": @(gBestTap), @"shot": @(gBestShot),
@@ -3961,6 +3946,92 @@ static void AINetLoop(void) {
             [NSThread sleepForTimeInterval:gPollGap];
         }
     });
+}
+
+// v35：G13 看门狗。两件事 ——
+//   ① 主线程卡死探测：每 5 秒 ping 一下主线程，回不来就记 lag（UI 卡死时命令也执行不了）；
+//   ② 轮询线程 hang 自愈：tick 超过 AI_WD_HANG_SEC 没动，就起新一代轮询线程接管。
+static void AIWatchdog(void) {
+    static BOOL wdStarted = NO;
+    if (wdStarted) return;
+    wdStarted = YES;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+        while (1) {
+            [NSThread sleepForTimeInterval:5.0];
+            @autoreleasepool {
+                double now = [[NSDate date] timeIntervalSince1970];
+                @try {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        gMainTick = [[NSDate date] timeIntervalSince1970];
+                    });
+                    if (gMainTick > 0) {
+                        gMainLag = now - gMainTick;
+                        if (gMainLag > 60.0)
+                            AILog(@"  🩺 主线程 %.0fs 没响应 ping（UI 卡死）", gMainLag);
+                    }
+                } @catch (NSException *e) {}
+                double age = (gPollTick > 0) ? (now - gPollTick) : 0.0;
+                if (gPollTick > 0 && age > AI_WD_HANG_SEC && gPollRst < AI_WD_MAX_RETRY) {
+                    int n = __sync_add_and_fetch((int32_t *)&gPollRst, 1);
+                    AILog(@"  🩺 G13 看门狗：轮询 %.0fs 没动静，判定 hang，起第 %d 代轮询线程",
+                          age, gPollGen + 1);
+                    AIReportDict(@{@"op": @"wd", @"ok": @YES, @"ver": kAIVer,
+                                   @"age": @((long long)age), @"restart": @(n)});
+                    @try { AIPollLoop(); } @catch (NSException *e) { AILog(@"  重启轮询异常 %@", e); }
+                }
+            }
+        }
+    });
+}
+
+static void AINetLoop(void) {
+    if (gNetStarted) return;    // 幂等：早期先起一次网络，后面再调不会重复启动
+    gNetStarted = YES;
+    AILog(@"==== [6] 控制通道 ====");
+
+    // 开机先做一次裸 TCP 探测，结论直接写到状态条上 —— 不用等用户点任何按钮。
+    // 这样即使 NSURLSession 全程 -1009，我也能立刻知道 TCP 层到底通不通。
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            NSString *t1 = AITcpTest("49.233.240.214", 443, 6.0);
+            NSString *t2 = AITcpTest("220.181.38.148", 443, 6.0);
+            gDiagText = [NSString stringWithFormat:@"⓪裸TCP 中继%@ 百度%@", t1, t2];
+            AILog(@"  [0c] 裸 TCP 探测: 中继(%@) 百度(%@)", t1, t2);
+            AIHudApply();
+        }
+    });
+    @try { AIStartServer(); AISleep(0.6); } @catch (NSException *e) { AILog(@"  服务启动异常 %@", e); }  // 等端口真正 bind 上再打印
+    gBase = AIBase();
+    gActiveBase = gBase;
+    AILog(@"  版本=%@ 中继: %@", kAIVer, gBase);
+    if ([gBase containsString:@"invalid"]) { AILog(@"  地址无效，轮询不启动"); AIHudApply(); return; }
+
+    // 后台任务：锁屏/切走后尽量多撑一会儿，别一退后台就断线
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            UIApplication *ap = [UIApplication sharedApplication];
+            gBgTask = [ap beginBackgroundTaskWithName:@"AIPoll" expirationHandler:^{
+                @try { if (gBgActive) [ap endBackgroundTask:gBgTask]; } @catch (id e) {}
+                gBgActive = NO; gBgTask = 0;
+            }];
+            gBgActive = (gBgTask != 0);
+            AILog(@"  后台任务: %@", gBgActive ? @"已申请（锁屏后能多撑一会儿）" : @"申请失败");
+        } @catch (id e) {}
+    });
+
+    AIHudApply();
+    AIHudTickLoop();
+
+    // 上线即报到：我在中继那边 GET /peek 就能看到这台设备的 dev id
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+        AIReportDict(@{@"op": @"hello", @"proc": gProcName, @"bundle": gBundleId,
+                       @"pid": @(getpid()), @"ver": kAIVer, @"tap": @(gBestTap), @"shot": @(gBestShot),
+                       @"tvhits": @(gTargetHits), @"act": @(gActionHits)});
+        AILog(@"  已向中继报到 dev=%@  中继=%@", gDevId, gBase);
+    });
+    // v35：轮询本体交给 AIPollLoop（看门狗可单独重启它），看门狗随后启动。
+    AIPollLoop();
+    AIWatchdog();
     AILog(@"  轮询已启动(%@) -> %@", kAIVer, gBase);
 }
 
