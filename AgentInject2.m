@@ -107,7 +107,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v25";
+static NSString * const kAIVer = @"v26";
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -644,6 +644,10 @@ static BOOL AITapInProcess(CGPoint pt) {
 - (NSSet *)allTouches                       { return self.aiTouches; }
 - (NSSet *)touchesForView:(UIView *)v       { return self.aiTouches; }
 - (NSSet *)touchesForWindow:(UIWindow *)w   { return self.aiTouches; }
+// v26：UIKit 的手势分发是真从 event 里取「与本手势关联的那组触摸」的
+//      （UIWindow.sendEvent: → _gestureRecognizersForEvent → touchesForGestureRecognizer:）。
+//      少了这条，伪造事件在 window 层分发时手势拿不到任何 touch，页面自然没反应。
+- (NSSet *)touchesForGestureRecognizer:(UIGestureRecognizer *)g { return self.aiTouches; }
 - (UIEventType)type                         { return UIEventTypeTouches; }
 - (UIEventSubtype)subtype                   { return UIEventSubtypeNone; }
 - (NSTimeInterval)timestamp                 { return self.aiTime; }
@@ -692,7 +696,15 @@ static BOOL AIDispatchFakeToView(UIView *target, CGPoint ptInTarget) {
 //   `-[UIGestureRecognizer touchesBegan/Moved/Ended:]`。
 //   UIGestureRecognizerSubclass.h 里这几个方法是公开的，子类化时本来就要重写。
 // ---------------------------------------------------------------------------
-static NSDictionary *AIGestureDirectTap(CGPoint pt) {
+// 参数：
+//   tvMode  触摸点的「归属 view」怎么选（RN 会拿 touch.view 去找 reactTag）
+//           0 = 手势所在的祖先 view（v25 行为）
+//           1 = 父链上第一个 RCT* 类 view（RN 页面推荐）★默认
+//           2 = hitTest 命中的那个 view
+//   mv     是否在 began / ended 之间插一拍 moved（默认 0，RN 的 Pressability
+//          见到 move 可能判定为滑动而取消点击）
+//   delayMs began 与 ended 之间的真实间隔（默认 60ms，让时间戳像真点击）
+static NSDictionary *AIGestureDirectTap(CGPoint pt, int tvMode, int mv, int delayMs) {
     UIWindow *w = AIHostWindow();
     if (!w) return @{@"ok": @NO, @"err": @"无 window"};
     UIView *hit = nil;
@@ -710,27 +722,54 @@ static NSDictionary *AIGestureDirectTap(CGPoint pt) {
         return @{@"ok": @NO, @"err": @"父链 22 层内无手势",
                  @"hit": NSStringFromClass(hit.class)};
 
-    CGPoint p = [w convertPoint:pt toView:gv];
+    // —— 选「触摸归属 view」——
+    UIView *tv = nil; int tvUp = -1;
+    if (tvMode == 2) { tv = hit; tvUp = 0; }
+    else if (tvMode == 1) {
+        UIView *c = hit; int i = 0;
+        while (c && i <= up) {
+            @try { if ([NSStringFromClass(c.class) hasPrefix:@"RCT"]) { tv = c; tvUp = i; break; } } @catch (id e) {}
+            c = c.superview; i++;
+        }
+    }
+    if (!tv) { tv = gv; tvUp = up; }
+
     AIFakeTouch *t = [AIFakeTouch new];
-    t.aiPoint = p; t.aiView = gv; t.aiWindow = w;
-    t.aiTime = [[NSDate date] timeIntervalSince1970];
+    t.aiView = tv; t.aiWindow = w;
+    // 坐标统一存【相对 tv】；locationInView:nil 会自动换算回 window 坐标（v25 修的那条）
+    t.aiPoint = [w convertPoint:pt toView:tv];
+    t.aiTime  = [[NSDate date] timeIntervalSince1970];
+
     AIFakeEvent *ev = [AIFakeEvent new];
     NSSet *one = [NSSet setWithObject:t];
     ev.aiTouches = one; ev.aiTime = t.aiTime;
 
     NSMutableArray *fired = [NSMutableArray array];
+    NSMutableArray *errs  = [NSMutableArray array];
     @try {
         t.aiPhase = UITouchPhaseBegan;
-        for (UIGestureRecognizer *gr in grs) { @try { [gr touchesBegan:one withEvent:ev]; } @catch (id e) {} }
-        t.aiPhase = UITouchPhaseMoved;
-        for (UIGestureRecognizer *gr in grs) { @try { [gr touchesMoved:one withEvent:ev]; } @catch (id e) {} }
+        for (UIGestureRecognizer *gr in grs) {
+            @try { [gr touchesBegan:one withEvent:ev]; }
+            @catch (NSException *e) { [errs addObject:[NSString stringWithFormat:@"began:%@", e.reason ?: @"?"]]; }
+        }
+        if (delayMs > 0) usleep((useconds_t)(delayMs * 1000));
+        if (mv) {
+            t.aiPhase = UITouchPhaseMoved;
+            for (UIGestureRecognizer *gr in grs) {
+                @try { [gr touchesMoved:one withEvent:ev]; }
+                @catch (NSException *e) { [errs addObject:[NSString stringWithFormat:@"moved:%@", e.reason ?: @"?"]]; }
+            }
+        }
+        t.aiTime = [[NSDate date] timeIntervalSince1970];   // ended 要有更晚的时间戳
+        ev.aiTime = t.aiTime;
         t.aiPhase = UITouchPhaseEnded;
         for (UIGestureRecognizer *gr in grs) {
             @try {
                 [gr touchesEnded:one withEvent:ev];
                 [fired addObject:[NSString stringWithFormat:@"%@|state=%ld",
                                   NSStringFromClass(gr.class), (long)gr.state]];
-            } @catch (id e) {}
+            }
+            @catch (NSException *e) { [errs addObject:[NSString stringWithFormat:@"ended:%@", e.reason ?: @"?"]]; }
         }
     } @catch (NSException *ex) {
         return @{@"ok": @NO, @"err": ex.reason ?: @"手势分发异常"};
@@ -741,9 +780,59 @@ static NSDictionary *AIGestureDirectTap(CGPoint pt) {
         t.aiPhase = UITouchPhaseEnded; [gv touchesEnded:one withEvent:ev];
     } @catch (id e) {}
 
-    return @{@"ok": @YES, @"gv": NSStringFromClass(gv.class), @"up": @(up),
-             @"hit": NSStringFromClass(hit.class), @"grs": fired,
-             @"n": @(grs.count), @"pt": NSStringFromCGPoint(p)};
+    NSMutableDictionary *d = [@{@"ok": @YES,
+                                @"gv": NSStringFromClass(gv.class), @"up": @(up),
+                                @"tv": NSStringFromClass(tv.class), @"tvUp": @(tvUp),
+                                @"hit": NSStringFromClass(hit.class), @"grs": fired,
+                                @"n": @(grs.count), @"pt": NSStringFromCGPoint([w convertPoint:pt toView:tv])} mutableCopy];
+    if (errs.count) d[@"errs"] = errs;
+    return d;
+}
+
+// ---------------------------------------------------------------------------
+// v26：wintap —— 让 UIWindow 自己做一次完整分发
+//
+//   gdtap 是把触摸直接怼进某个手势，绕过了 UIKit 的整套分发（hitTest →
+//   收集链上所有手势 → 逐个喂）。wintap 反过来：伪造一个 event 交给
+//   UIWindow.sendEvent:，让 UIKit 按它自己的规矩走一遍。
+//
+//   能不能成全看 UIWindow 认不认我们这个假 UIEvent —— 它内部读的是
+//   touchesForWindow:/touchesForGestureRecognizer:/allTouches 这几个 getter，
+//   我们全都重写了（v26 补上了 touchesForGestureRecognizer:）。
+//   这条路 v13 在微信上被判死（走的是 UIApplication 层），
+//   但 window 层 + 完整 getter 值得再试一次，尤其对付 RN / 自绘 UI。
+// ---------------------------------------------------------------------------
+static NSDictionary *AIWindowTap(CGPoint pt) {
+    UIWindow *w = AIHostWindow();
+    if (!w) return @{@"ok": @NO, @"err": @"无 window"};
+
+    AIFakeTouch *t = [AIFakeTouch new];
+    t.aiWindow = w; t.aiView = nil;
+    t.aiPoint  = pt;                       // 已是 window 坐标
+    t.aiTime   = [[NSDate date] timeIntervalSince1970];
+    t.aiPhase  = UITouchPhaseBegan;
+
+    AIFakeEvent *ev = [AIFakeEvent new];
+    NSSet *one = [NSSet setWithObject:t];
+    ev.aiTouches = one; ev.aiTime = t.aiTime;
+
+    int seBefore = gSendEventHits, actBefore = gActionHits;
+    NSMutableArray *errs = [NSMutableArray array];
+
+    @try { [w sendEvent:ev]; } @catch (NSException *e) { [errs addObject:[@"began:" stringByAppendingString:e.reason ?: @"?"]]; }
+    usleep(60000);
+    @try {
+        t.aiPhase = UITouchPhaseEnded;
+        t.aiTime  = [[NSDate date] timeIntervalSince1970]; ev.aiTime = t.aiTime;
+        [w sendEvent:ev];
+    } @catch (NSException *e) { [errs addObject:[@"ended:" stringByAppendingString:e.reason ?: @"?"]]; }
+
+    NSMutableDictionary *d = [@{@"ok": @YES,
+                                @"pt": NSStringFromCGPoint(pt),
+                                @"dse": @(gSendEventHits - seBefore),
+                                @"dact": @(gActionHits - actBefore)} mutableCopy];
+    if (errs.count) d[@"errs"] = errs;
+    return d;
 }
 
 // ---------------------------------------------------------------------------
@@ -2916,13 +3005,64 @@ static void AIExecCmd(NSDictionary *cmd) {
     // v25：把手势喂进手势识别器本体 —— RN / 自绘 UI 的点击通路
     if ([op isEqualToString:@"gdtap"]) {
         CGFloat x = [cmd[@"x"] floatValue], y = [cmd[@"y"] floatValue];
+        int tv = cmd[@"tv"] ? [cmd[@"tv"] intValue] : 1;
+        int mv = cmd[@"mv"] ? [cmd[@"mv"] intValue] : 0;
+        int dl = cmd[@"d"]  ? [cmd[@"d"]  intValue] : 60;
         __block NSDictionary *res = nil;
-        AIMainSync(^{ @try { res = AIGestureDirectTap(CGPointMake(x, y)); } @catch (id e) {} });
+        AIMainSync(^{ @try { res = AIGestureDirectTap(CGPointMake(x, y), tv, mv, dl); } @catch (id e) {} });
         NSMutableDictionary *mm = [(res ?: @{}) mutableCopy];
         mm[@"op"] = @"gdtap"; mm[@"x"] = @(x); mm[@"y"] = @(y);
         AIReportDict(mm);
-        AILog(@"  [cmd] gdtap (%.0f,%.0f) -> gv=%@ up=%@ grs=%@ err=%@",
-              x, y, mm[@"gv"], mm[@"up"], mm[@"grs"], mm[@"err"] ?: @"-");
+        AILog(@"  [cmd] gdtap (%.0f,%.0f) tv=%d -> gv=%@ tv=%@ grs=%@ errs=%@",
+              x, y, tv, mm[@"gv"], mm[@"tv"], mm[@"grs"], mm[@"errs"] ?: @"-");
+        return;
+    }
+    if ([op isEqualToString:@"wintap"]) {
+        CGFloat x = [cmd[@"x"] floatValue], y = [cmd[@"y"] floatValue];
+        __block NSDictionary *res = nil;
+        AIMainSync(^{ @try { res = AIWindowTap(CGPointMake(x, y)); } @catch (id e) {} });
+        NSMutableDictionary *mm = [(res ?: @{}) mutableCopy];
+        mm[@"op"] = @"wintap"; mm[@"x"] = @(x); mm[@"y"] = @(y);
+        AIReportDict(mm);
+        AILog(@"  [cmd] wintap (%.0f,%.0f) -> dse=%@ dact=%@ errs=%@",
+              x, y, mm[@"dse"], mm[@"dact"], mm[@"errs"] ?: @"-");
+        return;
+    }
+    if ([op isEqualToString:@"schemes"]) {
+        __block NSString *s = @"";
+        AIMainSync(^{
+            @try {
+                NSArray *types = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleURLTypes"];
+                NSMutableArray *lines = [NSMutableArray array];
+                for (NSDictionary *t in types) {
+                    NSString *role = t[@"CFBundleTypeRole"] ?: @"?";
+                    for (NSString *sc in (t[@"CFBundleURLSchemes"] ?: @[]))
+                        [lines addObject:[NSString stringWithFormat:@"%@ (%@)", sc, role]];
+                }
+                s = lines.count ? [lines componentsJoinedByString:@", "] : @"(无 URL scheme)";
+            } @catch (id e) { s = @"读取失败"; }
+        });
+        AIReportDict(@{@"op": @"schemes", @"ok": @YES, @"text": s});
+        return;
+    }
+    if ([op isEqualToString:@"open"]) {
+        NSString *u = cmd[@"url"];
+        if (!u.length) { AIReportDict(@{@"op": @"open", @"ok": @NO, @"err": @"缺 url"}); return; }
+        NSURL *url = [NSURL URLWithString:u];
+        __block BOOL ok = NO;
+        AIMainSync(^{
+            @try {
+                UIApplication *app = [UIApplication sharedApplication];
+                if ([app respondsToSelector:@selector(openURL:options:completionHandler:)])
+                    [app openURL:url options:@{} completionHandler:^(BOOL r){ ok = r; }];
+                else
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                    ok = [app openURL:url];
+#pragma clang diagnostic pop
+            } @catch (id e) {}
+        });
+        AIReportDict(@{@"op": @"open", @"ok": @(ok), @"url": u});
         return;
     }
     if ([op isEqualToString:@"tap"]) {
