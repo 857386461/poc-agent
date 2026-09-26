@@ -176,6 +176,7 @@ static void AITaskSet(NSString *name, int step, int total, NSString *state, int 
 static void AIStepAdd(NSString *state, NSString *act, NSString *obj, NSString *ev);
 static NSString *AIShapeFor(NSString *st);
 static UIColor  *AIColorFor(NSString *st);
+static NSString *AITaskLine(void);          // AIGuardRender(4452) 在定义(4779)之前要用
 static NSString *AITaskStateNow(void);      // v30：当前有效状态（含 fail 优先）
 static NSDictionary *AITaskDict(void);      // /status 的 task{} —— AIExecCmd 在定义之前要用
 static NSDictionary *AIUiDict(void);        // /status 的 ui{}
