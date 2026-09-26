@@ -107,7 +107,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v27";
+static NSString * const kAIVer = @"v29";
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -1915,7 +1915,8 @@ static NSArray *AIRunMacro(NSArray *steps, double gapMs) {
                     r[@"ok"] = @(viaSend); r[@"how"] = viaSend ? @"sendEvent" : @"(未确认)";
                 } else if ([op isEqualToString:@"scroll"]) {
                     NSDictionary *d = AIScrollAt(CGPointMake([s[@"x"] floatValue], [s[@"y"] floatValue]),
-                                                 [s[@"dy"] doubleValue], [s[@"dx"] doubleValue], YES);
+                                                 [s[@"dy"] doubleValue], [s[@"dx"] doubleValue], YES,
+                                                 [s[@"fire"] respondsToSelector:@selector(intValue)] ? [s[@"fire"] intValue] : 0);
                     r[@"ok"] = d[@"ok"] ?: @NO;
                     r[@"txt"] = [NSString stringWithFormat:@"%@ %@ -> %@ (移动 %.0f)",
                                  d[@"sv"] ?: @"?", d[@"before"] ?: @"?",
@@ -2168,7 +2169,63 @@ static BOOL AIFakeSwipe(CGPoint a, CGPoint b, int steps, double dur) {
 //   改走结果侧：直接改 UIScrollView.contentOffset，绕开整条触摸链。
 //   dy > 0 = 内容向上走（看到后面的内容），dy < 0 = 往回看。
 // ---------------------------------------------------------------------------
-static NSDictionary *AIScrollAt(CGPoint pt, double dy, double dx, BOOL anim) {
+// v29：安全调用 delegate 的 void 回调（用 NSInvocation，避免 performSelector 的标量/结构体坑）
+static BOOL AICallVoid(id target, SEL sel, void *arg1, const char *sig) {
+    if (!target || ![target respondsToSelector:sel]) return NO;
+    @try {
+        NSMethodSignature *ms = [target methodSignatureForSelector:sel];
+        if (!ms) return NO;
+        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:ms];
+        inv.selector = sel;
+        if (arg1) [inv setArgument:arg1 atIndex:2];
+        [inv invokeWithTarget:target];
+        return YES;
+    } @catch (NSException *e) { return NO; }
+}
+
+// v29：改完 contentOffset 后，手动把「分页回调」喂给 delegate。
+// 关键：setContentOffset:animated: 只触发 scrollViewDidEndScrollingAnimation:，
+//       不触发 scrollViewDidEndDecelerating: —— 而快手的分页/切播放器逻辑就在 decelerating 里。
+//       所以只改 offset 会出现「列表 cell 数据换了、画面还是原来那条」的鬼现象。
+static NSArray *AIFirePaging(UIScrollView *sv, int mode) {
+    if (!sv) return @[];
+    id del = nil;
+    @try { del = sv.delegate; } @catch (NSException *e) {}
+    if (!del) return @[@"no-delegate"];
+    NSMutableArray *fired = [NSMutableArray array];
+
+    SEL s_begin = @selector(scrollViewWillBeginDragging:);
+    SEL s_scroll = @selector(scrollViewDidScroll:);
+    SEL s_enddrag = @selector(scrollViewDidEndDragging:willDecelerate:);
+    SEL s_decel  = @selector(scrollViewDidEndDecelerating:);
+
+    if (mode == 2) {  // 只补最后一拍
+        if (AICallVoid(del, s_decel, &sv, NULL)) [fired addObject:@"decel"];
+        return fired;
+    }
+    // mode 1：完整减速序列 —— 模拟一根真实手指的减速滑行
+    if (AICallVoid(del, s_begin, &sv, NULL)) [fired addObject:@"begin"];
+    for (int i = 0; i < 6; i++) {          // 中途若干次 didScroll，App 才有"正在滑"的观感
+        if (AICallVoid(del, s_scroll, &sv, NULL)) { if (i == 0) [fired addObject:@"didScroll"]; }
+        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.016]];
+    }
+    if ([del respondsToSelector:s_enddrag]) {
+        @try {
+            NSMethodSignature *ms = [del methodSignatureForSelector:s_enddrag];
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:ms];
+            inv.selector = s_enddrag;
+            [inv setArgument:&sv atIndex:2];
+            BOOL yes = YES;
+            [inv setArgument:&yes atIndex:3];
+            [inv invokeWithTarget:del];
+            [fired addObject:@"endDrag"];
+        } @catch (NSException *e) {}
+    }
+    if (AICallVoid(del, s_decel, &sv, NULL)) [fired addObject:@"decel"];
+    return fired;
+}
+
+static NSDictionary *AIScrollAt(CGPoint pt, double dy, double dx, BOOL anim, int fire) {
     UIWindow *w = AIHostWindow();
     if (!w) return @{@"ok": @NO, @"err": @"无 window"};
     UIView *hit = nil;
@@ -2186,13 +2243,33 @@ static NSDictionary *AIScrollAt(CGPoint pt, double dy, double dx, BOOL anim) {
     CGPoint after = CGPointMake(MIN(maxX, MAX(0, before.x + dx)),
                                 MIN(maxY, MAX(0, before.y + dy)));
     [sv setContentOffset:after animated:anim];
-    return @{@"ok": @YES, @"sv": NSStringFromClass(sv.class), @"up": @(up),
-             @"hit": hit ? NSStringFromClass(hit.class) : @"nil",
-             @"before": NSStringFromCGPoint(before),
-             @"after":  NSStringFromCGPoint(after),
-             @"moved":  @(after.y - before.y),
-             @"contentSize": NSStringFromCGSize(sv.contentSize),
-             @"frame":  NSStringFromCGRect(sv.bounds)};
+    NSMutableDictionary *out = [NSMutableDictionary dictionaryWithDictionary:
+        @{@"ok": @YES, @"sv": NSStringFromClass(sv.class), @"up": @(up),
+          @"hit": hit ? NSStringFromClass(hit.class) : @"nil",
+          @"before": NSStringFromCGPoint(before),
+          @"after":  NSStringFromCGPoint(after),
+          @"moved":  @(after.y - before.y),
+          @"contentSize": NSStringFromCGSize(sv.contentSize),
+          @"frame":  NSStringFromCGRect(sv.bounds)}];
+    // v29：诊断信息 —— 分页到底有没有被 App 接管
+    id del = nil; @try { del = sv.delegate; } @catch (NSException *e) {}
+    out[@"delegate"] = del ? NSStringFromClass([del class]) : @"nil";
+    out[@"paging"]   = @(sv.pagingEnabled);
+    if ([sv isKindOfClass:[UITableView class]]) {
+        UITableView *tv = (UITableView *)sv;
+        out[@"visRows"] = @([tv indexPathsForVisibleRows].count);
+    }
+    if (fire > 0) {
+        NSArray *fired = AIFirePaging(sv, fire);
+        out[@"fired"] = fired;
+        // 再等一拍，让 App 有时间换播放器
+        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.25]];
+        CGPoint now = sv.contentOffset;
+        out[@"offsetAfterFire"] = NSStringFromCGPoint(now);
+        if ([sv isKindOfClass:[UITableView class]])
+            out[@"visRowsAfter"] = @([(UITableView *)sv indexPathsForVisibleRows].count);
+    }
+    return out;
 }
 
 // 主线程同步执行（HTTP 服务在后台线程，触摸/截图必须回主线程）
@@ -3616,7 +3693,8 @@ static void AIExecCmd(NSDictionary *cmd) {
         double dx = [cmd[@"dx"] doubleValue];
         BOOL anim = [cmd[@"anim"] respondsToSelector:@selector(boolValue)] ? [cmd[@"anim"] boolValue] : YES;
         __block NSDictionary *d = nil;
-        AIMainSync(^{ @try { d = AIScrollAt(p, dy, dx, anim); } @catch (NSException *e) {} });
+        int fire = [cmd[@"fire"] respondsToSelector:@selector(intValue)] ? [cmd[@"fire"] intValue] : 0;
+        AIMainSync(^{ @try { d = AIScrollAt(p, dy, dx, anim, fire); } @catch (NSException *e) {} });
         AILog(@"  [cmd] scroll dy=%.0f -> %@", dy, d);
         AIReportDict(@{@"op": @"scroll", @"info": d ?: @{@"err": @"scroll 返回 nil"}});
     } else if ([op isEqualToString:@"back"]) {
