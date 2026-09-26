@@ -107,7 +107,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v33";   // v33 = v32（罩层真源自愈）+ 悬浮球自愈/可观测（治「球不见了」）+ wininfo 体检（版本自报 built/lib/ops + UI 三层任务态）+ 罩层真源自愈（治 idle 也挡屏 / overlay off 关不掉）
+static NSString * const kAIVer = @"v34";   // v33 = v32（罩层真源自愈）+ 悬浮球自愈/可观测（治「球不见了」）+ wininfo 体检（版本自报 built/lib/ops + UI 三层任务态）+ 罩层真源自愈（治 idle 也挡屏 / overlay off 关不掉）
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -148,6 +148,8 @@ static NSString *gTaskState  = @"idle";   // 当前状态
 static NSString *gTaskBrief  = nil;       // 一句话（给悬浮球/防护罩），如「正在刷第 3 个视频」
 static NSString *gGuardMode  = @"privacy";// privacy（毛玻璃+暗化）| verify（露出 App，仍吃触摸）
 static BOOL      gGuardPinned = NO;       // 手动 pin：任务结束也不落下
+static volatile int32_t gOpBusy = 0;      // v34：AI 操作期标志（不只是有任务才遮挡）
+static CFTimeInterval   gLastOpTs = 0;    // v34：最后一次真实操作的时刻，用于空闲自动落下
 static volatile int32_t gBusy = 0;        // 任务期标志：1 = 有任务在跑 → 防护罩自动升起
 static NSMutableArray *gSteps = nil;      // L3 步骤列表：@{@"s":状态,@"act":动作,@"obj":目标,@"ev":证据}
 static BOOL      gPanelDiag  = NO;        // L3 面板「诊断」区是否展开（默认折叠）
@@ -173,6 +175,8 @@ static void AISetOverlayVisible(BOOL vis);   // 盖屏按钮在它的定义之�
 static void AIGuardSync(void);               // v32：罩层状态自愈（tick 每秒收敛一次）
 static void AIGuardRender(void);             // v32：guardVerify(4392) 在定义(4411)之前要用
 static void AIFloatSync(void);               // v33：悬浮球自愈（tick 每秒收敛一次）
+static void AIOpMark(void);                  // v34：操作类命令点亮罩层（AIExecCmd 在定义之前要用）
+static void AIOpIdleCheck(void);             // v34：操作停下 8s 后罩层自动落下
 static void AIShowOverlay(void);            // 盖屏按钮回调里要刷新报告
 // v30 UI 三层任务态（定义见 AIFloatApply 之前）
 static void AITaskSet(NSString *name, int step, int total, NSString *state, int ok, NSString *brief);
@@ -3352,6 +3356,14 @@ static NSMutableArray *gUIOffViews = nil;   // v27：被 uioff 剥掉交互的�
 static void AIExecCmd(NSDictionary *cmd) {
     NSString *op = cmd[@"op"];
     if (!op) return;
+    // v34：凡是「会让手机发生真实变化」的命令，都点亮罩层（人能看到"AI 正在操作手机"）。
+    // 只读类（text/tree/probe/find/rows/status/wins/log/wininfo…）不算，不然读屏也糊一层。
+    static NSSet *kTouchOps = nil;
+    if (!kTouchOps) kTouchOps = [NSSet setWithObjects:
+        @"tapui", @"gtap", @"rntap", @"gdtap", @"wintap", @"tap", @"swipe",
+        @"scroll", @"pick", @"picktxt", @"back", @"nav", @"dismiss", @"open",
+        @"chain", @"macro", @"task", @"uioff", @"uion", nil];
+    if ([kTouchOps containsObject:op]) AIOpMark();
     // v27：find —— 列出该点上所有「框里包含它」的非全屏 view（面积升序）
     if ([op isEqualToString:@"find"]) {
         CGFloat x = [cmd[@"x"] floatValue], y = [cmd[@"y"] floatValue];
@@ -3665,6 +3677,15 @@ static void AIExecCmd(NSDictionary *cmd) {
                 w.windowLevel, (int)(w.rootViewController.view.subviews.count)];
         }
         AIReportDict(@{@"op": @"wininfo", @"ok": @YES, @"text": s});
+    } else if ([op isEqualToString:@"panel"]) {
+        // v34：L3 详细面板的开关。之前只能靠点球展开，我没法自动化验证它，
+        // 加个命令入口，面板内容也能被脚本巡检。
+        BOOL open = cmd[@"on"] ? ([cmd[@"on"] intValue] != 0) : YES;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            gFloatExpanded = open ? YES : NO;
+            gFloatForce = YES; AIFloatApply();
+        });
+        AIReportDict(@{@"op": @"panel", @"ok": @YES, @"open": @(open ? 1 : 0)});
     } else if ([op isEqualToString:@"status"]) {
         // v30：自报「我是谁」—— 本 dylib 在手机上的真实路径 + 构建时刻 + op 集。
         // 背景：v28 起存档把「源码版本」当「注入版本」写，导致 v27/v28 之争；
@@ -3818,6 +3839,7 @@ static void AIHudTickLoop(void) {
         @try { AIHudApply(); } @catch (id e) {}
         @try { AIGuardSync(); } @catch (id e) {}   // v32：罩层每秒自愈，谁偷偷显示都会被拉回真源
         @try { AIFloatSync(); } @catch (id e) {}   // v33：悬浮球每秒自愈，弄丢了 1 秒内拉回来
+        @try { AIOpIdleCheck(); } @catch (id e) {} // v34：操作停下 8s 后罩层自动落下
         AIHudTickLoop();
     });
 }
@@ -3888,14 +3910,14 @@ static void AINetLoop(void) {
                         if (gPollOK == 1) {
                             AILog(@"  ✅ 首次轮询成功，已上线 -> %@", gActiveBase);
                             // v32：盖屏已退役（决策②），别再自动糊一层。结论写 log / 诊断区即可。
-                            if (AIFlag(@"sw1", NO)) AIShowOverlay();
+                            if (NO /*sw1 日志盖屏已退役*/) AIShowOverlay();
                         }
                     } else {
                         gPollErr++; failRun++;
                         gLastErrCode = pe ? pe.code : -999;
                         gLastErrText = pe.localizedDescription;
                         AILog(@"  ⚠️ 轮询失败: %@ (code=%ld)", pe.localizedDescription, (long)gLastErrCode);
-                        if ((gPollErr == 1 || gPollErr == 3) && AIFlag(@"sw1", NO)) AIShowOverlay();  // v32：同上，仅诊断模式
+                        if ((gPollErr == 1 || gPollErr == 3) && NO /*sw1 日志盖屏已退役*/) AIShowOverlay();  // v32：同上，仅诊断模式
                         // 域名连续挂 4 次 -> 切 IP 直连兜底（DNS 被污染时救命）
                         if (failRun >= 4 && ![gActiveBase hasPrefix:@"https://4"]) {
                             gActiveBase = @"https://49.233.240.214";
@@ -4374,14 +4396,14 @@ static void AITestTapAt(CGPoint pt, NSString *desc) {
     if (hadOverlay) {
         // v32：恢复也走真源（不是无条件显示）；诊断盖屏仅在 sw1 时刷
         AIGuardSync();
-        if (AIFlag(@"sw1", NO)) AIShowOverlay();
+        if (NO /*sw1 日志盖屏已退役*/) AIShowOverlay();
     }
 }
 
 static void AITestTapButton(void) {
     CGPoint pt = CGPointZero;
     NSString *desc = nil;
-    if (!AIFindFirstButton(&pt, &desc)) { AILog(@"  没找到可点的 UIButton"); if (AIFlag(@"sw1", NO)) AIShowOverlay(); return; }
+    if (!AIFindFirstButton(&pt, &desc)) { AILog(@"  没找到可点的 UIButton"); if (NO /*sw1 日志盖屏已退役*/) AIShowOverlay(); return; }
     AITestTapAt(pt, desc);
 }
 
@@ -4504,7 +4526,24 @@ static void AIGuardRender(void) {
 // 每次冷启动都糊一层，而且它是 dispatch_async 异步的，跟 off 命令赛跑。
 // 与其逐个追凶，不如把「该不该显示」收敛成纯函数，再让 tick 每秒自愈一次。
 static BOOL AIGuardShouldShow(void) {
-    return (gGuardPinned || gBusy > 0) ? YES : NO;
+    return (gGuardPinned || gBusy > 0 || gOpBusy > 0) ? YES : NO;
+}
+
+// v34 · 「AI 真的动了一下手机」也该遮挡 —— 之前只有 task{} 驱动的 busy 才会升起，
+// 于是我单独发一条 tapui/scroll 时屏幕上没有任何提示，人不知道手机正在被操作。
+// 现在任何操作类命令都会点亮罩层，停下 8 秒后自动落下（不会常驻挡视线）。
+#define AI_GUARD_OP_IDLE 8.0
+static void AIOpMark(void) {
+    if (!AIFlag(@"guardAuto", YES)) return;    // 嫌挡眼可以关掉这个开关
+    gOpBusy = 1;
+    gLastOpTs = CFAbsoluteTimeGetCurrent();
+    AIGuardSync();
+}
+static void AIOpIdleCheck(void) {
+    if (gOpBusy && (CFAbsoluteTimeGetCurrent() - gLastOpTs) > AI_GUARD_OP_IDLE) {
+        gOpBusy = 0;
+        AIGuardSync();
+    }
 }
 
 // 按真源收敛罩层（主线程）。幂等，可每 tick 调。
@@ -4561,7 +4600,7 @@ static void AIBoot(void) {
     // v20：默认不再糊一层全屏盖屏（用户吐槽太碍事），只挂一个可拖动的小悬浮球。
     // 想要全屏诊断报告的，在悬浮球面板里把「诊断盖屏」打开。
     @try { AIFloatApply(); } @catch (NSException *e) { AILog(@"float 异常 %@", e); }
-    if (AIFlag(@"sw1", NO)) AIShowOverlayText(@"AgentInject2 已加载 ✓\n正在自检，请稍候…", NO, nil);
+    if (NO /*sw1 日志盖屏已退役*/) AIShowOverlayText(@"AgentInject2 已加载 ✓\n正在自检，请稍候…", NO, nil);
     // 后台看看仓库里有没有比我新的版本（有就先下下来，下次重开 App 生效）
     if (AIFlag(@"autoupd", YES)) { @try { AICheckUpdateAsync(); } @catch (NSException *e) {} }
 
@@ -4603,7 +4642,7 @@ static void AIBoot(void) {
             if (gSrvPort) AILog(@"########## 控制: http://%@:%d/status ##########", gSrvIp ?: @"?", gSrvPort);
             @try { AIWriteReport(); } @catch (NSException *e) {}
             @try { AIFloatApply(); }  @catch (NSException *e) {}
-            if (AIFlag(@"sw1", NO)) { @try { AIShowOverlay(); } @catch (NSException *e) {} }
+            if (NO /*sw1 日志盖屏已退役*/) { @try { AIShowOverlay(); } @catch (NSException *e) {} }
             // v32：冷启动收尾 —— 强制按真源收敛罩层（idle 必须是落下的）
             @try { AIGuardSync(); } @catch (NSException *e) {}
         });
@@ -4867,14 +4906,19 @@ static void AITaskSet(NSString *name, int step, int total, NSString *state, int 
     if (state) gTaskState = AITaskStateNorm(state);
     if (ok    >= 0) gTaskOk    = ok;
     if (brief) gTaskBrief = brief.copy;
-    // 清任务：name 空 + step/total 归零 → 回落空闲
-    if (total == 0 && step == 0 && (!name || !name.length)) {
+    // 清任务：step/total 同时归零就是清空信号。
+    // v34：不再要求 name 也为空 —— v33 实测 name 非空时 brief 会残留（idle 了还挂着上一步的话）。
+    if (total == 0 && step == 0) {
         gTaskState = @"idle"; gTaskBrief = nil; gTaskOk = -1;
         gTaskIdx = 0; gTaskTotal = 0; gTaskResult = nil;
+        gGuardMode = @"privacy";          // v34：verify 模式随任务一起复位
         [gSteps removeAllObjects];
     }
-    gBusy = (gTaskTotal > 0 && ([gTaskState isEqualToString:@"exec"] ||
-                                [gTaskState isEqualToString:@"wait"])) ? 1 : 0;
+    // v34 · busy 判定修正：v33 只认 exec/wait，导致「第 2 步 ok（2/5，任务还没完）」
+    // 罩层就提前落下、隐私裸露。正确语义：任务还在跑 = 有任务 && 没走到最后一步 && 不是 idle。
+    BOOL stExec = [gTaskState isEqualToString:@"exec"] || [gTaskState isEqualToString:@"wait"];
+    BOOL done   = (gTaskTotal > 0 && gTaskIdx >= gTaskTotal && !stExec);   // 最后一步且非执行态
+    gBusy = (gTaskTotal > 0 && !done && ![gTaskState isEqualToString:@"idle"]) ? 1 : 0;
     gFloatForce = YES;
     AIFloatApply();
     // L2 防护罩：任务期自动升起 + 手动 pin（拍板决策 3：两者都要）
