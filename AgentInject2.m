@@ -107,7 +107,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v26";
+static NSString * const kAIVer = @"v27";
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -175,6 +175,8 @@ static void AIBudgetReset(int n);                    // v23：额度重置，定
 static BOOL AIMemSafe(void);                         // v24：内存水位阀，定义在 ~2436 行
 static int  AIMemMB(void);                           // v24：当前常驻内存 MB
 static id   AISafeObjGet(id v, SEL g);               // v24：只接受对象返回值的 selector 调用
+static NSString *AIRuntimeTextOf(id v);              // v27：AIFindViewsAt 要用，定义在 ~2684 行
+static NSArray   *AIFindViewsAt(CGPoint pt, int maxN);   // v27：按坐标精确命中（躲开 hitTest）
 static NSDictionary *AIPickTextViaGesture(NSString *kw);  // v23：按文字触发手势，定义在 ~1339 行
 static NSDictionary *AIScrollAt(CGPoint pt, double dy, double dx, BOOL anim);  // v17
 static NSString *AIBack(void);                  // v18：AIRunMacro(~1057) 在它定义之前要调用
@@ -785,6 +787,146 @@ static NSDictionary *AIGestureDirectTap(CGPoint pt, int tvMode, int mv, int dela
                                 @"tv": NSStringFromClass(tv.class), @"tvUp": @(tvUp),
                                 @"hit": NSStringFromClass(hit.class), @"grs": fired,
                                 @"n": @(grs.count), @"pt": NSStringFromCGPoint([w convertPoint:pt toView:tv])} mutableCopy];
+    if (errs.count) d[@"errs"] = errs;
+    return d;
+}
+
+// ---------------------------------------------------------------------------
+// v27：find / rntap —— 不问 hitTest，按坐标在整棵树里「精确命中」
+//
+//   卡了好几版的真实原因：任务中心是 RN 页，(341,293) 的 hitTest 命中的是
+//   0,0,390,844 的【全屏 RCTView】（RN 根节点），而真正的按钮「立即签到」
+//   是 RCTTextView（reactTag=599…），它压根不在 hitTest 的返回链上。
+//
+//   RN 的点击派发拿的是 touch.view 的 reactTag（就是 view.tag）：
+//   tag 传成了根节点，JS 侧从根开始找 responder，找不到挂 Pressability 的
+//   按钮 —— 所以手势 state 都变成 3（recognized）了，业务纹丝不动。
+//
+//   v27 换个找法：整棵树扫一遍，把所有「框里包含这个点」的 view 都捞出来，
+//   按面积从小到大排，最小的那个就是按钮本体，用它的 tag 去喂手势。
+// ---------------------------------------------------------------------------
+static NSArray *AIFindViewsAt(CGPoint pt, int maxN) {
+    UIWindow *w = AIHostWindow();
+    if (!w) return @[];
+    CGFloat scr = w.bounds.size.width * w.bounds.size.height;
+    if (scr <= 0) scr = 390 * 844;
+    NSMutableArray *out = [NSMutableArray array];
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
+    int budget = 6000;                       // 快手树很大，扫太多会卡主线程
+    while (stack.count && budget > 0) {
+        UIView *v = stack.lastObject; [stack removeLastObject]; budget--;
+        if (![v isKindOfClass:[UIView class]]) continue;
+        CGRect r = CGRectZero; BOOL ok = NO;
+        @try { r = [v convertRect:v.bounds toView:nil]; ok = YES; } @catch (id e) {}
+        if (!ok || CGRectIsNull(r) || r.size.width <= 0 || r.size.height <= 0) continue;
+        CGFloat area = r.size.width * r.size.height;
+        if (area >= scr * 0.6) {             // 全屏的不算「精确目标」
+            @try { for (UIView *c in v.subviews) [stack addObject:c]; } @catch (id e) {}
+            continue;
+        }
+        if (CGRectContainsPoint(r, pt)) {
+            NSMutableDictionary *d = [NSMutableDictionary dictionary];
+            d[@"cls"]  = NSStringFromClass(v.class);
+            d[@"f"]    = [NSString stringWithFormat:@"%.0f,%.0f %.0fx%.0f",
+                          r.origin.x, r.origin.y, r.size.width, r.size.height];
+            d[@"area"] = @((int)area);
+            @try {
+                NSNumber *tg = AISafeObjGet(v, @selector(reactTag));
+                if (![tg isKindOfClass:[NSNumber class]]) tg = @(v.tag);
+                d[@"tag"] = [tg description];
+            } @catch (id e) { d[@"tag"] = @(v.tag).description; }
+            @try {
+                NSString *tx = AIRuntimeTextOf(v);
+                if (tx.length) d[@"txt"] = tx.length > 40 ? [tx substringToIndex:40] : tx;
+            } @catch (id e) {}
+            d[@"v"] = v;                     // 只在进程内用，绝不进 JSON
+            [out addObject:d];
+        }
+        @try { for (UIView *c in v.subviews) [stack addObject:c]; } @catch (id e) {}
+    }
+    [out sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [a[@"area"] compare:b[@"area"]];
+    }];
+    if (maxN > 0 && (int)out.count > maxN) return [out subarrayWithRange:NSMakeRange(0, (NSUInteger)maxN)];
+    return out;
+}
+
+// 三拍喂手势（began → [moved] → ended），时间戳递增
+static void AIFireGRs(NSArray *grs, NSSet *one, AIFakeTouch *t, AIFakeEvent *ev,
+                      int mv, int delayMs, NSMutableArray *fired, NSMutableArray *errs) {
+    @try {
+        t.aiPhase = UITouchPhaseBegan;
+        for (UIGestureRecognizer *gr in grs) {
+            @try { [gr touchesBegan:one withEvent:ev]; }
+            @catch (NSException *e) { [errs addObject:[NSString stringWithFormat:@"began:%@", e.reason ?: @"?"]]; }
+        }
+        if (delayMs > 0) usleep((useconds_t)(delayMs * 1000));
+        if (mv) {
+            t.aiPhase = UITouchPhaseMoved;
+            for (UIGestureRecognizer *gr in grs) {
+                @try { [gr touchesMoved:one withEvent:ev]; }
+                @catch (NSException *e) { [errs addObject:[NSString stringWithFormat:@"moved:%@", e.reason ?: @"?"]]; }
+            }
+        }
+        t.aiTime  = [[NSDate date] timeIntervalSince1970];   // ended 必须有更晚的时间戳
+        ev.aiTime = t.aiTime;
+        t.aiPhase = UITouchPhaseEnded;
+        for (UIGestureRecognizer *gr in grs) {
+            @try {
+                [gr touchesEnded:one withEvent:ev];
+                [fired addObject:[NSString stringWithFormat:@"%@|state=%ld",
+                                  NSStringFromClass(gr.class), (long)gr.state]];
+            }
+            @catch (NSException *e) { [errs addObject:[NSString stringWithFormat:@"ended:%@", e.reason ?: @"?"]]; }
+        }
+    } @catch (NSException *ex) { [errs addObject:ex.reason ?: @"?"]; }
+}
+
+// v27：rntap —— 用「精确命中的那个 view」的 tag 去喂手势
+//   up    从最小候选往上走几层（RN 的 Pressability 常常挂在父容器上）
+//   rank  用第几个候选（0=面积最小；同一坐标叠了好几层时可以换）
+static NSDictionary *AIRNTap(CGPoint pt, int up, int rank, int delayMs) {
+    UIWindow *w = AIHostWindow();
+    if (!w) return @{@"ok": @NO, @"err": @"无 window"};
+    NSArray *cands = AIFindViewsAt(pt, 24);
+    if (!cands.count) return @{@"ok": @NO, @"err": @"该点没有任何非全屏 view 的框包含它"};
+    if (rank >= (int)cands.count) rank = (int)cands.count - 1;
+    UIView *tv = cands[rank][@"v"];
+    if (![tv isKindOfClass:[UIView class]]) return @{@"ok": @NO, @"err": @"候选无效"};
+    for (int i = 0; i < up && tv.superview; i++) tv = tv.superview;
+
+    UIView *gv = tv; int up2 = 0; NSArray *grs = nil;
+    while (gv && up2 < 24) {
+        @try { if (gv.gestureRecognizers.count) { grs = gv.gestureRecognizers; break; } } @catch (id e) {}
+        gv = gv.superview; up2++;
+    }
+    if (!gv || !grs.count)
+        return @{@"ok": @NO, @"err": @"父链 24 层内无手势",
+                 @"tv": NSStringFromClass(tv.class), @"tag": cands[rank][@"tag"] ?: @"-"};
+
+    AIFakeTouch *t = [AIFakeTouch new];
+    t.aiView = tv; t.aiWindow = w;
+    t.aiPoint = [w convertPoint:pt toView:tv];
+    t.aiTime  = [[NSDate date] timeIntervalSince1970];
+    AIFakeEvent *ev = [AIFakeEvent new];
+    NSSet *one = [NSSet setWithObject:t];
+    ev.aiTouches = one; ev.aiTime = t.aiTime;
+
+    NSMutableArray *fired = [NSMutableArray array], *errs = [NSMutableArray array];
+    AIFireGRs(grs, one, t, ev, 0, delayMs, fired, errs);
+    // 兜底：手势所在 view 自己也喂一遍（有些控件在 touchesEnded: 里收尾）
+    @try {
+        t.aiPhase = UITouchPhaseBegan; [gv touchesBegan:one withEvent:ev];
+        t.aiPhase = UITouchPhaseEnded; [gv touchesEnded:one withEvent:ev];
+    } @catch (id e) {}
+
+    NSMutableDictionary *d = [@{@"ok": @YES,
+                                @"tv": NSStringFromClass(tv.class),
+                                @"tag": cands[rank][@"tag"] ?: @"-",
+                                @"f":   cands[rank][@"f"] ?: @"-",
+                                @"rank": @(rank), @"up": @(up),
+                                @"gv": NSStringFromClass(gv.class), @"gup": @(up2),
+                                @"grs": fired, @"ncand": @(cands.count)} mutableCopy];
     if (errs.count) d[@"errs"] = errs;
     return d;
 }
@@ -2999,9 +3141,74 @@ static void AIReportDict(NSDictionary *d) {
     } @catch (id e) {}
 }
 
+static NSMutableArray *gUIOffViews = nil;   // v27：被 uioff 剥掉交互的遮挡层，uion 可还原
+
 static void AIExecCmd(NSDictionary *cmd) {
     NSString *op = cmd[@"op"];
     if (!op) return;
+    // v27：find —— 列出该点上所有「框里包含它」的非全屏 view（面积升序）
+    if ([op isEqualToString:@"find"]) {
+        CGFloat x = [cmd[@"x"] floatValue], y = [cmd[@"y"] floatValue];
+        int n = cmd[@"n"] ? [cmd[@"n"] intValue] : 12;
+        __block NSArray *arr = nil;
+        AIMainSync(^{ @try { arr = AIFindViewsAt(CGPointMake(x, y), n); } @catch (id e) {} });
+        NSMutableString *s = [NSMutableString string];
+        int i = 0;
+        for (NSDictionary *d in (arr ?: @[]))
+            [s appendFormat:@"%2d %-26@ %-22@ tag=%-9@ %@\n", i++,
+             d[@"cls"], d[@"f"], d[@"tag"] ?: @"-", d[@"txt"] ?: @""];
+        if (!s.length) s = [NSMutableString stringWithString:@"(该点没有非全屏 view 的框包含它)"];
+        AIReportDict(@{@"op": @"find", @"ok": @YES, @"x": @(x), @"y": @(y), @"text": s});
+        AILog(@"  [cmd] find (%.0f,%.0f) -> %d 个", x, y, (int)((arr ?: @[]).count));
+        return;
+    }
+    // v27：rntap —— 拿「精确命中的那个 view」的 reactTag 去喂手势
+    if ([op isEqualToString:@"rntap"]) {
+        CGFloat x = [cmd[@"x"] floatValue], y = [cmd[@"y"] floatValue];
+        int up = cmd[@"up"]   ? [cmd[@"up"]   intValue] : 0;
+        int rk = cmd[@"rank"] ? [cmd[@"rank"] intValue] : 0;
+        int dl = cmd[@"d"]    ? [cmd[@"d"]    intValue] : 60;
+        __block NSDictionary *res = nil;
+        AIMainSync(^{ @try { res = AIRNTap(CGPointMake(x, y), up, rk, dl); } @catch (id e) {} });
+        NSMutableDictionary *mm = [(res ?: @{}) mutableCopy];
+        mm[@"op"] = @"rntap"; mm[@"x"] = @(x); mm[@"y"] = @(y);
+        AIReportDict(mm);
+        AILog(@"  [cmd] rntap (%.0f,%.0f) up=%d rank=%d -> tv=%@ tag=%@ grs=%@",
+              x, y, up, rk, mm[@"tv"], mm[@"tag"], mm[@"grs"]);
+        return;
+    }
+    // v27：uioff —— 剥遮挡层：把该点 hitTest 命中的 view 的交互关掉（不改外观）
+    if ([op isEqualToString:@"uioff"]) {
+        CGFloat x = [cmd[@"x"] floatValue], y = [cmd[@"y"] floatValue];
+        __block NSString *info = @"";
+        AIMainSync(^{
+            @try {
+                if (!gUIOffViews) gUIOffViews = [NSMutableArray array];
+                UIView *h = AIHitAtPoint(CGPointMake(x, y));
+                if (h && h.userInteractionEnabled) {
+                    h.userInteractionEnabled = NO;
+                    [gUIOffViews addObject:h];
+                    info = [NSString stringWithFormat:@"已关交互 %@ 框%@",
+                            NSStringFromClass(h.class),
+                            NSStringFromCGRect([h convertRect:h.bounds toView:nil])];
+                } else info = h ? @"该 view 的交互本来就是关的" : @"hitTest 未命中";
+            } @catch (id e) { info = @"异常"; }
+        });
+        AIReportDict(@{@"op": @"uioff", @"ok": @YES, @"x": @(x), @"y": @(y), @"txt": info});
+        AILog(@"  [cmd] uioff (%.0f,%.0f) -> %@", x, y, info);
+        return;
+    }
+    if ([op isEqualToString:@"uion"]) {         // v27：把剥掉的交互全部还原
+        __block int n = 0;
+        AIMainSync(^{
+            @try {
+                for (UIView *v in gUIOffViews ?: @[]) { v.userInteractionEnabled = YES; n++; }
+                [gUIOffViews removeAllObjects];
+            } @catch (id e) {}
+        });
+        AIReportDict(@{@"op": @"uion", @"ok": @YES, @"n": @(n)});
+        return;
+    }
     // v25：把手势喂进手势识别器本体 —— RN / 自绘 UI 的点击通路
     if ([op isEqualToString:@"gdtap"]) {
         CGFloat x = [cmd[@"x"] floatValue], y = [cmd[@"y"] floatValue];
