@@ -107,7 +107,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v35";   // v35 = v34 + G13 轮询看门狗自愈（轮询线程 hang 死时自动起新一代，不用再杀进程重开）+ 主线程卡死探测；status 新增 wd{} 可观测
+static NSString * const kAIVer = @"v36";   // v36 = v35 + 看门狗误判修正（AIExecCmd 执行命令时更新 gPollTick，治「长命令积压被误判 hang→换代风暴→rst 耗尽」）
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -3367,6 +3367,11 @@ static NSMutableArray *gUIOffViews = nil;   // v27：被 uioff 剥掉交互的�
 
 static void AIExecCmd(NSDictionary *cmd) {
     NSString *op = cmd[@"op"];
+    // v36：执行命令也算「活着」。v35 的看门狗只看轮询 tick，而 text 这类命令
+    // 一跑就是 30~60s 且在轮询线程内同步执行 —— tick 期间不更新，45s 一到就被
+    // 误判 hang 触发换代，积压队列越长换代越频繁，rst 8 次耗尽后自愈瘫痪。
+    // 修法：命令一开始就把 tick 打上去（「我在忙，别换我」），单条命令 <45s 就不会再误判。
+    gPollTick = [[NSDate date] timeIntervalSince1970];
     if (!op) return;
     // v34：凡是「会让手机发生真实变化」的命令，都点亮罩层（人能看到"AI 正在操作手机"）。
     // 只读类（text/tree/probe/find/rows/status/wins/log/wininfo…）不算，不然读屏也糊一层。
