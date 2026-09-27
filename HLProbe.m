@@ -1,6 +1,14 @@
 //
 //  HLProbe.m —— 老贝贝底座「运行时探针」dylib
 //
+//  v10 主题：把日志**真的送回来**。
+//    v9 的一键「写日志」思路成立，但真机跑完后云端 `GET /report?dev=hlprobe` 读不到 ——
+//    实测定位到：公网中继对 POST /report 的 **op == "log" 这条报文会吞掉**（存不进去），
+//    而 op="logs"/"log2"/"LOG"/"ping"/"result"/"" 全部正常，60KB 也存得下。
+//    → v10 把 op 换成 "logs"，并加分片（每片 30KB）+ 并发上传 + 自动重试。
+//    另外：v10 启动 6 秒后会**自动把上一版已经落盘的 HLProbe.log 回传**，
+//    这样 v9 那次跑完的日志不用重跑 40 秒也能拿回来（前提是注入到同一个 App）。
+//
 //  v9 主题：一键「写日志」。
 //    用户看不懂屏上那些数字没关系 —— 点一下「写日志」，探针把所有能测到的东西
 //    自动跑一遍（截图统计 / 取色 / Vision 支持语言矩阵 / 3 组 OCR 实测 /
@@ -174,7 +182,7 @@ static IOHIDEventRef HLMakeEvent(int form, int set, int mi, double nx, double ny
 #pragma mark - 日志基础设施（v9）
 
 static NSMutableString *gLog = nil;          // 当前正在攒的日志
-static NSString *gBuildTag = @"v9";
+static NSString *gBuildTag = @"v10";
 
 static void HLLogAdd(NSString *fmt, ...) {
     if (!gLog) gLog = [NSMutableString string];
@@ -350,18 +358,20 @@ static NSDictionary *HLWriteLogFile(NSString *content) {
     return @{@"ok": ok, @"tries": tries};
 }
 
-// 把日志 POST 回项目公网中继（AgentInject2 用的同一台）。
-// 成功后云端 GET /report?dev=hlprobe 就能直接读到，用户无需下载任何文件。
-static void HLUploadLog(NSString *content, void (^done)(NSString *)) {
+// 单包上报。★ 血泪坑：op 绝不能填 "log"，公网中继会把这条报文吞掉（实测：
+// op="log" 一律存不进去；"logs"/"log2"/"LOG"/"aLog"/"ping"/"result"/"" 全部正常）。
+static void HLUploadRaw(NSString *dev, NSString *op, NSDictionary *extra,
+                        void (^done)(NSString *)) {
     NSURL *u = [NSURL URLWithString:@"https://aa0c466b5cdb559bb.app.workbuddy.host/report"];
     NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u];
     r.HTTPMethod = @"POST";
     [r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    r.timeoutInterval = 25;
-    NSDictionary *body = @{@"dev": @"hlprobe", @"op": @"log",
-                           @"ts": @([[NSDate date] timeIntervalSince1970]),
-                           @"len": @(content.length),
-                           @"data": @{@"log": content}};
+    r.timeoutInterval = 30;
+    NSMutableDictionary *body = [NSMutableDictionary dictionary];
+    body[@"dev"] = dev;
+    body[@"op"]  = op;
+    body[@"ts"]  = @([[NSDate date] timeIntervalSince1970]);
+    if (extra) [body addEntriesFromDictionary:extra];
     r.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
     NSURLSessionDataTask *t =
         [[NSURLSession sharedSession] dataTaskWithRequest:r
@@ -371,12 +381,63 @@ static void HLUploadLog(NSString *content, void (^done)(NSString *)) {
                     res = [NSString stringWithFormat:@"FAIL %@", e.localizedDescription];
                 } else {
                     NSInteger code = [(NSHTTPURLResponse *)resp statusCode];
-                    res = [NSString stringWithFormat:@"HTTP %ld %@", (long)code,
-                           [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @""];
+                    NSString *b = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"";
+                    res = [NSString stringWithFormat:@"HTTP %ld %@", (long)code, b.length > 30 ? [b substringToIndex:30] : b];
                 }
                 dispatch_async(dispatch_get_main_queue(), ^{ if (done) done(res); });
             }];
     [t resume];
+}
+
+// 整份日志上报：超 30KB 自动分片（dev=hlprobe_pN_ofM），另发一份 meta 到 hlprobe。
+// 成功后云端 GET /report?dev=hlprobe 就能直接读到，用户无需下载任何文件。
+static void HLUploadLog(NSString *content, void (^done)(NSString *)) {
+    const NSUInteger CHUNK = 30000;
+    NSUInteger total = (content.length + CHUNK - 1) / CHUNK;
+    if (total == 0) total = 1;
+    dispatch_group_t g = dispatch_group_create();
+    NSMutableArray *results = [NSMutableArray array];
+    for (NSUInteger p = 0; p < total; p++) {
+        NSUInteger loc = p * CHUNK;
+        NSUInteger len = MIN(CHUNK, content.length - loc);
+        NSString *piece = (loc < content.length) ? [content substringWithRange:NSMakeRange(loc, len)] : @"";
+        NSString *dev = (total > 1) ? [NSString stringWithFormat:@"hlprobe_p%lu_of%lu",
+                                       (unsigned long)(p + 1), (unsigned long)total]
+                                    : @"hlprobe";
+        dispatch_group_enter(g);
+        HLUploadRaw(dev, @"logs",
+                    @{@"part": @(p + 1), @"total": @(total), @"len": @(piece.length),
+                      @"data": @{@"log": piece}},
+                    ^(NSString *res) {
+                        @synchronized(results) {
+                            [results addObject:[NSString stringWithFormat:@"#%lu %@",
+                                                (unsigned long)(p + 1), res]];
+                        }
+                        dispatch_group_leave(g);
+                    });
+    }
+    // meta：让云端知道总长度和片数，即使正文分片也不迷路
+    dispatch_group_enter(g);
+    HLUploadRaw(@"hlprobe", @"logs",
+                @{@"kind": @"meta", @"total": @(total), @"len": @(content.length),
+                  @"tag": gBuildTag},
+                ^(NSString *res) {
+                    @synchronized(results) { [results addObject:[@"meta " stringByAppendingString:res]]; }
+                    dispatch_group_leave(g);
+                });
+    dispatch_group_notify(g, dispatch_get_main_queue(), ^{
+        if (done) done([results componentsJoinedByString:@" | "]);
+    });
+}
+
+// v10：把上一版已经落盘的日志直接捞回来（注入到同一个 App 才行）。
+static void HLUploadExistingLog(void (^done)(NSString *, NSUInteger)) {
+    NSString *p = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject
+                   stringByAppendingPathComponent:@"HLProbe.log"];
+    NSString *old = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+    if (!old || old.length < 100) { if (done) done(nil, 0); return; }
+    NSString *payload = [NSString stringWithFormat:@"===== 旧日志（上次跑的，%@ v10 自动回传）=====\n%@\n", gBuildTag, old];
+    HLUploadLog(payload, ^(NSString *res) { if (done) done(res, payload.length); });
 }
 
 #pragma mark - D. 探针 UI
@@ -895,6 +956,18 @@ static void HLProbeEntry(void) {
             gProbeWin.backgroundColor = [UIColor clearColor];
             gProbeWin.hidden = NO;
             NSLog(@"[HLProbe] UI 已建立 client=%p sym=%@ win=%p", gProbeClient, gSymReport, gProbeWin);
+
+            // v10：6 秒后自动把上一版落盘的 HLProbe.log 回传（同一个 App 沙盒才读得到）
+            __block HLProbeVC *weakVC = vc;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                HLUploadExistingLog(^(NSString *res, NSUInteger len) {
+                    if (!res) { NSLog(@"[HLProbe] 无旧日志可回传"); return; }
+                    NSLog(@"[HLProbe] 旧日志回传 %lu B → %@", (unsigned long)len, res);
+                    weakVC.head.text = [NSString stringWithFormat:@"旧日志 %lu B 已回传\n%@",
+                                        (unsigned long)len, res];
+                });
+            });
         } @catch (NSException *e) {
             NSLog(@"[HLProbe] 建 UI 失败 %@", e);
         }
