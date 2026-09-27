@@ -182,7 +182,7 @@ static IOHIDEventRef HLMakeEvent(int form, int set, int mi, double nx, double ny
 #pragma mark - 日志基础设施（v9）
 
 static NSMutableString *gLog = nil;          // 当前正在攒的日志
-static NSString *gBuildTag = @"v10";
+static NSString *gBuildTag = @"v11";
 
 static void HLLogAdd(NSString *fmt, ...) {
     if (!gLog) gLog = [NSMutableString string];
@@ -397,30 +397,39 @@ static void HLUploadLog(NSString *content, void (^done)(NSString *)) {
     if (total == 0) total = 1;
     dispatch_group_t g = dispatch_group_create();
     NSMutableArray *results = [NSMutableArray array];
+    // ★ v11：每片发**两个**槽位（base 与 base_b），meta 单独占 hlprobe_meta。
+    //    v10 的教训：正文和 meta 都写 dev=hlprobe，后到的 meta 把 5235B 正文整个覆盖了，
+    //    云端只读到一条 meta。上报必须让不同用途的报文落在不同 key 上。
+    NSMutableArray *jobs = [NSMutableArray array];
     for (NSUInteger p = 0; p < total; p++) {
         NSUInteger loc = p * CHUNK;
         NSUInteger len = MIN(CHUNK, content.length - loc);
         NSString *piece = (loc < content.length) ? [content substringWithRange:NSMakeRange(loc, len)] : @"";
-        NSString *dev = (total > 1) ? [NSString stringWithFormat:@"hlprobe_p%lu_of%lu",
-                                       (unsigned long)(p + 1), (unsigned long)total]
-                                    : @"hlprobe";
+        NSString *base = (total > 1) ? [NSString stringWithFormat:@"hlprobe_p%lu_of%lu",
+                                        (unsigned long)(p + 1), (unsigned long)total]
+                                     : @"hlprobe";
+        [jobs addObject:@[base, piece, @(p + 1)]];
+        [jobs addObject:@[[base stringByAppendingString:@"_b"], piece, @(p + 1)]];
+    }
+    for (NSArray *j in jobs) {
+        NSString *dev = (NSString *)j[0], *piece = (NSString *)j[1];
         dispatch_group_enter(g);
         HLUploadRaw(dev, @"logs",
-                    @{@"part": @(p + 1), @"total": @(total), @"len": @(piece.length),
+                    @{@"part": j[2], @"total": @(total), @"len": @(piece.length),
                       @"data": @{@"log": piece}},
                     ^(NSString *res) {
                         @synchronized(results) {
-                            [results addObject:[NSString stringWithFormat:@"#%lu %@",
-                                                (unsigned long)(p + 1), res]];
+                            [results addObject:[NSString stringWithFormat:@"%@ %@", dev, res]];
                         }
                         dispatch_group_leave(g);
                     });
     }
-    // meta：让云端知道总长度和片数，即使正文分片也不迷路
+    // meta：单独槽位，并带上开头 400 字兜底（正文万一丢了也能看出个大概）
     dispatch_group_enter(g);
-    HLUploadRaw(@"hlprobe", @"logs",
+    HLUploadRaw(@"hlprobe_meta", @"logs",
                 @{@"kind": @"meta", @"total": @(total), @"len": @(content.length),
-                  @"tag": gBuildTag},
+                  @"tag": gBuildTag,
+                  @"head": [content substringToIndex:MIN((NSUInteger)400, content.length)]},
                 ^(NSString *res) {
                     @synchronized(results) { [results addObject:[@"meta " stringByAppendingString:res]]; }
                     dispatch_group_leave(g);
