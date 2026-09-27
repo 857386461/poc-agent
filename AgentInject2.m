@@ -107,7 +107,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v36";   // v36 = v35 + 看门狗误判修正（AIExecCmd 执行命令时更新 gPollTick，治「长命令积压被误判 hang→换代风暴→rst 耗尽」）
+static NSString * const kAIVer = @"v37";   // v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程：v5 脚本每 8s 一条 task 命令踩中跨线程竞态，objc_retain 已释放对象 → SIGSEGV 闪退，.ips 实锤 AITaskDict+468 → objc_retain+16）
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -3711,6 +3711,11 @@ static void AIExecCmd(NSDictionary *cmd) {
         Dl_info di;
         if (dladdr((void *)&AIExecCmd, &di) && di.dli_fname)
             libPath = [NSString stringWithUTF8String:di.dli_fname];
+        // v37（G25）：task{}/ui{} 只能在主线程读 —— 轮询线程在这里裸读 gTask*，
+        // 主线程 AITaskSet 同时在裸写（copy 后 release 旧值），objc_retain 已释放
+        // 对象 = SIGSEGV。所有 gTask* 触碰统一 AIMainSync（与 probe/tapui 同模式）。
+        __block NSDictionary *tsk = nil, *ui = nil;
+        AIMainSync(^{ tsk = AITaskDict(); ui = AIUiDict(); });
         AIReportDict(@{@"op": @"status", @"ok": @YES, @"ver": kAIVer,
                        @"built": @(__DATE__ " " __TIME__),        // v30：编译器固化的构建时刻
                        @"lib": libPath,                            // v30：注入文件真实路径
@@ -3732,8 +3737,8 @@ static void AIExecCmd(NSDictionary *cmd) {
                                 @"age": @((long long)(gPollTick > 0
                                           ? ([[NSDate date] timeIntervalSince1970] - gPollTick) : -1.0)),
                                 @"mainLag": @((long long)gMainLag)},
-                       @"task": AITaskDict(),
-                       @"ui":   AIUiDict()});
+                       @"task": tsk,
+                       @"ui":   ui});
     } else if ([op isEqualToString:@"log"]) {
         NSString *t = AILogSnapshot();
         AIReportDict(@{@"op": @"log", @"ok": @YES, @"text": t});
@@ -3747,39 +3752,49 @@ static void AIExecCmd(NSDictionary *cmd) {
         AISetHudVisible(v);
         AIReportDict(@{@"op": @"hud", @"ok": @YES, @"visible": @(v)});
     } else if ([op isEqualToString:@"task"]) {      // v30：任务态 -> 三层 UI（唯一状态源）
-        // 云端可下发：name / step(动作) / idx / total / ok / state / brief(一句话) / ev(证据) / pin / guard
-        id nm = cmd[@"name"], st = cmd[@"step"];
-        NSString *name  = [nm isKindOfClass:[NSString class]] ? nm : @"";
-        NSString *step  = [st isKindOfClass:[NSString class]] ? st : @"";
-        int idx   = [cmd[@"idx"] intValue];
-        int total = [cmd[@"total"] intValue];
-        int ok    = cmd[@"ok"] ? [cmd[@"ok"] intValue] : -1;
-        id bf = cmd[@"brief"];
-        NSString *brief = [bf isKindOfClass:[NSString class]] ? bf : step;
-        id stt = cmd[@"state"];
-        NSString *state = [stt isKindOfClass:[NSString class]] ? stt
-                        : ((total > 0) ? @"exec" : @"idle");
-        if (cmd[@"guard"]) gGuardMode = [cmd[@"guard"] isEqualToString:@"verify"] ? @"verify" : @"privacy";
-        if (cmd[@"pin"])   gGuardPinned = [cmd[@"pin"] boolValue];
-        // 结果侧证据进 L3 步骤列表（有 ev 才记，避免把列表刷满）
-        id ev = cmd[@"ev"];
-        if ([ev isKindOfClass:[NSString class]] && [ev length])
-            AIStepAdd(state, step.length ? step : (brief.length ? brief : @"步骤"),
-                      (total > 0 ? [NSString stringWithFormat:@"%d/%d", idx, total] : @""), ev);
-        AITaskSet(name, idx, total, state, ok, brief);
-        gTaskStep = step;
-        if (ok >= 0 && total > 0) {
-            // 结束回顾卡：写原因，不写「操作失败」（规划 §8.1）
-            gTaskResult = (ok == 1)
-                ? [NSString stringWithFormat:@"✓ 任务完成 · %@ %d 步", (name.length ? name : @"任务"), total]
-                : [NSString stringWithFormat:@"✕ 任务没跑完 · 卡在第 %d 步：%@", idx,
-                   (step.length ? step : (brief.length ? brief : @"未知原因"))];
-        }
-        AIReportDict(@{@"op": @"task", @"ok": @YES, @"show": @(total > 0),
-                       @"text": (total > 0)
-                           ? [NSString stringWithFormat:@"%@ %d/%d %@", name, idx, total, brief ?: @""]
-                           : @"(空闲)",
-                       @"task": AITaskDict(), @"ui": AIUiDict()});
+        // v37（G25）竞态修复：整个处理体挪主线程。原实现 gTaskName/gTaskBrief/
+        // gTaskStep/gGuardMode 在轮询线程裸写、AITaskSet 在主线程裸写、AITaskDict/
+        // AIUiDict 在轮询线程裸读 —— v5 脚本每 8s 一条 task 命令，几分钟必踩中
+        // 「主线程 release 旧串 × 轮询线程 objc_retain 旧串」→ SIGSEGV 闪退
+        // （.ips 112750：AITaskDict+468 → +[NSDictionary dictionaryWithObjects:
+        //   forKeys:count:] → objc_retain+16）。主线程串行 = 无锁消灭竞态。
+        // cmd 本身是不可变字典（JSON 反序列化产物），跨线程只读安全。
+        // 云端可下发：name / step(动作) / idx / total / ok / state / brief / ev / pin / guard
+        NSString *nm  = [cmd[@"name"]  isKindOfClass:[NSString class]] ? cmd[@"name"]  : @"";
+        NSString *st  = [cmd[@"step"]  isKindOfClass:[NSString class]] ? cmd[@"step"]  : @"";
+        NSString *bf  = [cmd[@"brief"] isKindOfClass:[NSString class]] ? cmd[@"brief"] : nil;
+        NSString *stt = [cmd[@"state"] isKindOfClass:[NSString class]] ? cmd[@"state"] : nil;
+        NSString *evv = [cmd[@"ev"]    isKindOfClass:[NSString class]] ? cmd[@"ev"]    : nil;
+        __block NSDictionary *rep = nil;
+        AIMainSync(^{
+            NSString *name  = nm, *step = st;
+            NSString *brief = bf ?: step;
+            int idx   = [cmd[@"idx"] intValue];
+            int total = [cmd[@"total"] intValue];
+            int ok    = cmd[@"ok"] ? [cmd[@"ok"] intValue] : -1;
+            NSString *state = stt ?: ((total > 0) ? @"exec" : @"idle");
+            if (cmd[@"guard"]) gGuardMode = [cmd[@"guard"] isEqualToString:@"verify"] ? @"verify" : @"privacy";
+            if (cmd[@"pin"])   gGuardPinned = [cmd[@"pin"] boolValue];
+            // 结果侧证据进 L3 步骤列表（有 ev 才记，避免把列表刷满）
+            if ([evv isKindOfClass:[NSString class]] && [evv length])
+                AIStepAdd(state, step.length ? step : (brief.length ? brief : @"步骤"),
+                          (total > 0 ? [NSString stringWithFormat:@"%d/%d", idx, total] : @""), evv);
+            AITaskSet(name, idx, total, state, ok, brief);
+            gTaskStep = step;              // v37：主线程写（原轮询线程裸写，G25 竞态点）
+            if (ok >= 0 && total > 0) {
+                // 结束回顾卡：写原因，不写「操作失败」（规划 §8.1）
+                gTaskResult = (ok == 1)
+                    ? [NSString stringWithFormat:@"✓ 任务完成 · %@ %d 步", (name.length ? name : @"任务"), total]
+                    : [NSString stringWithFormat:@"✕ 任务没跑完 · 卡在第 %d 步：%@", idx,
+                       (step.length ? step : (brief.length ? brief : @"未知原因"))];
+            }
+            rep = @{@"op": @"task", @"ok": @YES, @"show": @(total > 0),
+                    @"text": (total > 0)
+                        ? [NSString stringWithFormat:@"%@ %d/%d %@", name, idx, total, brief ?: @""]
+                        : @"(空闲)",
+                    @"task": AITaskDict(), @"ui": AIUiDict()};
+        });
+        AIReportDict(rep);
     } else if ([op isEqualToString:@"probe"]) {
         // 我得先看清「这个坐标上到底是什么」，再决定怎么点
         CGFloat x = [cmd[@"x"] floatValue], y = [cmd[@"y"] floatValue];
