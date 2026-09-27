@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v38";   // v38 = v37 + 屏幕识字（会话A 加）：op=ocr 读整屏文字 / op=vfind 按文字找并点。参数来自 HLProbe 真机实测（iOS16.1.2）：accurate + 显式 zh-Hans,en-US + correction=NO 才认得中文；坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程：v5 脚本每 8s 一条 task 命令踩中跨线程竞态，objc_retain 已释放对象 → SIGSEGV 闪退，.ips 实锤 AITaskDict+468 → objc_retain+16）
+static NSString * const kAIVer = @"v39";   // v39 = v38 + G28 看门狗三件套（会话B 合流）：① hang 阈值 45→150s（text/tree 全量 25~90s，45s 对慢命令必然误判换代）；② rst 每 60s 冷却回收 1（原 rst=8 永久放弃换代，13:12 事故通道瘫死实锤）；③ 积压 >3 只执行最后 1 条（换代后新代拉积压慢命令循环换代是耗尽主因）；④ 换代即落盘日志（取证）。v38 = v37 + 屏幕识字（会话A）：op=ocr 读整屏文字 / op=vfind 按文字找并点，参数 accurate + zh-Hans,en-US + correction=NO、坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程，.ips 实锤 AITaskDict 竞态 → SIGSEGV）
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -118,7 +118,10 @@ static volatile int32_t gCmdGot = 0;
 // 心跳也停，唯一恢复办法是杀进程重开 —— 用户在外面根本不知道发生了什么。
 // 做法：轮询线程每完成一趟就打一个 tick；看门狗发现 tick 超过 WD_HANG_SEC 没动，
 // 就起一条「新一代」轮询线程接管，旧线程若哪天醒过来发现代次变了自行退出。
-#define AI_WD_HANG_SEC  45.0     // 一趟最长 2.5s(gap)+8s(超时)=10.5s，45s 足够宽松（后台挂起也容许）
+#define AI_WD_HANG_SEC 150.0     // v39（G28）：45→150。事实：text/tree 全量实测 25~90s，v36 只在命令
+                                 //      开头打一次 tick，45s 阈值对 >45s 的慢命令必然误判换代
+                                 //      → 新代再拉积压慢命令又超时 → 循环换代 → rst 耗尽 → 通道瘫死
+                                 //      （13:12 事故实证：App 活着、主线程活着、命令通道 10 分钟无响应）
 #define AI_WD_MAX_RETRY 8        // 自愈重启上限，防止线程泄漏式暴涨
 static volatile double gPollTick  = 0;    // 轮询线程最后一次「走完一趟」的时刻
 static volatile int32_t gPollGen  = 0;    // 轮询线程代次（只有最新一代继续跑）
@@ -4131,13 +4134,16 @@ static void AIPollLoop(void) {
                             gotCmd = arr.count > 0;
                             // v24：积压保护。App 崩掉/被杀时，云端会攒下一堆没消费的指令，
                             //      重开后一次性灌进来 —— 很可能就是当初把它搞崩的那批。
-                            //      正常操作一次最多下发 1~2 条，超过 3 条基本可以断定是历史遗留。
-                            //      只执行最后 3 条，其余丢弃并上报，避免"一开就再崩"。
+                            // v39（G28）：3 条 → 1 条。事实：13:12 事故里换代后的新代拉到
+                            //      积压慢命令（text 30~90s/条）连执行，45s/条必然再触发换代
+                            //      → 循环到 rst 耗尽 → 通道瘫死。积压 >3 本身就是异常态
+                            //      （正常 poll 间隔 0.35~2.5s 只会攒 1~2 条），过期命令
+                            //      执行最后 1 条（最新意图）即可，其余全丢并上报。
                             if (arr.count > 3) {
-                                AILog(@"  ⚠️ 积压 %lu 条旧指令，只执行最后 3 条", (unsigned long)arr.count);
+                                AILog(@"  ⚠️ 积压 %lu 条旧指令，只执行最后 1 条", (unsigned long)arr.count);
                                 AIReportDict(@{@"op": @"drop", @"ok": @YES,
-                                               @"dropped": @(arr.count - 3), @"total": @(arr.count)});
-                                arr = [arr subarrayWithRange:NSMakeRange(arr.count - 3, 3)];
+                                               @"dropped": @(arr.count - 1), @"total": @(arr.count)});
+                                arr = [arr subarrayWithRange:NSMakeRange(arr.count - 1, 1)];
                             }
                             for (NSDictionary *c in arr) { gCmdGot++; AIExecCmd(c); }
                         }
@@ -4189,9 +4195,21 @@ static void AIWatchdog(void) {
                     int n = __sync_add_and_fetch((int32_t *)&gPollRst, 1);
                     AILog(@"  🩺 G13 看门狗：轮询 %.0fs 没动静，判定 hang，起第 %d 代轮询线程",
                           age, gPollGen + 1);
+                    // v39（G28）：换代即落盘 —— rst 耗尽/进程被杀后内存日志全丢，
+                    // 13:12 事故的现场就是这么丢的。落盘文件下次冷启动仍可读。
+                    @try { AIWriteReport(); } @catch (id e) {}
                     AIReportDict(@{@"op": @"wd", @"ok": @YES, @"ver": kAIVer,
                                    @"age": @((long long)age), @"restart": @(n)});
                     @try { AIPollLoop(); } @catch (NSException *e) { AILog(@"  重启轮询异常 %@", e); }
+                }
+                // v39（G28）：rst 冷却回收 —— 原来 rst 到 8 永久放弃换代（无响应判死刑）。
+                // 13:12 事故实锤：换代后新代拉到积压慢命令（text 30~90s/条）又超阈值，
+                // 循环换代 8 次 ≈7 分钟耗尽 → 彻底瘫。冷却 = 每 60s 还 1 个预算，
+                // 自愈永远在线；真 hang 场景 150s 阈值 + 预算回收依然能救。
+                static volatile double gLastRstCool = 0;   // 看门狗单线程访问，static 即可
+                if (gPollRst > 0 && now - gLastRstCool > 60) {
+                    gLastRstCool = now;
+                    __sync_sub_and_fetch((int32_t *)&gPollRst, 1);
                 }
             }
         }
