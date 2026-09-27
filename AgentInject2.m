@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v39";   // v39 = v38 + G28 看门狗三件套（会话B 合流）：① hang 阈值 45→150s（text/tree 全量 25~90s，45s 对慢命令必然误判换代）；② rst 每 60s 冷却回收 1（原 rst=8 永久放弃换代，13:12 事故通道瘫死实锤）；③ 积压 >3 只执行最后 1 条（换代后新代拉积压慢命令循环换代是耗尽主因）；④ 换代即落盘日志（取证）。v38 = v37 + 屏幕识字（会话A）：op=ocr 读整屏文字 / op=vfind 按文字找并点，参数 accurate + zh-Hans,en-US + correction=NO、坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程，.ips 实锤 AITaskDict 竞态 → SIGSEGV）
+static NSString * const kAIVer = @"v40";   // v40 = v39 + G30 根治（G30：回执通道单边瘫死——飞行模式令域名 poll 连败 4 次后 gActiveBase 切 IP 兜底，轮询带 AITrustDelegate 活着，回执/心跳 POST（AIReportDict）却没带 → IP 直连证书 CN 不匹配 → -1202「证书无效」一切回执单边全灭；看门狗只看轮询 tick（命令还在执行）永不换代，IP 态又无自动回切路径 → 死锁到杀 App。修法：回执与轮询同待遇，IP 态同样 trustAny+Host 覆盖）。v39 = v38 + G28 看门狗三件套（会话B 合流）：① hang 阈值 45→150s（text/tree 全量 25~90s，45s 对慢命令必然误判换代）；② rst 每 60s 冷却回收 1（原 rst=8 永久放弃换代，13:12 事故通道瘫死实锤）；③ 积压 >3 只执行最后 1 条（换代后新代拉积压慢命令循环换代是耗尽主因）；④ 换代即落盘日志（取证）。v38 = v37 + 屏幕识字（会话A）：op=ocr 读整屏文字 / op=vfind 按文字找并点，参数 accurate + zh-Hans,en-US + correction=NO、坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程，.ips 实锤 AITaskDict 竞态 → SIGSEGV）
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -3521,11 +3521,22 @@ static void AIReportDict(NSDictionary *d) {
     NSData *bd = [NSJSONSerialization dataWithJSONObject:m options:0 error:nil];
     if (!bd) return;
     @try {
+        // G30（v39 真机确诊）：飞行模式令域名 poll 连败 4 次后 gActiveBase 切 IP 兜底，
+        // 轮询带 AITrustDelegate（信任任意证书）活着，回执/心跳 POST 却没带 ——
+        // IP 直连证书 CN 不匹配 → -1202「此服务器的证书无效」，一切回执单边全灭，
+        // 而看门狗只看轮询 tick（命令还在执行）永不换代，IP 态又无自动回切路径，
+        // 只能杀 App。修法：回执与轮询同待遇 —— IP 态同样 trustAny + Host 覆盖回域名。
+        BOOL isIP = [(gActiveBase ?: @"") hasPrefix:@"https://4"];
+        NSData *out = nil; NSInteger httpCode = 0; NSTimeInterval ms = 0;
         NSError *e = nil;
-        AIHttpErr([(gActiveBase ?: gBase) stringByAppendingString:@"/report"], bd, 15.0, &e);
-        if (e) {
-            gRepErr++; gLastErrCode = e.code; gLastErrText = e.localizedDescription;
-            AILog(@"  ⚠️ 上报失败(%@): %@ (code=%ld)", m[@"op"], e.localizedDescription, (long)e.code);
+        AIHttpEx([(gActiveBase ?: gBase) stringByAppendingString:@"/report"], bd, 15.0,
+                 isIP, isIP ? @"aa0c466b5cdb559bb.app.workbuddy.host" : nil,
+                 &out, &e, &httpCode, &ms);
+        if (e || httpCode >= 400) {
+            gRepErr++; gLastErrCode = e ? e.code : httpCode;
+            gLastErrText = e.localizedDescription
+                         ?: [NSString stringWithFormat:@"HTTP %ld", (long)httpCode];
+            AILog(@"  ⚠️ 上报失败(%@): %@ (code=%ld)", m[@"op"], gLastErrText, (long)gLastErrCode);
         } else {
             gRepOK++;
         }
@@ -3919,7 +3930,7 @@ static void AIExecCmd(NSDictionary *cmd) {
                        @"ops": @"wait pick picktxt tapui tap scroll swipe rows tree toast probe "
                                @"back nav find rntap dismiss uioff uion gdtap wintap schemes open "
                                @"shot wins win gtap chain text dump update core ball overlay "
-                               @"status log hud task macro diag",
+                               @"status log hud task macro diag ocr vfind",
                        @"proc": gProcName, @"bundle": gBundleId, @"pid": @(getpid()),
                        @"tap": @(gBestTap), @"shot": @(gBestShot),
                        @"mon": @(gMonHits), @"se": @(gSendEventHits),
