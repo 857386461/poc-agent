@@ -45,11 +45,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="inject2-${{ github.run_number }}"
+          # v30 起：release 只挂 dylib，不再打 zip 包（用户要求：直接产出 dylib）
           gh release create "$TAG" \
             build/AgentInject2.dylib \
-            build/AgentInject2.zip \
             --title "AgentInject2 dylib $TAG" \
-            --notes "TrollFools 注入用：下载 AgentInject2.zip → 解压出 .dylib → TrollFools 选择 App 注入 → 打开 App 等 8 秒 → 看盖屏自检报告"
+            --notes "TrollFools 注入用：下载 AgentInject2.dylib → TrollFools 选择 App 注入 → 打开 App 等 8 秒"
 
       - name: Upload build log on failure
         if: failure()
