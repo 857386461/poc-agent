@@ -98,7 +98,9 @@ echo "=== [2d/5] Vision OCR 可用性诊断（v7 新增：老贝贝识字链路�
 VFW="$SDK/System/Library/Frameworks/Vision.framework"
 echo "--- Vision.framework ---"
 ls "$VFW" 2>/dev/null | head -8 || echo "  [结论] SDK 里没有 Vision.framework"
-VH=$(find "$VFW/Headers" -name "VNRecognizeTextRequest.h" 2>/dev/null | head -1)
+# 注意：iOS SDK 的 framework 头文件不在顶层 Headers/，而是 Versions/A/Headers/，
+#   find 顶层会落空（v8 就踩了，只 ls 到 Resources/Versions/Vision）。全目录搜。
+VH=$(find "$VFW" -name "VNRecognizeTextRequest.h" 2>/dev/null | head -1)
 echo "头文件: ${VH:-（未找到 VNRecognizeTextRequest.h）}"
 if [ -n "$VH" ]; then
   echo "--- recognitionLevel 枚举 ---"
