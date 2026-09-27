@@ -93,6 +93,7 @@ if [ -n "$TBD" ]; then
 fi
 } 2>&1 | tee -a "$REPORT"
 
+{
 echo "=== [2d/5] Vision OCR 可用性诊断（v7 新增：老贝贝识字链路） ==="
 VFW="$SDK/System/Library/Frameworks/Vision.framework"
 echo "--- Vision.framework ---"
@@ -109,6 +110,7 @@ if [ -n "$VH" ]; then
 fi
 # 运行时才能确定的（支持哪些语言、中文在不在）交给 dylib 里的
 # supportedRecognitionLanguagesForTextRecognitionLevel: 真机打屏，见 HLProbe.m 的「识字」按钮。
+} 2>&1 | tee -a "$REPORT"
 
 echo "=== [3/5] 编译 HLProbe.dylib（dlsym 路线，不链 IOKit；OCR 用 Vision） ==="
 rm -f build_hl/HLProbe.dylib build_hl/HLProbe.zip
