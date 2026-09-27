@@ -28,6 +28,8 @@
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <QuartzCore/QuartzCore.h>
+#import <Vision/Vision.h>          // v38：屏幕识字（OCR）—— 通用能力，不针对任何 App
+#import <ImageIO/ImageIO.h>
 #import <objc/runtime.h>
 #import <UIKit/UIGestureRecognizerSubclass.h>   // v25：允许直接调 gr 的 touchesBegan/Ended
 #import <dlfcn.h>
@@ -107,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v37";   // v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程：v5 脚本每 8s 一条 task 命令踩中跨线程竞态，objc_retain 已释放对象 → SIGSEGV 闪退，.ips 实锤 AITaskDict+468 → objc_retain+16）
+static NSString * const kAIVer = @"v38";   // v38 = v37 + 屏幕识字（会话A 加）：op=ocr 读整屏文字 / op=vfind 按文字找并点。参数来自 HLProbe 真机实测（iOS16.1.2）：accurate + 显式 zh-Hans,en-US + correction=NO 才认得中文；坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程：v5 脚本每 8s 一条 task 命令踩中跨线程竞态，objc_retain 已释放对象 → SIGSEGV 闪退，.ips 实锤 AITaskDict+468 → objc_retain+16）
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -2629,6 +2631,171 @@ static UIImage *AIShotByBest(void) {
 }
 
 // ---------------------------------------------------------------------------
+// 9b. 屏幕识字（Vision OCR）—— v38，会话A
+// ---------------------------------------------------------------------------
+// 为什么加它：视图树（tree）对自绘控件 / RN / Flutter / 游戏 UI 基本读不到字，
+// 但**人眼看到的字**一定能被 Vision 读到。这是「对话即操作手机」最缺的一块通用能力。
+//
+// 参数不是猜的，是 HLProbe 在真机（iPhone / iOS 16.1.2）逐项实测出来的，别改：
+//   • recognitionLevel = Accurate
+//   • recognitionLanguages = @[@"zh-Hans", @"en-US"]   ★必须显式写★
+//     用「自动语言包」时「微信」被认成「EXtE」，中文全废。
+//   • usesLanguageCorrection = NO                      ★必须关★
+//     开了语言纠正，中文会被"纠正"成乱码。
+//   • revision 用默认（真机实测 = 3；accurate+rev3 支持 14 种语言含 zh-Hans）
+// 同一屏实测：正确参数 28 条/777ms，「微信」「微信支付」conf=1.00；
+//            fast 档「微信支付」变「,41-*lt」；自动语言包「微信」变「EXtE」。
+//
+// 坐标换算（★坑★）：Vision 的 boundingBox 是【归一化、原点左下】，UIKit 原点左上。
+//   y_ui = (1 - y_vn - h) * H
+// 真机锚点实测：屏顶文字实际 y=44 → 不翻转算 777(Δ733)，翻转算 56(Δ12)。
+// 注意别拿屏幕中部的文字当锚点：y≈H/2 时翻转前后只差 1~2pt，完全没区分力
+// （v7 就是被中部锚点的「Δ51 vs Δ54」骗得差点判反）。
+
+// 图像平均亮度（0-255，-1=取不到）：判断截图是不是黑图
+static int AIImageLuma(UIImage *im) {
+    if (!im) return -1;
+    CGImageRef cg = im.CGImage;
+    if (!cg) return -1;
+    static const int N = 16;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    if (!cs) return -1;
+    uint8_t *buf = (uint8_t *)calloc((size_t)N * N * 4, 1);
+    if (!buf) { CGColorSpaceRelease(cs); return -1; }
+    CGContextRef ctx = CGBitmapContextCreate(buf, N, N, 8, N * 4, cs,
+                                             kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (!ctx) { free(buf); return -1; }
+    CGContextSetInterpolationQuality(ctx, kCGInterpolationLow);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, N, N), cg);
+    CGContextRelease(ctx);
+    long sum = 0;
+    for (int i = 0; i < N * N; i++) {
+        int r = buf[i*4], g = buf[i*4+1], b = buf[i*4+2];
+        sum += (r * 299 + g * 587 + b * 114) / 1000;
+    }
+    free(buf);
+    return (int)(sum / (N * N));
+}
+
+// 挑一张「不是黑图」的截图：黑图是老毛病（多半截到我们自己那层 alert 窗口），
+// 这里按策略顺序试，第一个亮够的就用，顺便把用的是哪条通道回报上去。
+static NSDictionary *AIOCRShot(void) {
+    static const int order[] = {3, 4, 2, 1};
+    static const char *nm[] = {"hierarchy", "layer", "UICreateScreen", "UIGetScreen"};
+    for (int i = 0; i < 4; i++) {
+        UIImage *im = nil;
+        @try {
+            switch (order[i]) {
+                case 3: im = AIShot_Hierarchy(); break;
+                case 4: im = AIShot_Layer();     break;
+                case 2: im = AIShot_Private2();  break;
+                case 1: im = AIShot_Private1();  break;
+            }
+        } @catch (id e) { im = nil; }
+        if (!im || im.size.width < 2) continue;
+        int luma = AIImageLuma(im);
+        AILog(@"  [ocr] 截图[%s] %.0fx%.0f luma=%d", nm[i], im.size.width, im.size.height, luma);
+        if (luma >= 6) {
+            return @{@"im": im, @"how": [NSString stringWithUTF8String:nm[i]], @"luma": @(luma)};
+        }
+    }
+    return nil;
+}
+
+// 跑一次 OCR。kw 为空=全量；非空=只留包含 kw 的（不区分大小写）。
+// 返回 items 已按「从上到下、从左到右」排好，坐标是 UIKit 点坐标（左上原点）。
+static NSDictionary *AIOCRRun(NSString *kw, int limit) {
+    double t0 = [[NSDate date] timeIntervalSince1970];
+    NSDictionary *sh = AIOCRShot();
+    if (!sh) return @{@"ok": @NO, @"err": @"no-shot（四种截图通道全黑或全空）"};
+    UIImage *im = sh[@"im"];
+    CGImageRef cg = im.CGImage;
+    if (!cg) return @{@"ok": @NO, @"err": @"no-cgimage", @"luma": sh[@"luma"]};
+
+    VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] init];
+    req.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+    req.recognitionLanguages = @[@"zh-Hans", @"en-US"];
+    req.usesLanguageCorrection = NO;
+    NSError *err = nil;
+    VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCGImage:cg options:@{}];
+    BOOL done = NO;
+    @try { done = [h performRequests:@[req] error:&err]; } @catch (id e) { done = NO; }
+    double cost = ([[NSDate date] timeIntervalSince1970] - t0) * 1000.0;
+    if (!done) {
+        return @{@"ok": @NO, @"err": err.localizedDescription ?: @"performRequests 失败",
+                 @"luma": sh[@"luma"], @"how": sh[@"how"], @"cost": @((int)cost)};
+    }
+
+    CGSize scr = [UIScreen mainScreen].bounds.size;
+    NSMutableArray *arr = [NSMutableArray array];
+    NSArray *obs = req.results ?: @[];
+    for (VNRecognizedTextObservation *o in obs) {
+        VNRecognizedText *top = [[o topCandidates:1] firstObject];
+        if (!top) continue;
+        NSString *s = top.string ?: @"";
+        if (!s.length) continue;
+        if (kw.length && [s rangeOfString:kw options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+        CGRect bb = o.boundingBox;                       // 归一化，原点【左下】
+        CGFloat w = bb.size.width  * scr.width;
+        CGFloat hh = bb.size.height * scr.height;
+        CGFloat x  = bb.origin.x   * scr.width;
+        CGFloat y  = (1 - bb.origin.y - bb.size.height) * scr.height;   // ★翻转★
+        [arr addObject:@{@"t": s, @"c": @((int)(top.confidence * 100)),
+                         @"x": @((int)x), @"y": @((int)y),
+                         @"w": @((int)w), @"h": @((int)hh),
+                         @"cx": @((int)(x + w / 2)), @"cy": @((int)(y + hh / 2))}];
+    }
+    [arr sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        double ay = [a[@"y"] doubleValue], by = [b[@"y"] doubleValue];
+        if (fabs(ay - by) > 10) return ay < by ? NSOrderedAscending : NSOrderedDescending;
+        return [a[@"x"] doubleValue] < [b[@"x"] doubleValue] ? NSOrderedAscending : NSOrderedDescending;
+    }];
+    if (limit > 0 && (int)arr.count > limit) [arr removeObjectsInRange:NSMakeRange((NSUInteger)limit, arr.count - (NSUInteger)limit)];
+
+    // 摘要行：一条命令就能看懂屏上有什么，不用在云端拼 JSON
+    NSMutableString *sum = [NSMutableString string];
+    for (NSDictionary *d in arr) [sum appendFormat:@"%@@(%@,%@) ", d[@"t"], d[@"cx"], d[@"cy"]];
+    return @{@"ok": @YES, @"n": @(arr.count), @"cost": @((int)cost),
+             @"luma": sh[@"luma"], @"how": sh[@"how"], @"items": arr,
+             @"sum": sum.length ? sum : @"(屏上没识别到文字)"};
+}
+
+// 按文字找并（可选）点它：这是「说人话就能操作」的落点。
+// 点用 tapui（UIControl 路线，真机验证有效）；tapui 没命中再退 sendEvent，
+// 但 sendEvent 成功不代表生效（合成触摸常被自绘层吞），所以 how 要如实回报。
+static NSDictionary *AIOCRFindTap(NSString *kw, int idx, BOOL doTap) {
+    if (!kw.length) return @{@"ok": @NO, @"err": @"缺 s=关键词"};
+    NSDictionary *r = AIOCRRun(kw, 0);
+    NSArray *items = r[@"items"] ?: @[];
+    if (!items.count) {
+        return @{@"ok": @NO, @"err": @"没找到这个文字", @"kw": kw,
+                 @"luma": r[@"luma"] ?: @(-1), @"how": r[@"how"] ?: @""};
+    }
+    NSUInteger i = (idx >= 0 && (NSUInteger)idx < items.count) ? (NSUInteger)idx : 0;
+    NSDictionary *it = items[i];
+    NSMutableDictionary *out = [it mutableCopy];
+    out[@"ok"]  = @YES;
+    out[@"kw"]  = kw;
+    out[@"idx"] = @(i);
+    out[@"hit"] = @(items.count);
+    out[@"all"] = [items valueForKey:@"t"];
+    if (doTap) {
+        CGPoint p = CGPointMake([it[@"cx"] doubleValue], [it[@"cy"] doubleValue]);
+        NSString *desc = nil;
+        BOOL ok = NO; NSString *how = @"none";
+        @try { ok = AITapUIControlAt(p, &desc); if (ok) how = @"tapui"; } @catch (id e) {}
+        if (!ok) { @try { ok = AIFakeTapAtWindowPoint(p); if (ok) how = @"sendEvent"; } @catch (id e) {} }
+        out[@"tapok"] = @(ok);
+        out[@"how"]   = how;
+        out[@"desc"]  = desc ?: @"";
+        AILog(@"  [ocr] vfind 「%@」-> #%lu (%@,%@) tap=%d via %@ %@",
+              kw, (unsigned long)i, it[@"cx"], it[@"cy"], ok, how, desc ?: @"");
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // 10. UIControl 路线（对 UI 自动化有用，对游戏无用）
 // ---------------------------------------------------------------------------
 static void AIWalkControls(UIView *root, NSMutableArray *out, int depth) {
@@ -3381,6 +3548,33 @@ static void AIExecCmd(NSDictionary *cmd) {
         @"scroll", @"pick", @"picktxt", @"back", @"nav", @"dismiss", @"open",
         @"chain", @"macro", @"task", @"uioff", @"uion", nil];
     if ([kTouchOps containsObject:op]) AIOpMark();
+    // v38：ocr —— 整屏识字（会话A 加）。s=只留含该关键词的(可选)，n=最多几条(默认60)
+    if ([op isEqualToString:@"ocr"]) {
+        NSString *kw = cmd[@"s"] ?: @"";
+        int lim = cmd[@"n"] ? [cmd[@"n"] intValue] : 60;
+        __block NSDictionary *r = nil;
+        AIMainSync(^{ @try { r = AIOCRRun(kw, lim); } @catch (id e) {} });
+        NSMutableDictionary *rep = [r mutableCopy] ?: [NSMutableDictionary dictionary];
+        rep[@"op"] = @"ocr"; rep[@"s"] = kw;
+        AIReportDict(rep);
+        AILog(@"  [cmd] ocr s=%@ -> %@ 条 %@ms luma=%@ via %@",
+              kw.length ? kw : @"(全部)", r[@"n"] ?: @0, r[@"cost"] ?: @0,
+              r[@"luma"] ?: @(-1), r[@"how"] ?: @"-");
+        return;
+    }
+    // v38：vfind —— 按文字找并点它。s=关键词 idx=第几个(默认0) tap=1 则真的点
+    if ([op isEqualToString:@"vfind"]) {
+        NSString *kw = cmd[@"s"] ?: @"";
+        int idx = cmd[@"idx"] ? [cmd[@"idx"] intValue] : 0;
+        BOOL tap = cmd[@"tap"] && [cmd[@"tap"] intValue] == 1;
+        if (tap) AIOpMark();
+        __block NSDictionary *r = nil;
+        AIMainSync(^{ @try { r = AIOCRFindTap(kw, idx, tap); } @catch (id e) {} });
+        NSMutableDictionary *rep = [r mutableCopy] ?: [NSMutableDictionary dictionary];
+        rep[@"op"] = @"vfind";
+        AIReportDict(rep);
+        return;
+    }
     // v27：find —— 列出该点上所有「框里包含它」的非全屏 view（面积升序）
     if ([op isEqualToString:@"find"]) {
         CGFloat x = [cmd[@"x"] floatValue], y = [cmd[@"y"] floatValue];
