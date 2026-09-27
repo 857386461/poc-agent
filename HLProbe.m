@@ -1,29 +1,22 @@
 //
 //  HLProbe.m —— 老贝贝底座「运行时探针」dylib
 //
-//  目的：一次注入，把规格书 §2.4 悬而未决的组合（eventMask × Create 参数个数
-//        × 字段常量）在真机上一个不漏地试完，并把结果用肉眼可见的方式显示出来。
+//  v9 主题：一键「写日志」。
+//    用户看不懂屏上那些数字没关系 —— 点一下「写日志」，探针把所有能测到的东西
+//    自动跑一遍（截图统计 / 取色 / Vision 支持语言矩阵 / 3 组 OCR 实测 /
+//    坐标换算自检 / 27 组触摸合成），写成**一份自包含的日志**：
+//      (1) 写进 App 沙盒多个候选路径（供 Filza 之类手动取）
+//      (2) 直接 POST 回项目公网中继（云端可立即读回，用户零操作）
+//    云端只用看这份日志就能下结论，不再需要用户读屏 / 截图。
 //
-//  为什么不用「改 Makefile 宏重编 9 次」：
-//      · 每换一种组合就要 GitHub 编一次 + 重注入一次，9 种 = 9 轮，太慢
-//      · 崩溃发生在运行时，编译时看不出来
-//      → 这里把 18 种组合（3 事件形态 × 2 字段常量集 × 3 mask）全部编进同一份 dylib，
-//        UI 上一个按钮逐个试；崩了重启 App 自动从断点继续（NSUserDefaults 记录）。
-//
-//  判据（拒绝「看起来对」）：
-//      · 触摸：屏幕正中央有一个计数器按钮。手动点 +1 证明按钮本身活着；
-//        合成触摸若真的到达 App，同一个按钮 +1。数字涨了才算通过。
-//      · 取色：三块纯色 UIView（红/绿/蓝），取色回读 RGB。
-//        红读成蓝 = byte order 反了，一眼可见。
+//  同时修掉 v6/v7/v8 的**真 bug**（这条最要紧）：
+//    v6/v7 判定合成触摸是否到达，比的是 self.synthN ——
+//    但 synthN 除了 onReset 清零外**从不自增**，于是 27 组永远判 NO-EFFECT。
+//    真正被合成触摸顶到的按钮走的是 onManual: → 累加的是 manualN。
+//    → 「27 组合全部 NO-EFFECT」是**假结论**，v9 改成比对 manualN 的增量。
 //
 //  组合编号 k ∈ [0,27)：form = k%3, fieldset = (k/3)%3, mask = (k/9)%3
-//
-//  v7 新增（验证「老贝贝识字」链路能否搬过来）：
-//      · 识字：截目标 App 主窗口 → Vision VNRecognizeTextRequest → 条数/耗时/前 3 条文本+坐标
-//      · 坐标自检：截探针自己的窗口，OCR 找已知位置的 "手动点=N" 文本，
-//        用「不翻转 y」和「y=1-y-h 翻转」两种公式分别回算 UIKit 坐标，
-//        与按钮真实 frame 比误差 —— 一次注入就把 Vision 坐标换算钉死。
-//      · 黑图判定：截图后算平均亮度与非黑像素占比，直接回答「截图是不是息屏黑图」。
+//    （v6 曾用 (k/6)%3，与 (k/3)%3 不独立，27 个编号只覆盖 18 组，v7 已修）
 //
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -33,10 +26,11 @@
 #import <dlfcn.h>
 #import <mach/mach_time.h>
 #import <unistd.h>
+#import <stdarg.h>
 
 #pragma mark - A. IOKit 桥（dlopen + dlsym，与已验证可用的 AgentInject2 同款写法）
 
-static void *gProbeClient = NULL;   // 选中的 HID client（必须定义在使用点之前）
+static void *gProbeClient = NULL;   // 选中的 HID client
 
 // ★ 探针窗口：必须全局强引用 + iOS13+ initWithWindowScene:，否则注入后不显示（v6 修的坑）
 static UIWindow *gProbeWin = nil;
@@ -111,11 +105,11 @@ static void HLLoadHID(void) {
     gSymReport = miss ? [NSString stringWithFormat:@"缺 %d 个: %@", miss, ms] : @"11/11 全部命中";
 }
 
-#pragma mark - B. 两套字段常量（真机已验证 vs 规格书 §2.4 给的）
+#pragma mark - B. 三套字段常量（真机已验证 vs 规格书 §2.4 vs 老贝贝报告）
 
 #define HL_SET_OURS 0   // AgentInject2 真机跑通用：X=0x0B0000
 #define HL_SET_SPEC 1   // 规格书 §2.4 给的：X=0x0B0030
-#define HL_SET_BEI  2   // 老贝贝逆向报告 §4.3：X=0x0B0014 / Y=0x0B0015（三套常量之一，别照抄！）
+#define HL_SET_BEI  2   // 老贝贝逆向报告 §4.3：X=0x0B0014（三套常量之一，别照抄！）
 
 static uint32_t HLFieldX(int set)         { return set==HL_SET_OURS ? 0x0B0000u : (set==HL_SET_SPEC ? 0x0B0030u : 0x0B0014u); }
 static uint32_t HLFieldY(int set)         { return set==HL_SET_OURS ? 0x0B0001u : (set==HL_SET_SPEC ? 0x0B0031u : 0x0B0015u); }
@@ -177,7 +171,32 @@ static IOHIDEventRef HLMakeEvent(int form, int set, int mi, double nx, double ny
     }
 }
 
-#pragma mark - C. 取色（规格书 §3：drawViewHierarchy + CoreGraphics 读像素）
+#pragma mark - 日志基础设施（v9）
+
+static NSMutableString *gLog = nil;          // 当前正在攒的日志
+static NSString *gBuildTag = @"v9";
+
+static void HLLogAdd(NSString *fmt, ...) {
+    if (!gLog) gLog = [NSMutableString string];
+    va_list ap; va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    [gLog appendString:s];
+    [gLog appendString:@"\n"];
+    NSLog(@"[HLProbe] %@", s);
+}
+
+static NSString *HLEnvLine(void) {
+    UIDevice *d = [UIDevice currentDevice];
+    UIScreen *sc = [UIScreen mainScreen];
+    return [NSString stringWithFormat:
+            @"设备=%@ iOS=%@ 屏幕=%.0fx%.0f @%.0fx 首选语言=%@",
+            d.model, d.systemVersion,
+            sc.bounds.size.width, sc.bounds.size.height, sc.scale,
+            [[NSLocale preferredLanguages] firstObject] ?: @"?"];
+}
+
+#pragma mark - C. 截图 / 取色（规格书 §3：drawViewHierarchy + CoreGraphics 读像素）
 
 static UIImage *HLSnapshot(UIWindow *win) {
     if (!win) return nil;
@@ -189,7 +208,7 @@ static UIImage *HLSnapshot(UIWindow *win) {
     return img;
 }
 
-// 返回 "R,G,B (RGBA读) / R,G,B (BGRA读)"
+// 返回 "RGBA(r,g,b) BGRA(r,g,b)"
 static NSString *HLReadPixel(UIImage *img, CGPoint logicPoint) {
     if (!img) return @"no-img";
     CGImageRef cg = img.CGImage;
@@ -215,11 +234,7 @@ static NSString *HLReadPixel(UIImage *img, CGPoint logicPoint) {
 
 #pragma mark - F. Vision OCR（老贝贝识字链路复现 + 坐标换算验证）
 
-static NSString *gLangSupport = @"未查询";
-static NSString *gOCRVerdict = @"待跑";
-
 // 平均亮度 + 非黑像素占比：一眼分辨「截图正常」还是「息屏黑图」。
-// 这是本项目当前的头号悬案（我们回传的 PNG 经常是黑的），必须当场可判。
 static NSString *HLImageStats(UIImage *img) {
     if (!img) return @"no-img";
     CGImageRef cg = img.CGImage;
@@ -246,55 +261,122 @@ static NSString *HLImageStats(UIImage *img) {
             avg, pct, (avg < 6.f ? @" ⚠️黑图(疑似息屏)" : @"")];
 }
 
-// 返回 @{text, x, y, w, h} 数组。x/y/w/h 是 Vision 归一化坐标（原点左下）。
-static NSArray<NSDictionary *> *HLRecognize(UIImage *img, double *costMs) {
-    NSMutableArray *out = [NSMutableArray array];
-    if (!img || !img.CGImage) return out;
+// 逐 revision × level 问系统：这台机器上到底支持哪些语言（中文在不在）。
+// v7 只用 Revision1 问、却用默认 revision 跑 —— 问的和用的不是同一个，结论不可信。
+static NSString *HLLangMatrix(void) {
     if (@available(iOS 13.0, *)) {
-        // 运行时问系统：这台机器上 accurate 档到底支持哪些语言（中文在不在里面）
-        NSError *le = nil;
-        NSArray<NSString *> *langs =
-            [VNRecognizeTextRequest supportedRecognitionLanguagesForTextRecognitionLevel:
-                VNRequestTextRecognitionLevelAccurate
-                revision:VNRecognizeTextRequestRevision1 error:&le];
-        gLangSupport = langs
-            ? [NSString stringWithFormat:@"%lu种%@ · %@",
-                (unsigned long)langs.count,
-                ([langs containsObject:@"zh-Hans"] ? @" ✅含zh-Hans" : @" ❌无zh-Hans"),
-                [[langs subarrayWithRange:NSMakeRange(0, MIN((NSUInteger)6, langs.count))]
-                    componentsJoinedByString:@","]]
-            : [NSString stringWithFormat:@"查询失败 %@", le.localizedDescription];
+        NSMutableString *s = [NSMutableString string];
+        NSArray *levels = @[@(VNRequestTextRecognitionLevelFast), @(VNRequestTextRecognitionLevelAccurate)];
+        NSArray *names  = @[@"fast    ", @"accurate"];
+        for (int li = 0; li < 2; li++) {
+            for (int rev = 1; rev <= 4; rev++) {
+                NSError *e = nil;
+                NSArray<NSString *> *l =
+                    [VNRecognizeTextRequest supportedRecognitionLanguagesForTextRecognitionLevel:[levels[li] integerValue]
+                                                                                        revision:rev
+                                                                                           error:&e];
+                if (l) {
+                    [s appendFormat:@"  %@ rev%d: %lu种 zh-Hans=%@ | %@\n",
+                     names[li], rev, (unsigned long)l.count,
+                     ([l containsObject:@"zh-Hans"] ? @"YES" : @"no"),
+                     [l componentsJoinedByString:@","]];
+                } else {
+                    [s appendFormat:@"  %@ rev%d: 查询失败(%@)\n", names[li], rev, e.localizedDescription ?: @"?"];
+                }
+            }
+        }
+        return s;
+    }
+    return @"  iOS<13 无 Vision\n";
+}
 
+// 跑一次 OCR。返回 @{count,cost,items,err,rev,level}
+static NSDictionary *HLRecognizeEx(UIImage *img, NSInteger level, NSArray *langs,
+                                   BOOL correction, NSInteger revision) {
+    if (!img || !img.CGImage) return @{@"err": @"no-img", @"count": @0, @"items": @[]};
+    if (@available(iOS 13.0, *)) {
         VNImageRequestHandler *hd =
             [[VNImageRequestHandler alloc] initWithCGImage:img.CGImage options:@{}];
         VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] init];
-        req.recognitionLevel      = VNRequestTextRecognitionLevelAccurate;  // 中文只有 accurate 支持
-        req.recognitionLanguages  = @[@"zh-Hans", @"en-US"];
-        req.usesLanguageCorrection = NO;   // 官方明示中文不支持 correction，开了反而改错字
+        req.recognitionLevel = level;
+        if (langs) req.recognitionLanguages = langs;
+        req.usesLanguageCorrection = correction;
+        if (revision > 0) req.revision = revision;
 
         NSDate *t0 = [NSDate date];
         NSError *err = nil;
         BOOL ok = [hd performRequests:@[req] error:&err];
-        if (costMs) *costMs = -[t0 timeIntervalSinceNow] * 1000.0;
-        if (!ok) { gOCRVerdict = [NSString stringWithFormat:@"OCR 失败: %@", err.localizedDescription]; return out; }
-
+        double cost = -[t0 timeIntervalSinceNow] * 1000.0;
+        if (!ok) {
+            return @{@"err": err.localizedDescription ?: @"?",
+                     @"cost": @(cost), @"rev": @(req.revision), @"count": @0, @"items": @[]};
+        }
+        NSMutableArray *items = [NSMutableArray array];
         for (VNObservation *o in req.results) {
             if (![o isKindOfClass:[VNRecognizedTextObservation class]]) continue;
             VNRecognizedTextObservation *ob = (VNRecognizedTextObservation *)o;
             VNRecognizedText *top = [[ob topCandidates:1] firstObject];
             if (!top) continue;
             CGRect bb = ob.boundingBox;   // 归一化，原点左下
-            [out addObject:@{@"text": top.string,
-                             @"x": @(bb.origin.x), @"y": @(bb.origin.y),
-                             @"w": @(bb.size.width), @"h": @(bb.size.height)}];
+            [items addObject:@{@"text": top.string, @"conf": @(top.confidence),
+                               @"x": @(bb.origin.x), @"y": @(bb.origin.y),
+                               @"w": @(bb.size.width), @"h": @(bb.size.height)}];
         }
-        // 视觉顺序：从上到下、从左到右（Vision 的 y 原点在左下，所以按 y 降序）
-        [out sortUsingDescriptors:@[[NSSortDescriptor sortDescriptorWithKey:@"y" ascending:NO],
-                                    [NSSortDescriptor sortDescriptorWithKey:@"x" ascending:YES]]];
-    } else {
-        gOCRVerdict = @"iOS<13 无 Vision OCR";
+        [items sortUsingDescriptors:@[[NSSortDescriptor sortDescriptorWithKey:@"y" ascending:NO],
+                                      [NSSortDescriptor sortDescriptorWithKey:@"x" ascending:YES]]];
+        return @{@"count": @(items.count), @"cost": @(cost), @"items": items,
+                 @"rev": @(req.revision), @"level": @(level)};
     }
-    return out;
+    return @{@"err": @"iOS<13", @"count": @0, @"items": @[]};
+}
+
+#pragma mark - 落盘 / 上传（v9）
+
+// 往多个候选路径写同一份日志；返回 @{ok:[成功路径], tries:[每行结果]}
+static NSDictionary *HLWriteLogFile(NSString *content) {
+    NSMutableArray *paths = [NSMutableArray array];
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    if (docs.length) [paths addObject:[docs stringByAppendingPathComponent:@"HLProbe.log"]];
+    [paths addObject:[NSTemporaryDirectory() stringByAppendingPathComponent:@"HLProbe.log"]];
+    [paths addObject:@"/var/mobile/Documents/HLProbe.log"];   // 若越狱/有权限则最好找
+    [paths addObject:@"/var/mobile/Media/HLProbe.log"];
+    NSMutableArray *ok = [NSMutableArray array], *tries = [NSMutableArray array];
+    for (NSString *p in paths) {
+        NSError *e = nil;
+        BOOL w = [content writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:&e];
+        if (w) { [ok addObject:p]; [tries addObject:[@"✅ " stringByAppendingString:p]]; }
+        else   { [tries addObject:[NSString stringWithFormat:@"❌ %@ (%@)", p, e.localizedDescription ?: @"?"]]; }
+    }
+    return @{@"ok": ok, @"tries": tries};
+}
+
+// 把日志 POST 回项目公网中继（AgentInject2 用的同一台）。
+// 成功后云端 GET /report?dev=hlprobe 就能直接读到，用户无需下载任何文件。
+static void HLUploadLog(NSString *content, void (^done)(NSString *)) {
+    NSURL *u = [NSURL URLWithString:@"https://aa0c466b5cdb559bb.app.workbuddy.host/report"];
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u];
+    r.HTTPMethod = @"POST";
+    [r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    r.timeoutInterval = 25;
+    NSDictionary *body = @{@"dev": @"hlprobe", @"op": @"log",
+                           @"ts": @([[NSDate date] timeIntervalSince1970]),
+                           @"len": @(content.length),
+                           @"data": @{@"log": content}};
+    r.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+    NSURLSessionDataTask *t =
+        [[NSURLSession sharedSession] dataTaskWithRequest:r
+            completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
+                NSString *res;
+                if (e) {
+                    res = [NSString stringWithFormat:@"FAIL %@", e.localizedDescription];
+                } else {
+                    NSInteger code = [(NSHTTPURLResponse *)resp statusCode];
+                    res = [NSString stringWithFormat:@"HTTP %ld %@", (long)code,
+                           [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @""];
+                }
+                dispatch_async(dispatch_get_main_queue(), ^{ if (done) done(res); });
+            }];
+    [t resume];
 }
 
 #pragma mark - D. 探针 UI
@@ -310,12 +392,13 @@ static NSArray<NSDictionary *> *HLRecognize(UIImage *img, double *costMs) {
 @property (nonatomic, strong) UIButton    *target;
 @property (nonatomic, strong) NSArray     *swatches;   // ARC 下不能用 C 数组属性
 @property (nonatomic, strong) UILabel     *colorOut;
-@property (nonatomic, strong) UILabel     *ocrOut;
+@property (nonatomic, strong) UITextView  *ocrOut;      // v9 改可滚动，便于截图备份
 @property (nonatomic, strong) UILabel     *ocrHead;
-@property (nonatomic, assign) int          manualN;
-@property (nonatomic, assign) int          synthN;
+@property (nonatomic, assign) int          manualN;     // 手动/任意 UIKit 触摸命中 TARGET 的次数
+@property (nonatomic, assign) int          synthN;      // 「遍历期间」命中次数（合成触摸的判据）
 @property (nonatomic, assign) int          idx;
 @property (nonatomic, assign) BOOL         autoRunning;
+@property (nonatomic, assign) BOOL         logBusy;
 @property (nonatomic, strong) NSString    *clientName;
 @end
 
@@ -326,25 +409,25 @@ static NSArray<NSDictionary *> *HLRecognize(UIImage *img, double *costMs) {
     CGRect b = [UIScreen mainScreen].bounds;
     self.view.backgroundColor = [UIColor colorWithWhite:0.06 alpha:0.94];
 
-    CGFloat W = b.size.width;
+    CGFloat W = b.size.width, H = b.size.height;
 
-    self.head = [[UILabel alloc] initWithFrame:CGRectMake(8, 44, W - 16, 60)];
+    self.head = [[UILabel alloc] initWithFrame:CGRectMake(8, 44, W - 16, 62)];
     self.head.numberOfLines = 0;
     self.head.font = [UIFont systemFontOfSize:11];
     self.head.textColor = [UIColor whiteColor];
     [self.view addSubview:self.head];
 
-    self.ocrHead = [[UILabel alloc] initWithFrame:CGRectMake(8, 106, W - 16, 46)];
+    self.ocrHead = [[UILabel alloc] initWithFrame:CGRectMake(8, 108, W - 16, 48)];
     self.ocrHead.numberOfLines = 0;
     self.ocrHead.font = [UIFont systemFontOfSize:9.5];
     self.ocrHead.textColor = [UIColor cyanColor];
-    self.ocrHead.text = @"点「识字」跑 Vision OCR（端侧，不联网）";
+    self.ocrHead.text = @"点「写日志」→ 自动跑完并写文件+上传，云端直接读";
     [self.view addSubview:self.ocrHead];
 
     // ★ 必须在屏幕正中央：合成触摸固定打中心点
     self.target = [UIButton buttonWithType:UIButtonTypeSystem];
     self.target.frame = CGRectMake(0, 0, 240, 120);
-    self.target.center = CGPointMake(b.size.width / 2, b.size.height / 2);
+    self.target.center = CGPointMake(W / 2, H / 2);
     self.target.backgroundColor = [UIColor colorWithRed:0.13 green:0.35 blue:0.55 alpha:1];
     self.target.layer.cornerRadius = 12;
     self.target.titleLabel.numberOfLines = 0;
@@ -354,9 +437,9 @@ static NSArray<NSDictionary *> *HLRecognize(UIImage *img, double *costMs) {
           forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.target];
 
-    // 三块纯色
+    // 三块纯色（紧贴 TARGET 下方，TARGET 本身绝不能挪）
     NSArray *cols = @[[UIColor redColor], [UIColor greenColor], [UIColor blueColor]];
-    CGFloat y = b.size.height / 2 + 70;      // 紧贴 TARGET 按钮下方，按钮本身绝不能挪
+    CGFloat y = H / 2 + 70;
     NSMutableArray *sw = [NSMutableArray array];
     for (int i = 0; i < 3; i++) {
         UIView *v = [[UIView alloc] initWithFrame:CGRectMake(20 + i * 90, y, 80, 42)];
@@ -367,35 +450,37 @@ static NSArray<NSDictionary *> *HLRecognize(UIImage *img, double *costMs) {
     }
     self.swatches = sw;
 
-    self.colorOut = [[UILabel alloc] initWithFrame:CGRectMake(12, y + 44, W - 24, 36)];
+    self.colorOut = [[UILabel alloc] initWithFrame:CGRectMake(12, y + 44, W - 24, 34)];
     self.colorOut.numberOfLines = 0;
     self.colorOut.font = [UIFont systemFontOfSize:9.5];
     self.colorOut.textColor = [UIColor yellowColor];
     self.colorOut.text = @"点「取色」后这里显示 期望 vs 实测";
     [self.view addSubview:self.colorOut];
 
-    self.resultList = [[UILabel alloc] initWithFrame:CGRectMake(12, y + 82, W - 24, 64)];
+    self.resultList = [[UILabel alloc] initWithFrame:CGRectMake(12, y + 78, W - 24, 56)];
     self.resultList.numberOfLines = 0;
     self.resultList.font = [UIFont systemFontOfSize:9];
     self.resultList.textColor = [UIColor colorWithWhite:0.8 alpha:1];
     [self.view addSubview:self.resultList];
 
-    self.ocrOut = [[UILabel alloc] initWithFrame:CGRectMake(12, y + 148, W - 24, 84)];
-    self.ocrOut.numberOfLines = 0;
+    self.ocrOut = [[UITextView alloc] initWithFrame:CGRectMake(12, y + 136, W - 24, 96)];
+    self.ocrOut.editable = NO;
+    self.ocrOut.scrollEnabled = YES;
+    self.ocrOut.backgroundColor = [UIColor clearColor];
     self.ocrOut.font = [UIFont systemFontOfSize:8.5];
     self.ocrOut.textColor = [UIColor greenColor];
-    self.ocrOut.text = @"识字结果会显示在这里：条数 / 耗时 / 前 3 条文本与归一化坐标。";
+    self.ocrOut.text = @"日志 / OCR 结果会显示在这里（可上下滚动）。";
     [self.view addSubview:self.ocrOut];
 
-    NSArray *t1 = @[@"识字", @"坐标自检", @"取色", @"试下一个"];
-    SEL s1[4] = {@selector(onOCR:), @selector(onOCRSelf:), @selector(onColor:), @selector(onNext:)};
-    NSArray *t2 = @[@"自动遍历", @"重置", @"隐藏/显示"];
-    SEL s2[3] = {@selector(onAuto:), @selector(onReset:), @selector(onHide:)};
-    CGFloat bw1 = (W - 24) / 4.0, bw2 = (W - 24) / 3.0;
+    NSArray *t1 = @[@"写日志", @"识字", @"坐标自检", @"取色"];
+    SEL s1[4] = {@selector(onWriteLog:), @selector(onOCR:), @selector(onOCRSelf:), @selector(onColor:)};
+    NSArray *t2 = @[@"自动遍历", @"试下一个", @"重置", @"隐藏/显示"];
+    SEL s2[4] = {@selector(onAuto:), @selector(onNext:), @selector(onReset:), @selector(onHide:)};
+    CGFloat bw1 = (W - 24) / 4.0, bw2 = (W - 24) / 4.0;
     for (int i = 0; i < 4; i++) {
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-        btn.frame = CGRectMake(12 + i * bw1, y + 240, bw1 - 4, 36);
-        btn.backgroundColor = (i == 0) ? [UIColor colorWithRed:0.1 green:0.45 blue:0.3 alpha:1]
+        btn.frame = CGRectMake(12 + i * bw1, y + 238, bw1 - 4, 36);
+        btn.backgroundColor = (i == 0) ? [UIColor colorWithRed:0.10 green:0.50 blue:0.32 alpha:1]
                                        : [UIColor colorWithWhite:0.25 alpha:1];
         btn.titleLabel.font = [UIFont systemFontOfSize:11];
         [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
@@ -403,9 +488,9 @@ static NSArray<NSDictionary *> *HLRecognize(UIImage *img, double *costMs) {
         [btn addTarget:self action:s1[i] forControlEvents:UIControlEventTouchUpInside];
         [self.view addSubview:btn];
     }
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-        btn.frame = CGRectMake(12 + i * bw2, y + 282, bw2 - 4, 36);
+        btn.frame = CGRectMake(12 + i * bw2, y + 278, bw2 - 4, 36);
         btn.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1];
         btn.titleLabel.font = [UIFont systemFontOfSize:11];
         [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
@@ -419,7 +504,6 @@ static NSArray<NSDictionary *> *HLRecognize(UIImage *img, double *costMs) {
     self.idx = (int)[ud integerForKey:K_IDX];
     NSInteger trying = [ud integerForKey:K_TRY];
     if (trying > 0) {
-        // 上次写到 trying 却没清掉 = 崩在这个组合上
         NSMutableArray *r = [[ud arrayForKey:K_RES] mutableCopy] ?: [NSMutableArray array];
         while ((int)r.count <= (int)trying - 1) [r addObject:@"?"];
         [r replaceObjectAtIndex:(NSUInteger)(trying - 1) withObject:@"CRASH"];
@@ -433,8 +517,8 @@ static NSArray<NSDictionary *> *HLRecognize(UIImage *img, double *costMs) {
 - (void)refresh {
     int form = self.idx % 3, set = (self.idx / 3) % 3, mi = (self.idx / 9) % 3;
     self.head.text = [NSString stringWithFormat:
-        @"HLProbe v7 %s\n符号:%@\nclient:%@\n下一个 #%d/%d  form=%@ field=%@ mask=%@",
-        __DATE__, gSymReport, self.clientName ?: @"未选",
+        @"HLProbe %@ %s\n符号:%@  client:%@\n下一个 #%d/%d  form=%@ field=%@ mask=%@",
+        gBuildTag, __DATE__, gSymReport, self.clientName ?: @"未选",
         self.idx, HL_TOTAL, HLFormName(form), HLSetName(set), HLMaskName(mi)];
     [self.target setTitle:[NSString stringWithFormat:@"TARGET\n手动点=%d\n合成到=%d",
                            self.manualN, self.synthN]
@@ -468,39 +552,46 @@ static NSArray<NSDictionary *> *HLRecognize(UIImage *img, double *costMs) {
                    dispatch_get_main_queue(), ^{ [self autoStep]; });
 }
 
+// 合成一组触摸。判据改为 manualN 的增量（v6/v7 用 never-increasing 的 synthN，结论无效）
 - (void)runCombo:(int)k {
-    // v7 修正：v6 用 (k/6)%3 取 mask，与 (k/3)%3 不独立，27 个编号只覆盖 18 个组合、
-    // 漏掉 9 个（set0/mi2、set1/mi1、set2/mi0 全没试到）。改成 /9 才是完整 3×3×3。
     int form = k % 3, set = (k / 3) % 3, mi = (k / 9) % 3;
-    int before = self.synthN;
+    int before = self.manualN;
+    int created = 0;
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     [ud setInteger:k + 1 forKey:K_TRY];   // 崩在这里 → 下次启动判定为 CRASH
     [ud synchronize];
 
     @try {
-        IOHIDEventRef ev = NULL;
         for (int ph = 0; ph < 3; ph++) {
-            ev = HLMakeEvent(form, set, mi, 0.5, 0.5, ph);
+            IOHIDEventRef ev = HLMakeEvent(form, set, mi, 0.5, 0.5, ph);
             if (!ev) continue;
+            created++;
             if (gSetSender) gSetSender(ev, 0x4001ULL);
             if (gDispatch && gProbeClient) gDispatch(gProbeClient, ev);
             usleep(120 * 1000);
         }
-    } @catch (NSException *e) { /* 崩在 HID 层的话 ObjC 异常也兜不住，靠 K_TRY 断点 */ }
+    } @catch (NSException *e) { /* HID 层崩溃靠 K_TRY 断点兜 */ }
 
-    // 等事件路由回来再判定
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        int after = self.manualN;
+        BOOL ok = (after > before);
+        if (ok) self.synthN++;
         NSMutableArray *r = [[ud arrayForKey:K_RES] mutableCopy] ?: [NSMutableArray array];
         while ((int)r.count <= k) [r addObject:@"?"];
-        [r replaceObjectAtIndex:(NSUInteger)k
-                     withObject:(self.synthN > before ? @"OK" : @"NO-EFFECT")];
+        [r replaceObjectAtIndex:(NSUInteger)k withObject:(ok ? @"OK" : @"NO-EFFECT")];
         [ud setObject:r forKey:K_RES];
         [ud setInteger:k + 1 forKey:K_IDX];
         [ud removeObjectForKey:K_TRY];   // 正常走完，清掉崩溃标记
         [ud synchronize];
         self.idx = k + 1;
         [self refresh];
+        if (self.logBusy) {
+            HLLogAdd(@"#%02d %@ / %@ / %@ : 事件%d个 命中%d次 → %@",
+                     k, HLFormName(form), HLSetName(set), HLMaskName(mi),
+                     created, after - before, ok ? @"✅OK" : @"NO-EFFECT");
+            [self logSweepStep:k + 1];
+        }
     });
 }
 
@@ -518,9 +609,9 @@ static NSArray<NSDictionary *> *HLRecognize(UIImage *img, double *costMs) {
     self.colorOut.text = s;
 }
 
-#pragma mark - OCR 动作
+#pragma mark - 找目标 App 主窗口
 
-// 找「目标 App 的主窗口」：探针自己的窗口是 UIWindowLevelAlert+1000，必须排除，
+// 探针自己的窗口是 UIWindowLevelAlert+1000，必须排除，
 // 否则截下来全是探针自己的黑底，OCR 出来只有我们自己的字（假成功）。
 static UIWindow *HLAppWindow(void) {
     UIWindow *best = nil;
@@ -532,67 +623,229 @@ static UIWindow *HLAppWindow(void) {
     return best ?: [UIApplication sharedApplication].keyWindow;
 }
 
+#pragma mark - 原有「识字」按钮（单跑一次）
+
 - (void)onOCR:(id)sender {
     self.ocrOut.text = @"识字中…";
     UIWindow *appWin = HLAppWindow();
-    UIImage *img = HLSnapshot(appWin);          // 截图必须在主线程做
-    NSString *stats = HLImageStats(img);        // 先判是不是黑图，黑图 OCR 必然空
-    __block NSString *winDesc = [NSString stringWithFormat:@"win=%@ %@",
-        NSStringFromClass([appWin.rootViewController class]),
-        NSStringFromCGSize(appWin.bounds.size)];
+    UIImage *img = HLSnapshot(appWin);
+    NSString *stats = HLImageStats(img);
+    NSString *winDesc = [NSString stringWithFormat:@"win=%@ %@",
+        NSStringFromClass([appWin.rootViewController class]), NSStringFromCGRect(appWin.bounds)];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        double cost = 0;
-        NSArray *res = HLRecognize(img, &cost);
-        NSString *lang = gLangSupport, *verdict = gOCRVerdict;
+        NSDictionary *r = HLRecognizeEx(img, VNRequestTextRecognitionLevelAccurate,
+                                        @[@"zh-Hans", @"en-US"], NO, 0);
+        NSArray *items = r[@"items"] ?: @[];
         dispatch_async(dispatch_get_main_queue(), ^{
             NSMutableString *s = [NSMutableString string];
-            [s appendFormat:@"条数=%lu 耗时=%.0fms  %@\n", (unsigned long)res.count, cost, stats];
-            for (int i = 0; i < (int)MIN((NSUInteger)3, res.count); i++) {
-                NSDictionary *d = res[i];
+            [s appendFormat:@"条数=%@ 耗时=%.0fms  %@\n", r[@"count"], [r[@"cost"] doubleValue], stats];
+            for (int i = 0; i < (int)MIN((NSUInteger)5, items.count); i++) {
+                NSDictionary *d = items[i];
                 [s appendFormat:@"%d「%@」n(%.2f,%.2f %.2fx%.2f)\n", i, d[@"text"],
-                 [d[@"x"] doubleValue], [d[@"y"] doubleValue],
-                 [d[@"w"] doubleValue], [d[@"h"] doubleValue]];
+                 [d[@"x"] doubleValue], [d[@"y"] doubleValue], [d[@"w"] doubleValue], [d[@"h"] doubleValue]];
             }
-            if (!res.count) [s appendFormat:@"0 条 — %@", verdict];
+            if (!items.count) [s appendFormat:@"0 条 — %@", r[@"err"] ?: @""];
             self.ocrOut.text = s;
             self.ocrHead.text = [NSString stringWithFormat:@"支持语言: %@\n截图: %@  %@",
-                                 lang, stats, winDesc];
+                                 [HLLangMatrix() stringByReplacingOccurrencesOfString:@"\n" withString:@" "],
+                                 stats, winDesc];
         });
     });
 }
 
-// 坐标自检：拿「已知位置的文字」反过来验证 Vision → UIKit 的 y 换算到底哪个对。
-// 锚点：head 里的 "HLProbe"（实际 y=44）与 TARGET 按钮里的"手动点"（实际 y=按钮顶）。
+// 坐标自检：拿「已知位置的文字」反过来验证 Vision → UIKit 的 y 换算。
 - (void)onOCRSelf:(id)sender {
     self.ocrOut.text = @"坐标自检中…（截的是探针自己的窗口）";
     UIImage *img = HLSnapshot(gProbeWin ?: self.view.window);
     CGRect tf = self.target.frame, hf = self.head.frame;
     CGFloat H = [UIScreen mainScreen].bounds.size.height;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        double cost = 0;
-        NSArray *res = HLRecognize(img, &cost);
+        NSDictionary *r = HLRecognizeEx(img, VNRequestTextRecognitionLevelAccurate,
+                                        @[@"zh-Hans", @"en-US"], NO, 0);
+        NSArray *items = r[@"items"] ?: @[];
         NSArray *anchors = @[
             @{@"key": @"HLProbe", @"y": @(hf.origin.y)},
             @{@"key": @"手动点",  @"y": @(tf.origin.y)},
         ];
         NSMutableString *s = [NSMutableString string];
-        [s appendFormat:@"自检 命中%lu条 耗时%.0fms\n", (unsigned long)res.count, cost];
+        [s appendFormat:@"自检 命中%@条 耗时%.0fms\n", r[@"count"], [r[@"cost"] doubleValue]];
         for (NSDictionary *a in anchors) {
             NSString *key = a[@"key"];
             CGFloat expect = [a[@"y"] doubleValue];
             NSDictionary *hit = nil;
-            for (NSDictionary *d in res) {
+            for (NSDictionary *d in items) {
                 if ([[d[@"text"] description] rangeOfString:key].location != NSNotFound) { hit = d; break; }
             }
             if (!hit) { [s appendFormat:@"锚点「%@」未命中\n", key]; continue; }
             double vy = [hit[@"y"] doubleValue], vh = [hit[@"h"] doubleValue];
-            CGFloat yA = (CGFloat)(vy * H);                 // 公式A：不翻转
-            CGFloat yB = (CGFloat)((1.0 - vy - vh) * H);    // 公式B：y_ui = 1 - y_vn - h
+            CGFloat yA = (CGFloat)(vy * H);
+            CGFloat yB = (CGFloat)((1.0 - vy - vh) * H);
             CGFloat dA = fabs(yA - expect), dB = fabs(yB - expect);
             [s appendFormat:@"「%@」实际顶=%.0f | A不翻转=%.0f(Δ%.0f) B翻转=%.0f(Δ%.0f) → %@\n",
              key, expect, yA, dA, yB, dB, (dB < dA ? @"B✅(y=1-y-h)" : @"A✅(不翻转)")];
         }
         dispatch_async(dispatch_get_main_queue(), ^{ self.ocrOut.text = s; });
+    });
+}
+
+#pragma mark - v9 一键写日志
+
+- (void)onWriteLog:(id)sender {
+    if (self.logBusy) return;
+    self.logBusy = YES;
+    self.autoRunning = NO;
+    gLog = [NSMutableString string];
+    self.ocrHead.text = @"写日志：采集中…（约 40s，别关屏、别切 App）";
+    self.ocrOut.text = @"写日志中，请稍候…";
+
+    HLLogAdd(@"================ HLProbe %@ 真机诊断日志 ================", gBuildTag);
+    HLLogAdd(@"构建: %s %s", __DATE__, __TIME__);
+    HLLogAdd(@"时间: %@", [NSDate date]);
+    HLLogAdd(@"%@", HLEnvLine());
+    HLLogAdd(@"bundle: %@", [[NSBundle mainBundle] bundleIdentifier] ?: @"?");
+    HLLogAdd(@"HID 符号: %@", gSymReport);
+    HLLogAdd(@"HID client: %@ (%p)", gProbeClient ? @"已取得" : @"❌失败", gProbeClient);
+    HLLogAdd(@"TARGET 初始 manualN=%d synthN=%d（建议先手点 TARGET 三次再写日志，可作基线）",
+             self.manualN, self.synthN);
+
+    UIWindow *aw = HLAppWindow();
+    UIImage *appImg = HLSnapshot(aw);
+    UIImage *probeImg = HLSnapshot(gProbeWin ?: self.view.window);
+    NSString *stats = HLImageStats(appImg);
+
+    HLLogAdd(@"");
+    HLLogAdd(@"-- [1] 目标窗口 / 截图 --");
+    HLLogAdd(@"目标窗口: %@ %@", NSStringFromClass([aw.rootViewController class]), NSStringFromCGRect(aw.bounds));
+    HLLogAdd(@"截图统计: %@", stats);
+    HLLogAdd(@"截图方法: drawViewHierarchyInRect:afterScreenUpdates:NO");
+
+    HLLogAdd(@"");
+    HLLogAdd(@"-- [2] 取色（探针窗口三纯色块，判 byte order） --");
+    NSArray *expect = @[@"(255,0,0)", @"(0,255,0)", @"(0,0,255)"];
+    for (int i = 0; i < 3; i++) {
+        UIView *v = self.swatches[i];
+        CGPoint c = [self.view convertPoint:CGPointMake(v.bounds.size.width / 2, v.bounds.size.height / 2)
+                                   fromView:v];
+        HLLogAdd(@"  #%d 期望%@ 实测 %@", i, expect[i], HLReadPixel(probeImg, c));
+    }
+
+    HLLogAdd(@"");
+    HLLogAdd(@"-- [3] Vision 支持语言矩阵（逐 revision × level，问系统） --");
+    HLLogAdd(@"%@", HLLangMatrix());
+
+    HLLogAdd(@"");
+    HLLogAdd(@"-- [4] OCR 实测（3 种配置，判中文能不能识） --");
+    [self logOCRMatrix:appImg];
+
+    HLLogAdd(@"");
+    HLLogAdd(@"-- [5] 坐标自检（探针窗口已知位置文字反推 A/B） --");
+    [self logSelfCheck:probeImg];
+
+    HLLogAdd(@"");
+    HLLogAdd(@"-- [6] 触摸 27 组合（合成触摸是否到达 App） --");
+    // 复位触摸计数再遍历
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud removeObjectForKey:K_RES];
+    [ud removeObjectForKey:K_TRY];
+    [ud setInteger:0 forKey:K_IDX];
+    [ud synchronize];
+    self.idx = 0;
+    self.synthN = 0;
+    int base = self.manualN;
+    [self refresh];
+    HLLogAdd(@"遍历前 manualN=%d（基线；若为 0 说明还没人手动点过 TARGET）", base);
+    [self logSweepStep:0];
+}
+
+- (void)logOCRMatrix:(UIImage *)img {
+    if (@available(iOS 13.0, *)) {
+        VNRecognizeTextRequest *d = [[VNRecognizeTextRequest alloc] init];
+        HLLogAdd(@"  默认 revision=%ld（不显式设置时用的就是它）", (long)d.revision);
+    }
+    NSArray *cfgs = @[
+        @{@"name": @"accurate/[zh-Hans,en-US]/corr=NO", @"level": @(VNRequestTextRecognitionLevelAccurate),
+          @"langs": @[@"zh-Hans", @"en-US"], @"corr": @NO},
+        @{@"name": @"accurate/auto-langs/corr=YES", @"level": @(VNRequestTextRecognitionLevelAccurate),
+          @"langs": [NSNull null], @"corr": @YES},
+        @{@"name": @"fast/auto-langs/corr=NO", @"level": @(VNRequestTextRecognitionLevelFast),
+          @"langs": [NSNull null], @"corr": @NO},
+    ];
+    for (NSDictionary *c in cfgs) {
+        NSArray *langs = [c[@"langs"] isKindOfClass:[NSArray class]] ? c[@"langs"] : nil;
+        NSDictionary *r = HLRecognizeEx(img, [c[@"level"] integerValue], langs, [c[@"corr"] boolValue], 0);
+        HLLogAdd(@"  ● %@ → 条数=%@ 耗时=%.0fms rev=%@ %@",
+                 c[@"name"], r[@"count"], [r[@"cost"] doubleValue], r[@"rev"], r[@"err"] ?: @"");
+        NSArray *items = r[@"items"] ?: @[];
+        for (int i = 0; i < (int)MIN((NSUInteger)8, items.count); i++) {
+            NSDictionary *it = items[i];
+            HLLogAdd(@"      %d 「%@」conf=%.2f n(%.3f,%.3f %.3fx%.3f)",
+                     i, it[@"text"], [it[@"conf"] doubleValue],
+                     [it[@"x"] doubleValue], [it[@"y"] doubleValue],
+                     [it[@"w"] doubleValue], [it[@"h"] doubleValue]);
+        }
+    }
+}
+
+- (void)logSelfCheck:(UIImage *)img {
+    NSDictionary *r = HLRecognizeEx(img, VNRequestTextRecognitionLevelAccurate,
+                                    @[@"zh-Hans", @"en-US"], NO, 0);
+    NSArray *items = r[@"items"] ?: @[];
+    CGFloat H = [UIScreen mainScreen].bounds.size.height;
+    HLLogAdd(@"  自检 OCR 命中 %@ 条 耗时 %.0fms", r[@"count"], [r[@"cost"] doubleValue]);
+    NSArray *anchors = @[@{@"key": @"HLProbe", @"y": @(self.head.frame.origin.y)},
+                         @{@"key": @"手动点",  @"y": @(self.target.frame.origin.y)}];
+    for (NSDictionary *a in anchors) {
+        NSString *key = a[@"key"];
+        CGFloat expect = [a[@"y"] doubleValue];
+        NSDictionary *hit = nil;
+        for (NSDictionary *it in items) {
+            if ([it[@"text"] rangeOfString:key].location != NSNotFound) { hit = it; break; }
+        }
+        if (!hit) { HLLogAdd(@"  锚点「%@」未命中", key); continue; }
+        double vy = [hit[@"y"] doubleValue], vh = [hit[@"h"] doubleValue];
+        CGFloat yA = (CGFloat)(vy * H), yB = (CGFloat)((1.0 - vy - vh) * H);
+        HLLogAdd(@"  锚点「%@」实际顶=%.0f | A不翻转=%.0f(Δ%.0f) B翻转=%.0f(Δ%.0f) → %@",
+                 key, expect, yA, fabs(yA - expect), yB, fabs(yB - expect),
+                 (fabs(yB - expect) < fabs(yA - expect) ? @"B✅(y=1-y-h)" : @"A✅(不翻转)"));
+    }
+}
+
+- (void)logSweepStep:(int)k {
+    if (k >= HL_TOTAL) {
+        HLLogAdd(@"遍历完：合成命中 %d / %d 次", self.synthN, HL_TOTAL);
+        if (self.synthN == 0) {
+            HLLogAdd(@"⚠️ 27 组全部 NO-EFFECT —— 若遍历前 manualN>0（按钮本身活着），");
+            HLLogAdd(@"   则说明合成触摸事件根本没到达 App 的 UIKit 层。");
+        } else {
+            HLLogAdd(@"✅ 存在能生效的组合，见上面标 OK 的那几行。");
+        }
+        [self finalizeLog];
+        return;
+    }
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setInteger:k forKey:K_IDX];
+    [ud synchronize];
+    self.idx = k;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [self runCombo:k]; });
+}
+
+- (void)finalizeLog {
+    NSDictionary *w = HLWriteLogFile(gLog);
+    NSMutableString *m = [gLog mutableCopy];
+    [m appendString:@"\n-- [7] 落盘 / 上传 --\n"];
+    [m appendFormat:@"本地写入:\n%@\n", [w[@"tries"] componentsJoinedByString:@"\n"]];
+    NSString *payload = [m copy];
+    self.ocrOut.text = payload;
+    self.ocrHead.text = [NSString stringWithFormat:@"日志 %lu B，上传中…", (unsigned long)payload.length];
+    __weak typeof(self) ws = self;
+    HLUploadLog(payload, ^(NSString *res) {
+        NSString *all = [payload stringByAppendingFormat:@"上传: %@\n", res];
+        HLWriteLogFile(all);
+        ws.ocrHead.text = [NSString stringWithFormat:@"✅日志 %lu B\n上传: %@\n文件: %@",
+                           (unsigned long)all.length, res,
+                           [w[@"ok"] count] ? [w[@"ok"] firstObject] : @"(见下方列表)"];
+        ws.logBusy = NO;
     });
 }
 
@@ -609,7 +862,6 @@ static UIWindow *HLAppWindow(void) {
     w.hidden = !w.hidden;
 }
 
-// 合成触摸到达时，UIKit 会正常路由 → 命中中心按钮 → 这里 +1
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     [super touchesBegan:touches withEvent:event];
 }
@@ -618,10 +870,7 @@ static UIWindow *HLAppWindow(void) {
 
 #pragma mark - E. 注入入口
 
-// ★ 关键修复：窗口必须被全局强引用。原版用 block 内局部变量 UIWindow *w，
-//   block 跑完即被 ARC 回收 → 注入后界面「不显示」。改用 static 全局攥住，
-//   与 AgentInject2 的 gFloatWindow（static UIWindow *）同一套路。
-
+// ★ 窗口必须被全局强引用。原版用 block 内局部变量 UIWindow *w，ARC 跑完即回收 → 不显示。
 __attribute__((constructor))
 static void HLProbeEntry(void) {
     HLLoadHID();
