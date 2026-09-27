@@ -24,6 +24,9 @@ xcrun -sdk iphoneos clang \
   -framework Foundation \
   -framework CoreGraphics \
   -framework QuartzCore \
+  -framework Vision \
+  -framework CoreImage \
+  -framework ImageIO \
   -install_name @executable_path/AgentInject2.dylib \
   -o "$OUT" \
   "$SRC"
