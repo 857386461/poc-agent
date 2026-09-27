@@ -93,7 +93,24 @@ if [ -n "$TBD" ]; then
 fi
 } 2>&1 | tee -a "$REPORT"
 
-echo "=== [3/5] 编译 HLProbe.dylib（dlsym 路线，不链 IOKit） ==="
+echo "=== [2d/5] Vision OCR 可用性诊断（v7 新增：老贝贝识字链路） ==="
+VFW="$SDK/System/Library/Frameworks/Vision.framework"
+echo "--- Vision.framework ---"
+ls "$VFW" 2>/dev/null | head -8 || echo "  [结论] SDK 里没有 Vision.framework"
+VH=$(find "$VFW/Headers" -name "VNRecognizeTextRequest.h" 2>/dev/null | head -1)
+echo "头文件: ${VH:-（未找到 VNRecognizeTextRequest.h）}"
+if [ -n "$VH" ]; then
+  echo "--- recognitionLevel 枚举 ---"
+  grep -oE "VNRequestTextRecognitionLevel[A-Za-z]+" "$VH" | sort -u | head
+  echo "--- revision 常量 ---"
+  grep -oE "VNRecognizeTextRequestRevision[0-9]+" "$VH" | sort -u | head
+  echo "--- usesLanguageCorrection / customWords 支持性注释 ---"
+  grep -nE "languageCorrection|customWords|zh-Hans|Supported" "$VH" | head -12
+fi
+# 运行时才能确定的（支持哪些语言、中文在不在）交给 dylib 里的
+# supportedRecognitionLanguagesForTextRecognitionLevel: 真机打屏，见 HLProbe.m 的「识字」按钮。
+
+echo "=== [3/5] 编译 HLProbe.dylib（dlsym 路线，不链 IOKit；OCR 用 Vision） ==="
 rm -f build_hl/HLProbe.dylib build_hl/HLProbe.zip
 xcrun -sdk iphoneos clang \
   -arch arm64 \
@@ -105,6 +122,9 @@ xcrun -sdk iphoneos clang \
   -framework Foundation \
   -framework CoreGraphics \
   -framework QuartzCore \
+  -framework Vision \
+  -framework CoreImage \
+  -framework ImageIO \
   -install_name @executable_path/HLProbe.dylib \
   -o build_hl/HLProbe.dylib \
   HLProbe.m
