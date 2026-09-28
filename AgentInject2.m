@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v40";   // v40 = v39 + G30 根治（G30：回执通道单边瘫死——飞行模式令域名 poll 连败 4 次后 gActiveBase 切 IP 兜底，轮询带 AITrustDelegate 活着，回执/心跳 POST（AIReportDict）却没带 → IP 直连证书 CN 不匹配 → -1202「证书无效」一切回执单边全灭；看门狗只看轮询 tick（命令还在执行）永不换代，IP 态又无自动回切路径 → 死锁到杀 App。修法：回执与轮询同待遇，IP 态同样 trustAny+Host 覆盖）。v39 = v38 + G28 看门狗三件套（会话B 合流）：① hang 阈值 45→150s（text/tree 全量 25~90s，45s 对慢命令必然误判换代）；② rst 每 60s 冷却回收 1（原 rst=8 永久放弃换代，13:12 事故通道瘫死实锤）；③ 积压 >3 只执行最后 1 条（换代后新代拉积压慢命令循环换代是耗尽主因）；④ 换代即落盘日志（取证）。v38 = v37 + 屏幕识字（会话A）：op=ocr 读整屏文字 / op=vfind 按文字找并点，参数 accurate + zh-Hans,en-US + correction=NO、坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程，.ips 实锤 AITaskDict 竞态 → SIGSEGV）
+static NSString * const kAIVer = @"v41";   // v41 = v40 + UI 层四项升级（会话A·独立分支 ui-v40）：U1 悬浮球边缘磁吸（松手吸最近边）；U2 半出屏自愈（可见<2/3 拉回）；U3 L1 wait 态专属文案「◐ 等待 · …」；U4 ui.float 补 ratio 可见比例字段。仅改 UI 段落，未碰轮询/看门狗/ocr/vfind 业务逻辑。   // v40 = v39 + G30 根治（G30：回执通道单边瘫死——飞行模式令域名 poll 连败 4 次后 gActiveBase 切 IP 兜底，轮询带 AITrustDelegate 活着，回执/心跳 POST（AIReportDict）却没带 → IP 直连证书 CN 不匹配 → -1202「证书无效」一切回执单边全灭；看门狗只看轮询 tick（命令还在执行）永不换代，IP 态又无自动回切路径 → 死锁到杀 App。修法：回执与轮询同待遇，IP 态同样 trustAny+Host 覆盖）。v39 = v38 + G28 看门狗三件套（会话B 合流）：① hang 阈值 45→150s（text/tree 全量 25~90s，45s 对慢命令必然误判换代）；② rst 每 60s 冷却回收 1（原 rst=8 永久放弃换代，13:12 事故通道瘫死实锤）；③ 积压 >3 只执行最后 1 条（换代后新代拉积压慢命令循环换代是耗尽主因）；④ 换代即落盘日志（取证）。v38 = v37 + 屏幕识字（会话A）：op=ocr 读整屏文字 / op=vfind 按文字找并点，参数 accurate + zh-Hans,en-US + correction=NO、坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程，.ips 实锤 AITaskDict 竞态 → SIGSEGV）
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -5129,6 +5129,14 @@ static void AICheckUpdateAsync(void) {
     CGFloat y = MIN(MAX(ball.center.y + t.y, 90), sc.height - 90);
     ball.center = CGPointMake(x, y);
     if (g.state == UIGestureRecognizerStateEnded) {
+        // v41·U1 边缘磁吸（规划 §8.4 P2）：松手吸附到最近的左/右边缘，
+        // 避免球停在屏幕正中挡住内容。吸边留 30pt 边距（球半径），动画归位。
+        CGFloat snapX = (x < sc.width / 2) ? 30 : (sc.width - 30);
+        [UIView animateWithDuration:0.22 delay:0
+                            options:UIViewAnimationOptionCurveEaseOut
+                         animations:^{ ball.center = CGPointMake(snapX, y); }
+                         completion:nil];
+        x = snapX;
         AISetFlag(@"fx", (x - 30) / MAX(1, sc.width  - 60));
         AISetFlag(@"fy", (y - 90) / MAX(1, sc.height - 180));
         // 位置存成 0~1 的比例，换机型/转屏也不会跑到屏幕外
@@ -5203,8 +5211,15 @@ static NSString *AITaskLine(void) {
     if (gTaskTotal > 0) {
         NSString *n = gTaskName.length ? gTaskName : @"任务";
         NSString *b = gTaskBrief.length ? gTaskBrief : (gTaskStep.length ? gTaskStep : @"");
-        if (b.length) return [NSString stringWithFormat:@"%@ %d/%d\n%@", n, gTaskIdx, gTaskTotal, b];
-        return [NSString stringWithFormat:@"%@ %d/%d", n, gTaskIdx, gTaskTotal];
+        NSString *head = [NSString stringWithFormat:@"%@ %d/%d", n, gTaskIdx, gTaskTotal];
+        // v41·U3：wait 态在 L1 球上也要有专属前缀（此前只靠形状 ◐ 区分，字面看不出「在等什么」）
+        NSString *stNow = AITaskStateNow();
+        if ([stNow isEqualToString:@"wait"]) {
+            NSString *w = b.length ? b : @"等待中";
+            return [NSString stringWithFormat:@"◐ 等待 · %@", w];
+        }
+        if (b.length) return [NSString stringWithFormat:@"%@\n%@", head, b];
+        return head;
     }
     return gTaskBrief.length ? gTaskBrief : @"待命";
 }
@@ -5259,10 +5274,21 @@ static NSDictionary *AIUiDict(void) {
     NSString *st = AITaskStateNow();
     // v33：float 加可观测字段 —— 球到底在不在，看 win/vis/scn/frame 四个数，不用再靠肉眼猜
     CGRect ff = gFloatWindow ? gFloatWindow.frame : CGRectZero;
+    CGRect sb = [UIScreen mainScreen].bounds;
+    // v41·U4：球可见比例（0~1）。U1 边缘磁吸 / U2 半出屏自愈的判据都能被脚本读回，
+    // 不再只能靠肉眼判断球是不是快跑出屏了（vis<0.67 即触发 U2 自愈）。
+    CGFloat visW = MIN(ff.origin.x + ff.size.width, sb.size.width) - MAX(ff.origin.x, 0);
+    CGFloat visH = MIN(ff.origin.y + ff.size.height, sb.size.height) - MAX(ff.origin.y, 0);
+    CGFloat ratio = 1.0;
+    if (ff.size.width > 0 && ff.size.height > 0) {
+        CGFloat rw = MAX(0, visW) / ff.size.width, rh = MAX(0, visH) / ff.size.height;
+        ratio = MIN(rw, rh);
+    }
     return @{@"float": @{@"dot": st ?: @"idle", @"line": AITaskLine(),
                          @"win":  @(gFloatWindow ? 1 : 0),
                          @"vis":  (gFloatWindow && !gFloatWindow.hidden) ? @1 : @0,
                          @"scn":  (gFloatWindow && gFloatWindow.windowScene) ? @1 : @0,
+                         @"ratio": @(ratio),                       // v41·U4：屏内可见比例
                          @"frame": [NSString stringWithFormat:@"%.0f,%.0f %.0fx%.0f",
                                     ff.origin.x, ff.origin.y, ff.size.width, ff.size.height]},
              @"guard": @{@"visible": (gOverlayWindow && !gOverlayWindow.hidden) ? @1 : @0,
@@ -5303,6 +5329,13 @@ static void AIFloatSync(void) {
         CGRect sb = [UIScreen mainScreen].bounds;
         if (f.size.width <= 0 || f.size.height <= 0) need = YES;
         else if (!CGRectIntersectsRect(f, sb))        need = YES;   // 跑到屏幕外
+        else if (!gFloatExpanded) {
+            // v41·U2 半出屏自愈：球至少要有 2/3 在屏内，否则拉回最近边缘。
+            // v33 只判「完全出屏」，球被拖到只剩一角在屏上时不修（表现：找不回球）。
+            CGFloat visW = MIN(f.origin.x + f.size.width, sb.size.width) - MAX(f.origin.x, 0);
+            CGFloat visH = MIN(f.origin.y + f.size.height, sb.size.height) - MAX(f.origin.y, 0);
+            if (visW < f.size.width * (2.0 / 3.0) || visH < f.size.height * (2.0 / 3.0)) need = YES;
+        }
     }
     if (need) { gFloatForce = YES; AIFloatApply(); }
 }
