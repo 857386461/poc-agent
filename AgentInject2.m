@@ -31,6 +31,7 @@
 #import <Vision/Vision.h>          // v38：屏幕识字（OCR）—— 通用能力，不针对任何 App
 #import <ImageIO/ImageIO.h>
 #import <objc/runtime.h>
+#import <objc/message.h>            // v40ui版1：UIVisualEffectView 毛玻璃用 objc_msgSend 强转
 #import <UIKit/UIGestureRecognizerSubclass.h>   // v25：允许直接调 gr 的 touchesBegan/Ended
 #import <dlfcn.h>
 #import <mach/mach.h>
@@ -109,7 +110,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v41";   // v41 = v40 + UI 层四项升级（会话A·独立分支 ui-v40）：U1 悬浮球边缘磁吸（松手吸最近边）；U2 半出屏自愈（可见<2/3 拉回）；U3 L1 wait 态专属文案「◐ 等待 · …」；U4 ui.float 补 ratio 可见比例字段。仅改 UI 段落，未碰轮询/看门狗/ocr/vfind 业务逻辑。   // v40 = v39 + G30 根治（G30：回执通道单边瘫死——飞行模式令域名 poll 连败 4 次后 gActiveBase 切 IP 兜底，轮询带 AITrustDelegate 活着，回执/心跳 POST（AIReportDict）却没带 → IP 直连证书 CN 不匹配 → -1202「证书无效」一切回执单边全灭；看门狗只看轮询 tick（命令还在执行）永不换代，IP 态又无自动回切路径 → 死锁到杀 App。修法：回执与轮询同待遇，IP 态同样 trustAny+Host 覆盖）。v39 = v38 + G28 看门狗三件套（会话B 合流）：① hang 阈值 45→150s（text/tree 全量 25~90s，45s 对慢命令必然误判换代）；② rst 每 60s 冷却回收 1（原 rst=8 永久放弃换代，13:12 事故通道瘫死实锤）；③ 积压 >3 只执行最后 1 条（换代后新代拉积压慢命令循环换代是耗尽主因）；④ 换代即落盘日志（取证）。v38 = v37 + 屏幕识字（会话A）：op=ocr 读整屏文字 / op=vfind 按文字找并点，参数 accurate + zh-Hans,en-US + correction=NO、坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程，.ips 实锤 AITaskDict 竞态 → SIGSEGV）
+static NSString * const kAIVer = @"v40ui版1";   // v40ui版1 = v40 + UI 层整体视觉重做（会话A·独立分支 ui-v40）：L1 悬浮球 58×58 半透毛玻璃圆 + 上形状下小字 + done/fail 右上脉冲徽标；L3 详细面板改底部贴边大浮层（高 84%）+ grab 条 + 标题/状态 pill + meta 行 + 卡片式步骤列表 + 折叠诊断 + 4 钮控制条（暂停/结束/复制结论/诊断）。视觉规格对齐 UI原型-悬浮球与盖板-v5.html。仅改 AIFloatApply 视觉层，未碰轮询/看门狗/ocr/vfind 业务逻辑；AIUiDict 契约字段结构不变。   // v41 = v40 + UI 层四项升级（会话A·独立分支 ui-v40）：U1 悬浮球边缘磁吸（松手吸最近边）；U2 半出屏自愈（可见<2/3 拉回）；U3 L1 wait 态专属文案「◐ 等待 · …」；U4 ui.float 补 ratio 可见比例字段。仅改 UI 段落，未碰轮询/看门狗/ocr/vfind 业务逻辑。   // v40 = v39 + G30 根治（G30：回执通道单边瘫死——飞行模式令域名 poll 连败 4 次后 gActiveBase 切 IP 兜底，轮询带 AITrustDelegate 活着，回执/心跳 POST（AIReportDict）却没带 → IP 直连证书 CN 不匹配 → -1202「证书无效」一切回执单边全灭；看门狗只看轮询 tick（命令还在执行）永不换代，IP 态又无自动回切路径 → 死锁到杀 App。修法：回执与轮询同待遇，IP 态同样 trustAny+Host 覆盖）。v39 = v38 + G28 看门狗三件套（会话B 合流）：① hang 阈值 45→150s（text/tree 全量 25~90s，45s 对慢命令必然误判换代）；② rst 每 60s 冷却回收 1（原 rst=8 永久放弃换代，13:12 事故通道瘫死实锤）；③ 积压 >3 只执行最后 1 条（换代后新代拉积压慢命令循环换代是耗尽主因）；④ 换代即落盘日志（取证）。v38 = v37 + 屏幕识字（会话A）：op=ocr 读整屏文字 / op=vfind 按文字找并点，参数 accurate + zh-Hans,en-US + correction=NO、坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程，.ips 实锤 AITaskDict 竞态 → SIGSEGV）
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -5173,6 +5174,22 @@ static void AICheckUpdateAsync(void) {
     gGuardPinned = NO;
     AIToast(@"任务已结束");
 }
+// v40ui版1：L3 控制条新增「复制」——把当前结论/步骤复制到剪贴板（对接云端取结论）
+- (void)copyResult:(id)sender {
+    NSMutableString *ms = [NSMutableString new];
+    if (gTaskName.length) [ms appendFormat:@"任务：%@ (%d/%d)\n", gTaskName, gTaskIdx, gTaskTotal];
+    if (gTaskResult.length) [ms appendFormat:@"结论：%@\n", gTaskResult];
+    if (gSteps.count) {
+        [ms appendString:@"步骤：\n"];
+        for (NSDictionary *d in gSteps)
+            [ms appendFormat:@"  %@ %@ %@%@\n", AIShapeFor(d[@"s"]), d[@"act"], d[@"obj"],
+             ([d[@"ev"] length] ? [NSString stringWithFormat:@" → %@", d[@"ev"]] : @"")];
+    }
+    if (!ms.length) [ms appendString:@"（暂无结论）"];
+    UIPasteboard *pb = [UIPasteboard generalPasteboard];
+    pb.string = ms;
+    AIToast(@"结论已复制到剪贴板");
+}
 @end
 static AIFloatTarget *gFT = nil;
 
@@ -5358,7 +5375,6 @@ static void AIFloatApply(void) {
         // v33 · 关键修复：boot 早期 AIFirstWindowScene() 可能还没返回 scene（connectedScenes 为空），
         // 于是建出「无 windowScene 的窗口」—— iOS 13+ 上这种窗口永远不上屏，而且因为
         // gFloatWindow 已非 nil，后面再也不会重建。表现就是「悬浮球不见了」。
-        // 这里一旦发现缺 scene 且现在能拿到 scene，就销毁重建。
         if (gFloatWindow && gFloatWindow.windowScene == nil) {
             UIWindowScene *scnFix = AIFirstWindowScene();
             if (scnFix) { @try { gFloatWindow.hidden = YES; } @catch (id e) {} gFloatWindow = nil; }
@@ -5385,36 +5401,117 @@ static void AIFloatApply(void) {
         if (px <= 0 && py <= 0) { px = 0.86f; py = 0.42f; }        // 默认右侧中间
         CGPoint c = CGPointMake(30 + px * (sc.width - 60), 90 + py * (sc.height - 180));
 
+        // ═══════════════════════════════════════════════════════════════════
+        // v40ui版1 · UI 视觉重做（会话A·独立分支 ui-v40）：
+        //   目标 = 对齐 UI原型-悬浮球与盖板-v5.html 的视觉规格。
+        //   L1 球：58×58 半透毛玻璃 + 圆形轮廓 + 上形状下小字 + done/fail 右上脉冲徽标
+        //   L3 面板：底部贴边大浮层（高 84%）+ grab 条 + 标题/状态pill + meta + 卡片步骤列表
+        //           + 折叠诊断 + 4 钮控制条（暂停/结束/复制结论/诊断）
+        //   契约不变：AIUiDict 的 float/guard/panel 字段结构原样，仅文案取值变化。
+        // ═══════════════════════════════════════════════════════════════════
+
+        NSString *stNow = AITaskStateNow();
+        UIColor  *acc   = AIColorFor(stNow);
+        NSString *shape = AIShapeFor(stNow);
+
+        // ---- 令牌（对齐原型 :root）----
+        UIColor *txtCol  = [UIColor colorWithRed:0.91 green:0.93 blue:0.95 alpha:1.0];  // #e9eef3
+        UIColor *subCol  = [UIColor colorWithRed:0.60 green:0.64 blue:0.69 alpha:1.0];  // #98a4b1
+        UIColor *lineCol = [UIColor colorWithWhite:1.0 alpha:0.10];
+        CGFloat rBall = 29.0;    // 58/2
+        CGFloat rPanel = 22.0;
+
+        // ---- 毛玻璃工厂：优先 UIVisualEffectView，失败/不支持则降级半透纯色 ----
+        // 返回一个已铺满 frame 的容器 view（内含模糊层 + 半透明色罩），保证降级后视觉不塌。
+        UIView *(^makeBlurCard)(CGRect, CGFloat, CGFloat) = ^UIView *(CGRect frame, CGFloat radius, CGFloat tintAlpha) {
+            UIView *card = [[UIView alloc] initWithFrame:frame];
+            card.layer.cornerRadius = radius;
+            card.layer.masksToBounds = YES;
+            card.layer.borderWidth = 1.0;
+            card.layer.borderColor = lineCol.CGColor;
+            BOOL blurred = NO;
+            @try {
+                Class vevCls = NSClassFromString(@"UIVisualEffectView");
+                Class bevCls = NSClassFromString(@"UIBlurEffect");
+                if (vevCls && bevCls) {
+                    // 用 objc_msgSend 强转函数指针，避免 performSelector 对枚举/对象参数的歧义。
+                    id (*mkEffect)(Class, SEL, NSInteger) = (id (*)(Class, SEL, NSInteger))objc_msgSend;
+                    id be = mkEffect(bevCls, @selector(effectWithStyle:), 1);  // UIBlurEffectStyleDark=1
+                    if (be) {
+                        id (*mkView)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+                        id vev = mkView([vevCls alloc], @selector(initWithEffect:), be);
+                        if (vev && [vev isKindOfClass:[UIView class]]) {
+                            UIView *bv = (UIView *)vev;
+                            bv.frame = card.bounds;
+                            bv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+                            [card addSubview:bv];
+                            blurred = YES;
+                        }
+                    }
+                }
+            } @catch (NSException *e) { blurred = NO; }
+            UIView *tint = [[UIView alloc] initWithFrame:card.bounds];
+            tint.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            tint.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:blurred ? (tintAlpha * 0.55) : tintAlpha];
+            tint.userInteractionEnabled = NO;
+            [card addSubview:tint];
+            return card;
+        };
+
         if (!gFloatExpanded) {
-            gFloatWindow.frame = CGRectMake(c.x - 30, c.y - 30, 60, 60);
-            UIView *ball = [[UIView alloc] initWithFrame:CGRectMake(2, 2, 56, 56)];
-            ball.tag = 701;
-            ball.layer.cornerRadius = 28;
-            ball.layer.masksToBounds = YES;
-            ball.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.62];
-            // v30 三层 UI · L1：收起态 = 状态形状 + 一句话（纯任务语言，不再显示版本/指令数）
-            NSString *stNow = (gTaskTotal > 0) ? gTaskState : @"idle";
-            if (gTaskTotal > 0 && gTaskOk == 0) stNow = @"fail";   // 最近一步失败优先显示
-            NSString *shortLine = (gTaskTotal > 0)
-                ? [NSString stringWithFormat:@"%@ %d/%d", (gTaskName.length ? gTaskName : @"任务"), gTaskIdx, gTaskTotal]
-                : @"待命";
-            UILabel *lb = [[UILabel alloc] initWithFrame:CGRectMake(0, 6, 56, 44)];
-            lb.text = [NSString stringWithFormat:@"%@\n%@", AIShapeFor(stNow), shortLine];
-            lb.numberOfLines = 2; lb.textAlignment = NSTextAlignmentCenter;
-            lb.font = [UIFont boldSystemFontOfSize:11];
-            lb.textColor = AIColorFor(stNow);
-            lb.minimumScaleFactor = 0.7; lb.adjustsFontSizeToFitWidth = YES;
-            [ball addSubview:lb];
-            // done 态右上角徽标脉冲：不点开也知道结果（规划 §8.4）
+            // ══════════ L1 悬浮球（收起态）══════════
+            CGFloat bs = 58.0;
+            gFloatWindow.frame = CGRectMake(c.x - bs / 2, c.y - bs / 2, bs, bs);
+
+            UIView *ball = makeBlurCard(CGRectMake(0, 0, bs, bs), rBall, 0.72);
+
+            // 形状图标（上）
+            UILabel *sp = [[UILabel alloc] initWithFrame:CGRectMake(0, 11, bs, 20)];
+            sp.text = shape; sp.textAlignment = NSTextAlignmentCenter;
+            sp.font = [UIFont systemFontOfSize:19 weight:UIFontWeightSemibold];
+            sp.textColor = acc;
+            [ball addSubview:sp];
+
+            // 单行小字（下）：任务简报 / 空闲
+            NSString *word = @"AI 已就绪";
+            if (gTaskTotal > 0) {
+                word = gTaskBrief.length ? gTaskBrief
+                     : (gTaskStep.length ? gTaskStep : [NSString stringWithFormat:@"%@ %d/%d",
+                        (gTaskName.length ? gTaskName : @"任务"), gTaskIdx, gTaskTotal]);
+            } else if (gTaskResult.length) {
+                word = gTaskResult;
+            }
+            UILabel *wd = [[UILabel alloc] initWithFrame:CGRectMake(3, 33, bs - 6, 14)];
+            wd.text = word; wd.textAlignment = NSTextAlignmentCenter;
+            wd.font = [UIFont systemFontOfSize:9.5];
+            wd.textColor = subCol;
+            wd.lineBreakMode = NSLineBreakByTruncatingTail;
+            wd.minimumScaleFactor = 0.7; wd.adjustsFontSizeToFitWidth = YES;
+            [ball addSubview:wd];
+
+            // done/fail 右上角徽标（脉冲）
             NSString *stN = AITaskStateNorm(stNow);
             if ([stN isEqualToString:@"ok"] || [stN isEqualToString:@"fail"]) {
-                UIView *bg = [[UIView alloc] initWithFrame:CGRectMake(38, 3, 15, 15)];
-                bg.layer.cornerRadius = 7.5;
-                bg.backgroundColor = AIColorFor(stNow);
+                UIView *bg = [[UIView alloc] initWithFrame:CGRectMake(bs - 19, 2, 16, 16)];
+                bg.layer.cornerRadius = 8;
+                bg.backgroundColor = acc;
                 bg.layer.borderWidth = 1.5;
                 bg.layer.borderColor = [UIColor whiteColor].CGColor;
+                UILabel *chk = [[UILabel alloc] initWithFrame:bg.bounds];
+                chk.text = [stN isEqualToString:@"ok"] ? @"✓" : @"！";
+                chk.textAlignment = NSTextAlignmentCenter;
+                chk.font = [UIFont boldSystemFontOfSize:10];
+                chk.textColor = [UIColor blackColor];
+                [bg addSubview:chk];
                 [ball addSubview:bg];
+                // 脉冲动效（对齐原型 .badge animation:pulse）
+                CABasicAnimation *pulse = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+                pulse.fromValue = @(1.0); pulse.toValue = @(1.18);
+                pulse.duration = 0.75; pulse.autoreverses = YES;
+                pulse.repeatCount = HUGE_VALF;
+                [bg.layer addAnimation:pulse forKey:@"pulse"];
             }
+
             [ball addGestureRecognizer:[[UITapGestureRecognizer alloc]
                                         initWithTarget:gFT action:@selector(ballTapped:)]];
             UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
@@ -5422,85 +5519,176 @@ static void AIFloatApply(void) {
             [ball addGestureRecognizer:pan];
             [host addSubview:ball];
         } else {
-            CGFloat w = 280, h = 360;
-            CGFloat ox = MIN(MAX(c.x - w / 2, 8), sc.width  - w - 8);
-            CGFloat oy = MIN(MAX(c.y - h / 2, 70), sc.height - h - 8);
-            gFloatWindow.frame = CGRectMake(ox, oy, w, h);
-            UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
-            panel.layer.cornerRadius = 14; panel.layer.masksToBounds = YES;
-            panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.90];
+            // ══════════ L3 详细面板（底部贴边大浮层）══════════
+            CGFloat w = sc.width;
+            CGFloat h = MAX(360.0, sc.height * 0.84);
+            CGFloat oy = sc.height - h;
+            gFloatWindow.frame = CGRectMake(0, oy, w, h);
 
-            // L3 头部：状态形状 + 任务名（纯任务语言）
-            NSString *stP = (gTaskTotal > 0) ? gTaskState : @"idle";
-            if (gTaskTotal > 0 && gTaskOk == 0) stP = @"fail";
-            UILabel *ti = [[UILabel alloc] initWithFrame:CGRectMake(12, 8, w - 62, 22)];
+            UIView *panel = makeBlurCard(CGRectMake(0, 0, w, h), rPanel, 0.97);
+            panel.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;  // 只圆上两角
+
+            CGFloat pad = 16.0;
+            CGFloat y = 12.0;
+
+            // grab 拖拽条
+            UIView *grab = [[UIView alloc] initWithFrame:CGRectMake((w - 38) / 2, y, 38, 4)];
+            grab.layer.cornerRadius = 2;
+            grab.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.22];
+            [panel addSubview:grab];
+            y += 16;
+
+            // 头部：任务名 + 状态 pill
+            NSString *stP = stNow;
+            UILabel *ti = [[UILabel alloc] initWithFrame:CGRectMake(pad, y, w - pad * 2 - 76, 22)];
             ti.text = [NSString stringWithFormat:@"%@ %@", AIShapeFor(stP),
                        (gTaskName.length ? gTaskName : @"无任务")];
-            ti.textColor = AIColorFor(stP); ti.font = [UIFont boldSystemFontOfSize:14];
+            ti.textColor = txtCol; ti.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
             [panel addSubview:ti];
+            // 状态 pill（圆角胶囊，底色=状态色 16% 透明）
+            NSString *pillTxt = (gTaskTotal > 0)
+                ? ([stP isEqualToString:@"exec"] ? @"执行中"
+                   : [stP isEqualToString:@"wait"] ? @"等待中"
+                   : [stP isEqualToString:@"ok"]   ? @"已完成"
+                   : [stP isEqualToString:@"fail"] ? @"失败" : @"空闲")
+                : @"空闲";
+            UILabel *pill = [[UILabel alloc] initWithFrame:CGRectMake(w - pad - 66, y, 66, 22)];
+            pill.text = pillTxt; pill.textAlignment = NSTextAlignmentCenter;
+            pill.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+            pill.textColor = acc;
+            pill.backgroundColor = [acc colorWithAlphaComponent:0.16];
+            pill.layer.cornerRadius = 11; pill.layer.masksToBounds = YES;
+            [panel addSubview:pill];
+            // 收起按钮（点在 pill 右侧不行，放标题行末的独立处）
             UIButton *cx = [UIButton buttonWithType:UIButtonTypeSystem];
-            cx.frame = CGRectMake(w - 50, 6, 44, 26);
+            cx.frame = CGRectMake(w - pad - 66, y + 26, 66, 22);
             [cx setTitle:@"收起" forState:UIControlStateNormal];
+            cx.titleLabel.font = [UIFont systemFontOfSize:12];
             [cx addTarget:gFT action:@selector(collapse:) forControlEvents:UIControlEventTouchUpInside];
             [panel addSubview:cx];
+            y += 26;
 
-            UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, 30, w - 24, 30)];
-            st.numberOfLines = 2; st.font = [UIFont systemFontOfSize:11];
-            st.textColor = [UIColor lightGrayColor];
-            st.text = (gTaskTotal > 0)
-                ? [NSString stringWithFormat:@"步骤 %d/%d · %@", gTaskIdx, gTaskTotal, AITaskLine()]
+            // meta 行：步骤 x/y · 状态
+            UILabel *mt = [[UILabel alloc] initWithFrame:CGRectMake(pad, y, w - pad * 2, 18)];
+            mt.font = [UIFont systemFontOfSize:11.5];
+            mt.textColor = subCol;
+            mt.text = (gTaskTotal > 0)
+                ? [NSString stringWithFormat:@"步骤 %d / %d · %@", gTaskIdx, gTaskTotal, AITaskLine()]
                 : [NSString stringWithFormat:@"空闲待命 · %@", kAIVer];
-            [panel addSubview:st];
+            [panel addSubview:mt];
+            y += 24;
 
-            // 步骤列表：状态图标 + 动作 + 目标 + 结果侧证据
-            NSMutableString *ms = [NSMutableString new];
+            // 步骤列表（卡片行，可滚动）
+            CGFloat ctrlH = 56.0;                               // 底部控制条区
+            CGFloat listH = h - y - ctrlH - 12;
+            UIScrollView *sv = [[UIScrollView alloc] initWithFrame:CGRectMake(pad, y, w - pad * 2, listH)];
+            sv.showsVerticalScrollIndicator = YES;
+            CGFloat ry = 0;
             if (gSteps.count) {
                 for (NSDictionary *d in gSteps) {
-                    [ms appendFormat:@"%@ %@ %@", AIShapeFor(d[@"s"]), d[@"act"], d[@"obj"]];
-                    if ([d[@"ev"] length]) [ms appendFormat:@"  → %@", d[@"ev"]];
-                    [ms appendString:@"\n"];
+                    CGFloat rh = 52.0;
+                    UIView *row = [[UIView alloc] initWithFrame:CGRectMake(0, ry, sv.bounds.size.width, rh)];
+                    row.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.05];
+                    row.layer.cornerRadius = 10; row.layer.masksToBounds = YES;
+                    NSString *rs = AITaskStateNorm(d[@"s"]);
+                    UILabel *ic = [[UILabel alloc] initWithFrame:CGRectMake(10, 0, 22, rh)];
+                    ic.text = AIShapeFor(rs); ic.font = [UIFont systemFontOfSize:15];
+                    ic.textColor = AIColorFor(rs); ic.textAlignment = NSTextAlignmentCenter;
+                    [row addSubview:ic];
+                    UILabel *l1 = [[UILabel alloc] initWithFrame:CGRectMake(38, 9, row.bounds.size.width - 50, 18)];
+                    NSString *act = d[@"act"] ?: @"";
+                    NSString *obj = d[@"obj"] ?: @"";
+                    l1.text = obj.length ? [NSString stringWithFormat:@"%@ %@", act, obj] : act;
+                    l1.font = [UIFont systemFontOfSize:12.5];
+                    l1.textColor = txtCol;
+                    l1.lineBreakMode = NSLineBreakByTruncatingTail;
+                    [row addSubview:l1];
+                    NSString *ev = d[@"ev"] ?: @"";
+                    if (ev.length) {
+                        UILabel *l2 = [[UILabel alloc] initWithFrame:CGRectMake(38, 28, row.bounds.size.width - 50, 16)];
+                        l2.text = [NSString stringWithFormat:@"→ %@", ev];
+                        l2.font = [UIFont fontWithName:@"Menlo" size:9.5] ?: [UIFont systemFontOfSize:9.5];
+                        l2.textColor = subCol;
+                        l2.lineBreakMode = NSLineBreakByTruncatingTail;
+                        [row addSubview:l2];
+                    }
+                    [sv addSubview:row];
+                    ry += rh + 9;
                 }
             } else {
-                [ms appendString:@"（暂无步骤记录）"];
+                UIView *empty = [[UIView alloc] initWithFrame:CGRectMake(0, 0, sv.bounds.size.width, 60)];
+                empty.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.04];
+                empty.layer.cornerRadius = 10;
+                UILabel *el = [[UILabel alloc] initWithFrame:CGRectMake(12, 0, empty.bounds.size.width - 24, 60)];
+                el.text = @"暂无进行中的任务";
+                el.font = [UIFont systemFontOfSize:12];
+                el.textColor = subCol; el.numberOfLines = 2;
+                [empty addSubview:el];
+                [sv addSubview:empty];
+                ry += 69;
             }
-            if (gTaskResult.length) [ms appendFormat:@"\n▶ %@", gTaskResult];   // 结束回顾卡
-            UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(10, 62, w - 20, 188)];
-            tv.backgroundColor = [UIColor colorWithWhite:0.13 alpha:1.0];
-            tv.textColor = [UIColor whiteColor];
-            tv.font = [UIFont fontWithName:@"Menlo" size:9];
-            tv.editable = NO; tv.selectable = YES;
-            tv.text = ms; tv.layer.cornerRadius = 8;
-            [panel addSubview:tv];
+            sv.contentSize = CGSizeMake(sv.bounds.size.width, MAX(ry, sv.bounds.size.height));
+            [panel addSubview:sv];
+            y += listH + 6;
 
-            // 诊断区（默认折叠）：HUD 退役后，网络/版本/中继只在这里
+            // 结果回顾卡（任务结束有结论时）
+            if (gTaskResult.length) {
+                UILabel *rc = [[UILabel alloc] initWithFrame:CGRectMake(pad, y, w - pad * 2, 20)];
+                rc.text = [NSString stringWithFormat:@"▶ %@", gTaskResult];
+                rc.font = [UIFont systemFontOfSize:11.5];
+                rc.textColor = txtCol;
+                rc.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.05];
+                rc.layer.cornerRadius = 8; rc.layer.masksToBounds = YES;
+                [panel addSubview:rc];
+                y += 24;
+            }
+
+            // 诊断区（折叠）
             UIButton *dg = [UIButton buttonWithType:UIButtonTypeSystem];
-            dg.frame = CGRectMake(10, 254, w - 20, 28);
+            dg.frame = CGRectMake(pad, y, w - pad * 2, 24);
             [dg setTitle:(gPanelDiag ? @"▾ 诊断 · 收起" : @"▸ 诊断 · 网络/版本") forState:UIControlStateNormal];
             dg.titleLabel.font = [UIFont systemFontOfSize:12];
             dg.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
             [dg addTarget:gFT action:@selector(toggleDiag:) forControlEvents:UIControlEventTouchUpInside];
             [panel addSubview:dg];
+            y += 26;
             if (gPanelDiag) {
-                UILabel *dl = [[UILabel alloc] initWithFrame:CGRectMake(12, 284, w - 24, 42)];
-                dl.numberOfLines = 3; dl.font = [UIFont fontWithName:@"Menlo" size:9];
-                dl.textColor = [UIColor lightGrayColor];
+                UILabel *dl = [[UILabel alloc] initWithFrame:CGRectMake(pad + 2, y, w - pad * 2 - 4, 40)];
+                dl.numberOfLines = 3; dl.font = [UIFont fontWithName:@"Menlo" size:9.5] ?: [UIFont systemFontOfSize:9.5];
+                dl.textColor = subCol;
                 dl.text = [NSString stringWithFormat:@"%@ 心跳✅%d❌%d 令%d\n%@\n%@",
                            kAIVer, gPollOK, gPollErr, gCmdGot,
                            (gActiveBase ?: (gBase ?: @"-")),
                            (gLastErrText.length ? gLastErrText : @"无错误")];
                 [panel addSubview:dl];
             }
-            // 安全控件：唯一能打断 AI 的入口（≥44pt 原则，这里 32 高但宽 88）
-            UIButton *pz = [UIButton buttonWithType:UIButtonTypeSystem];
-            pz.frame = CGRectMake(10, h - 38, 88, 32);
-            [pz setTitle:@"⏸ 暂停" forState:UIControlStateNormal];
-            [pz addTarget:gFT action:@selector(pauseTask:) forControlEvents:UIControlEventTouchUpInside];
-            [panel addSubview:pz];
-            UIButton *ed = [UIButton buttonWithType:UIButtonTypeSystem];
-            ed.frame = CGRectMake(w - 98, h - 38, 88, 32);
-            [ed setTitle:@"⏹ 结束" forState:UIControlStateNormal];
-            [ed addTarget:gFT action:@selector(endTask:) forControlEvents:UIControlEventTouchUpInside];
-            [panel addSubview:ed];
+
+            // 控制条：4 钮（暂停 / 结束 / 复制结论 / 诊断）—— 贴底部
+            CGFloat by = h - 44.0;
+            CGFloat gap = 7.0;
+            CGFloat bw = (w - pad * 2 - gap * 3) / 4.0;
+            NSArray *titles = @[@"暂停", @"结束", @"复制", @"诊断"];
+            NSArray *sels   = @[@"pauseTask:", @"endTask:", @"copyResult:", @"toggleDiag:"];
+            for (int i = 0; i < 4; i++) {
+                UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+                b.frame = CGRectMake(pad + i * (bw + gap), by, bw, 34);
+                [b setTitle:titles[i] forState:UIControlStateNormal];
+                b.titleLabel.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightMedium];
+                b.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.06];
+                b.layer.cornerRadius = 11; b.layer.masksToBounds = YES;
+                [b setTitleColor:txtCol forState:UIControlStateNormal];
+                SEL sel = NSSelectorFromString(sels[i]);
+                if ([gFT respondsToSelector:sel])
+                    [b addTarget:gFT action:sel forControlEvents:UIControlEventTouchUpInside];
+                else
+                    [b addTarget:gFT action:NSSelectorFromString(sels[i]) forControlEvents:UIControlEventTouchUpInside];
+                if (i == 1) { // 结束=红
+                    b.backgroundColor = [UIColor colorWithRed:1.0 green:0.37 blue:0.37 alpha:0.15];
+                    [b setTitleColor:[UIColor colorWithRed:1.0 green:0.82 blue:0.82 alpha:1.0] forState:UIControlStateNormal];
+                }
+                [panel addSubview:b];
+            }
+
             [host addSubview:panel];
         }
         gFloatWindow.hidden = NO;
