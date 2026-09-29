@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v42";   // v42 = v41 + UI 结构实现（会话主 · 补齐原型 v8 缺失的结构，共 12 处）。v41 只做了 5 处数值微调（颜色/alpha/形状/宽高），用户对比原型后指出「真机还是老界面，只有悬浮球变了」——因为 v41 没新增任何结构，而原型最核心的两块结构真机上根本不存在。本版补齐：① L3 步骤列表：一整块 9px Menlo 灰字 UITextView → UIScrollView + 逐行 AIStepRowView（图标 14 + 动作 12px #e9eef3 + 目标 + Menlo 10px 证据 + 0.5px 分隔线，按状态着色；行高 有证据 48/无 34）；② 结束回顾卡（规划 §8.1 收尾闭环）：原来只有一行 ▶ 拼在文本末尾 → 罩层中央 246×214 大卡（✓/■ + 任务完成·原因 + 用时·动作·失败 三数字 + 知道了 44pt）；③ L2 罩层进度条：「共 N 步 · 当前第 M 步」+ 196×6 进度条（填充 idx/total，与状态同色）；④ L1 球动效：脉动（exec/wait 1.8s 呼吸）+ done 徽标脉冲 + 吸边半隐（edge 开关，alpha .55 右移 18）；⑤ 减少动效：跟随 UIAccessibilityIsReduceMotionEnabled + reduce 开关强制；⑥ L3 副标题加「成功 ✓N」计数；⑦ L3 新增「⧉ 复制步骤全文」按钮（行视图后文字不可选，需显式出口）；⑧ 回顾卡状态机：gRecapShown/gRecapDismissed 双闸。⑨ 结构可观测化（这一条是被否掉的 v41 最该有的东西）：ui{} 新增 panel.steps.n（步骤行数）/ panel.okcnt（成功步数）/ guard.recap（回顾卡在不在）/ guard.recaptext / guard.pct（进度条百分比）/ float.edge / float.reduce —— v41 的 ui{} 里一个结构字段都没有，脚本想测「步骤列表有没有每步一行」也无从下手，只能退化成测 dot 颜色，于是「15/15 全绿但用户不认」；⑩ 新增命令 recapknow（等价点「知道了」）/ copysteps（复制全文，回传剪贴板长度）/ flag（读写 edge·reduce 等开关），让上述结构量全部可被脚本远程断言。—— 关键坑：AIGuardShouldShow 加 gRecapShown（任务收尾 gBusy 归零，否则罩在同帧落下，卡无容器）；task op 里显式 AIGuardRender（AIGuardSync 在罩已显示时不重绘，卡状态变了屏上还是旧的）；AITaskSet 清空分支仅在 gRecapDismissed 时清 gTaskResult（否则云端补发的 task{0,0} 会把刚弹的卡提前干掉）。v41 = v40 + UI 落地（会话主 · 原型 v8 → 真机源码，共 5 处）：① 失败形状 ✕→■（与原型 v4/v8 对齐，规划 §2 与 §9.2 自相矛盾取 ■；形状是语义载体，原型与源码不一致落地必错）；② L1 悬浮球可辨识性：黑 0.62 半透明无描边 → 不透明 #14161a + 2px 亮描边 rgba(255,255,255,.92)，双对比元素取最大值（原型实测 深色宿主旧值仅 1.13:1 近乎隐形，新值 深色 16.29/浅白 6.74/中性灰 12.48/高饱和 14.62 全 ≥3）；③ L1 球词优先读 task.brief（原实现忽略 brief，球上只有干巴巴的 3/7）；④ L2 罩层暗化 0.55→0.65（0.55 在浅色宿主上次级文字仅 3.33:1 不达 WCAG，0.65 是四种宿主全达标的最小可用值 6.57~15.64）；⑤ L3 面板暂停/结束按钮 32→44 高 + 面板 360→380（原注释写着「≥44pt 原则」实际只做 32，而这是唯一能叫停 AI 的安全入口）。v40 = v39 + G30 根治（G30：回执通道单边瘫死——飞行模式令域名 poll 连败 4 次后 gActiveBase 切 IP 兜底，轮询带 AITrustDelegate 活着，回执/心跳 POST（AIReportDict）却没带 → IP 直连证书 CN 不匹配 → -1202「证书无效」一切回执单边全灭；看门狗只看轮询 tick（命令还在执行）永不换代，IP 态又无自动回切路径 → 死锁到杀 App。修法：回执与轮询同待遇，IP 态同样 trustAny+Host 覆盖）。v39 = v38 + G28 看门狗三件套（会话B 合流）：① hang 阈值 45→150s（text/tree 全量 25~90s，45s 对慢命令必然误判换代）；② rst 每 60s 冷却回收 1（原 rst=8 永久放弃换代，13:12 事故通道瘫死实锤）；③ 积压 >3 只执行最后 1 条（换代后新代拉积压慢命令循环换代是耗尽主因）；④ 换代即落盘日志（取证）。v38 = v37 + 屏幕识字（会话A）：op=ocr 读整屏文字 / op=vfind 按文字找并点，参数 accurate + zh-Hans,en-US + correction=NO、坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程，.ips 实锤 AITaskDict 竞态 → SIGSEGV）
+static NSString * const kAIVer = @"v43";   // v43 = v42 + 原型数值/结构精修（会话主 · 对照原型选择器原文逐项核对，共 7 处）：① .step .sy 形状字号 13→**12**（上一版误取 .p-hd .sy 的 15px，改回 .step 继承值 --fz-1=12；同一 class 名在不同作用域取值不同，必须回选择器原文核）、列宽 14→**12**（原型 .step .sy{width:12px}）；② 动作文字 X 33→**31**（.step padding-left 12 + .sy 宽 12 + .l1 gap 7）；③ 步骤行高 48→**51**（有证据行重算：7+18.6+2+15.5+7+0.5，无证据行仍 34）；④ .ev 证据行缩进 33→**31**（.step padding-left 12 + .ev padding-left 19），颜色 .72→**.88**（原型 .ev 用 --txt-2=rgba(255,255,255,.88)）；⑤ L1 球内部拆两元素：原来形状+词塞进一个 11px 双行 label → 形状独立 **19px**（原型 .ball .shape{font-size:19px}）+ 词独立 **9px**、色 .88（原型 .ball .word{font-size:9px;max-width:52px}），脉动动画改挂形状层（原型 .shape.pulse）；⑥ L3 面板头部拆两元素：原来形状+任务名同 label 同色 14px → 形状独立 **15px** 状态色（原型 .p-hd .sy{font-size:15px}）+ 标题恒白 **13px**（原型 .p-hd h3{font-size:13px}，不随状态着色），间距 8（.p-hd gap:8px）；⑦ 版本号自证。v42 = v41 + UI 结构实现（会话主 · 补齐原型 v8 缺失的结构，共 12 处）。v41 只做了 5 处数值微调（颜色/alpha/形状/宽高），用户对比原型后指出「真机还是老界面，只有悬浮球变了」——因为 v41 没新增任何结构，而原型最核心的两块结构真机上根本不存在。本版补齐：① L3 步骤列表：一整块 9px Menlo 灰字 UITextView → UIScrollView + 逐行 AIStepRowView（图标 14 + 动作 12px #e9eef3 + 目标 + Menlo 10px 证据 + 0.5px 分隔线，按状态着色；行高 有证据 48/无 34）；② 结束回顾卡（规划 §8.1 收尾闭环）：原来只有一行 ▶ 拼在文本末尾 → 罩层中央 246×214 大卡（✓/■ + 任务完成·原因 + 用时·动作·失败 三数字 + 知道了 44pt）；③ L2 罩层进度条：「共 N 步 · 当前第 M 步」+ 196×6 进度条（填充 idx/total，与状态同色）；④ L1 球动效：脉动（exec/wait 1.8s 呼吸）+ done 徽标脉冲 + 吸边半隐（edge 开关，alpha .55 右移 18）；⑤ 减少动效：跟随 UIAccessibilityIsReduceMotionEnabled + reduce 开关强制；⑥ L3 副标题加「成功 ✓N」计数；⑦ L3 新增「⧉ 复制步骤全文」按钮（行视图后文字不可选，需显式出口）；⑧ 回顾卡状态机：gRecapShown/gRecapDismissed 双闸。⑨ 结构可观测化（这一条是被否掉的 v41 最该有的东西）：ui{} 新增 panel.steps.n（步骤行数）/ panel.okcnt（成功步数）/ guard.recap（回顾卡在不在）/ guard.recaptext / guard.pct（进度条百分比）/ float.edge / float.reduce —— v41 的 ui{} 里一个结构字段都没有，脚本想测「步骤列表有没有每步一行」也无从下手，只能退化成测 dot 颜色，于是「15/15 全绿但用户不认」；⑩ 新增命令 recapknow（等价点「知道了」）/ copysteps（复制全文，回传剪贴板长度）/ flag（读写 edge·reduce 等开关），让上述结构量全部可被脚本远程断言。—— 关键坑：AIGuardShouldShow 加 gRecapShown（任务收尾 gBusy 归零，否则罩在同帧落下，卡无容器）；task op 里显式 AIGuardRender（AIGuardSync 在罩已显示时不重绘，卡状态变了屏上还是旧的）；AITaskSet 清空分支仅在 gRecapDismissed 时清 gTaskResult（否则云端补发的 task{0,0} 会把刚弹的卡提前干掉）。v41 = v40 + UI 落地（会话主 · 原型 v8 → 真机源码，共 5 处）：① 失败形状 ✕→■（与原型 v4/v8 对齐，规划 §2 与 §9.2 自相矛盾取 ■；形状是语义载体，原型与源码不一致落地必错）；② L1 悬浮球可辨识性：黑 0.62 半透明无描边 → 不透明 #14161a + 2px 亮描边 rgba(255,255,255,.92)，双对比元素取最大值（原型实测 深色宿主旧值仅 1.13:1 近乎隐形，新值 深色 16.29/浅白 6.74/中性灰 12.48/高饱和 14.62 全 ≥3）；③ L1 球词优先读 task.brief（原实现忽略 brief，球上只有干巴巴的 3/7）；④ L2 罩层暗化 0.55→0.65（0.55 在浅色宿主上次级文字仅 3.33:1 不达 WCAG，0.65 是四种宿主全达标的最小可用值 6.57~15.64）；⑤ L3 面板暂停/结束按钮 32→44 高 + 面板 360→380（原注释写着「≥44pt 原则」实际只做 32，而这是唯一能叫停 AI 的安全入口）。v40 = v39 + G30 根治（G30：回执通道单边瘫死——飞行模式令域名 poll 连败 4 次后 gActiveBase 切 IP 兜底，轮询带 AITrustDelegate 活着，回执/心跳 POST（AIReportDict）却没带 → IP 直连证书 CN 不匹配 → -1202「证书无效」一切回执单边全灭；看门狗只看轮询 tick（命令还在执行）永不换代，IP 态又无自动回切路径 → 死锁到杀 App。修法：回执与轮询同待遇，IP 态同样 trustAny+Host 覆盖）。v39 = v38 + G28 看门狗三件套（会话B 合流）：① hang 阈值 45→150s（text/tree 全量 25~90s，45s 对慢命令必然误判换代）；② rst 每 60s 冷却回收 1（原 rst=8 永久放弃换代，13:12 事故通道瘫死实锤）；③ 积压 >3 只执行最后 1 条（换代后新代拉积压慢命令循环换代是耗尽主因）；④ 换代即落盘日志（取证）。v38 = v37 + 屏幕识字（会话A）：op=ocr 读整屏文字 / op=vfind 按文字找并点，参数 accurate + zh-Hans,en-US + correction=NO、坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程，.ips 实锤 AITaskDict 竞态 → SIGSEGV）
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -5436,18 +5436,29 @@ static UIView *AIStepRowView(NSDictionary *d, CGFloat w) {
     UIColor  *c  = AIColorFor(st);
     NSString *ev = d[@"ev"];
     BOOL hasEv = [ev length] > 0;
-    CGFloat rowH = hasEv ? 48.0 : 34.0;            // 有证据行更高（原型 .step padding + .ev 两行）
+    // v43：行高按原型实测重算（不再拍脑袋）。
+    // 原型 .step{padding:7px 12px;line-height:1.55}：无证据行 = 7+18.6+7+0.5 ≈ 34；有证据行 =
+    // 7+18.6+2(.ev margin-top)+15.5+7+0.5 ≈ 51。原实现 48 是漏算了 .ev 的 margin-top 与 .l1 的
+    // line-height 余量，行会挤 —— 步骤多时越挤越明显。
+    CGFloat rowH = hasEv ? 51.0 : 34.0;
     UIView *row = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, rowH)];
     row.backgroundColor = [UIColor clearColor];
 
-    UILabel *sy = [[UILabel alloc] initWithFrame:CGRectMake(12, hasEv ? 7 : 9, 14, 16)];
+    // v43：形状列宽/字号按原型 .step .sy 取值。原型里 **.step .sy 没有 font-size 声明**，
+    // 继承 .step 的 font-size:var(--fz-1)=12px；而 .p-hd .sy{font-size:15px} 是**面板头部**那个
+    // 大形状的尺寸，不是步骤行的。上一版我按 15px 改是读错了选择器 —— 这类「同一 class 名在不同
+    // 作用域下取值不同」的坑，正是 v41 翻车的同类错误，落地前必须回到选择器原文核对。
+    // 列宽 12 也取自原型 .step .sy{width:12px}（不是按字号拍脑袋给的 14）。
+    // Y = 7(.step padding-top) + (18.6-16)/2 ≈ 8，让形状在 l1 行内垂直居中。
+    UILabel *sy = [[UILabel alloc] initWithFrame:CGRectMake(12, 8, 12, 16)];
     sy.text = AIShapeFor(st); sy.textColor = c;
-    sy.font = [UIFont boldSystemFontOfSize:13];
+    sy.font = [UIFont boldSystemFontOfSize:12];
     sy.textAlignment = NSTextAlignmentCenter;
     [row addSubview:sy];
 
-    CGFloat nmX = 12 + 14 + 7;                     // = 33（对齐原型 .l1 gap:7px）
-    UILabel *nm = [[UILabel alloc] initWithFrame:CGRectMake(nmX, hasEv ? 6 : 8, w - nmX - 12, 18)];
+    CGFloat nmX = 12 + 12 + 7;                     // = 31（原型 .step padding-left 12 + .sy 宽 12 + .l1 gap 7）
+    // Y 同上取 8（与形状同基线），高度 18 容纳 12px 字。
+    UILabel *nm = [[UILabel alloc] initWithFrame:CGRectMake(nmX, 7, w - nmX - 12, 18)];
     NSString *act = d[@"act"] ?: @"", *obj = d[@"obj"] ?: @"";
     nm.text = obj.length ? [NSString stringWithFormat:@"%@ %@", act, obj] : act;
     nm.textColor = [UIColor colorWithRed:0.913 green:0.933 blue:0.953 alpha:1.0];   // #e9eef3
@@ -5456,10 +5467,16 @@ static UIView *AIStepRowView(NSDictionary *d, CGFloat w) {
     [row addSubview:nm];
 
     if (hasEv) {
-        UILabel *el = [[UILabel alloc] initWithFrame:CGRectMake(nmX, 26, w - nmX - 12, 14)];
+        // v43：证据行左缩进对齐原型 .ev{padding-left:19px}，即「.step 左内边距 12 + 19 = 31」。
+        // 原实现写 nmX=33（按 图标14+gap7+12 推出来），比原型多 2px —— 依据错了：
+        // 原型的证据行缩进是**相对 .step 的固定值**，不是按图标宽度算的。
+        // 巧合的是：图标列宽改回 12 后 nmX 也正好 = 31，但两者语义不同（动作行对齐图标+gap，
+        // 证据行对齐 .ev 的固定 padding），所以这里仍按 .ev 独立取值，不做「复用 nmX」的优化。
+        CGFloat evX = 12 + 19;                     // = 31
+        UILabel *el = [[UILabel alloc] initWithFrame:CGRectMake(evX, 26, w - evX - 12, 14)];
         el.text = ev;
         el.font = [UIFont fontWithName:@"Menlo" size:10];    // 等宽只用在真数据（证据）
-        el.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.72];
+        el.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.88];  // 原型 .ev 用 --txt-2=rgba(255,255,255,.88)
         el.lineBreakMode = NSLineBreakByTruncatingTail;
         [row addSubview:el];
     }
@@ -5678,14 +5695,29 @@ static void AIFloatApply(void) {
                 : ((gTaskTotal > 0)
                    ? [NSString stringWithFormat:@"%@ %d/%d", (gTaskName.length ? gTaskName : @"任务"), gTaskIdx, gTaskTotal]
                    : @"待命");
-            UILabel *lb = [[UILabel alloc] initWithFrame:CGRectMake(0, 6, 56, 44)];
-            lb.text = [NSString stringWithFormat:@"%@\n%@", AIShapeFor(stNow), shortLine];
-            lb.numberOfLines = 2; lb.textAlignment = NSTextAlignmentCenter;
-            lb.font = [UIFont boldSystemFontOfSize:11];
-            lb.textColor = AIColorFor(stNow);
-            lb.minimumScaleFactor = 0.7; lb.adjustsFontSizeToFitWidth = YES;
-            [ball addSubview:lb];
-            // v42：脉动（原型 .shape.pulse，breathe 1.8s）—— 执行/等待态才动，减少动效时不加
+            // v43：L1 球内部结构对齐原型 .ball .shape / .word —— 上一版把两者塞进同一个
+            // 11px 双行 label，字号被强行拉平，球上根本没有原型那种「大形状 + 小词」的层次。
+            // 原型：.shape{font-size:19px;line-height:1}、.word{font-size:9px;max-width:52px}，
+            // 两者上下排列（.ball flex-direction:column; gap:2px）。这里拆成两个 label。
+            // 纵向：内容高 = 形状 20 + gap 2 + 词 13 = 35，球 58 → 居中偏移 (58-35)/2 ≈ 11.5，
+            // 取 12/33 让形状与词之间真正空出 1~2px（原型 .ball gap:2px + column 居中）。
+            UILabel *sh = [[UILabel alloc] initWithFrame:CGRectMake(0, 12, 56, 20)];
+            sh.text = AIShapeFor(stNow);
+            sh.textColor = AIColorFor(stNow);
+            sh.font = [UIFont boldSystemFontOfSize:19];          // 原型 .ball .shape{font-size:19px}
+            sh.textAlignment = NSTextAlignmentCenter;
+            [ball addSubview:sh];
+
+            UILabel *wd = [[UILabel alloc] initWithFrame:CGRectMake(2, 34, 52, 13)];
+            wd.text = shortLine;
+            wd.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.88];   // 原型 --txt-2
+            wd.font = [UIFont systemFontOfSize:9];               // 原型 .ball .word{font-size:9px}
+            wd.textAlignment = NSTextAlignmentCenter;
+            wd.lineBreakMode = NSLineBreakByTruncatingTail;
+            wd.minimumScaleFactor = 0.75; wd.adjustsFontSizeToFitWidth = YES;
+            [ball addSubview:wd];
+            // v42：脉动（原型 .shape.pulse，breathe 1.8s）—— 执行/等待态才动，减少动效时不加。
+            // v43：动画挂在形状 label（sh）上，原型 .shape.pulse 也是这一层，不是球整体。
             NSString *qn = AITaskStateNorm(stNow);
             BOOL pulsing = ([qn isEqualToString:@"exec"] || [qn isEqualToString:@"wait"]) && !gReduceMotion;
             if (pulsing) {
@@ -5694,7 +5726,7 @@ static void AIFloatApply(void) {
                 an.duration = 1.8;
                 an.autoreverses = YES;
                 an.repeatCount = HUGE_VALF;
-                [lb.layer addAnimation:an forKey:@"breathe"];
+                [sh.layer addAnimation:an forKey:@"breathe"];
             }
             // done 态右上角徽标脉冲：不点开也知道结果（规划 §8.4）
             NSString *stN = AITaskStateNorm(stNow);
@@ -5733,13 +5765,23 @@ static void AIFloatApply(void) {
             panel.layer.cornerRadius = 14; panel.layer.masksToBounds = YES;
             panel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.90];
 
-            // L3 头部：状态形状 + 任务名（纯任务语言）
+            // L3 头部：状态形状 + 任务名。v43 对齐原型 .p-hd —— 原型里形状与标题是**两个元素**：
+            //   .p-hd{display:flex;align-items:center;gap:8px}  .p-hd .sy{font-size:15px}  .p-hd h3{font-size:13px;font-weight:650;flex:1}
+            // 上一版把形状和任务名塞进同一个 label 并统一用状态色（14px），于是标题颜色跟着状态变、
+            // 形状也没了 15px 的层级。这里拆开：形状独立着色 15px，标题恒白 13px。
             NSString *stP = (gTaskTotal > 0) ? gTaskState : @"idle";
             if (gTaskTotal > 0 && gTaskOk == 0) stP = @"fail";
-            UILabel *ti = [[UILabel alloc] initWithFrame:CGRectMake(12, 8, w - 62, 22)];
-            ti.text = [NSString stringWithFormat:@"%@ %@", AIShapeFor(stP),
-                       (gTaskName.length ? gTaskName : @"无任务")];
-            ti.textColor = AIColorFor(stP); ti.font = [UIFont boldSystemFontOfSize:14];
+            UILabel *syP = [[UILabel alloc] initWithFrame:CGRectMake(12, 8, 18, 22)];
+            syP.text = AIShapeFor(stP);
+            syP.textColor = AIColorFor(stP);
+            syP.font = [UIFont boldSystemFontOfSize:15];     // 原型 .p-hd .sy{font-size:15px}
+            syP.textAlignment = NSTextAlignmentCenter;
+            [panel addSubview:syP];
+            UILabel *ti = [[UILabel alloc] initWithFrame:CGRectMake(12 + 18 + 8, 8, w - 12 - 18 - 8 - 50, 22)];
+            ti.text = (gTaskName.length ? gTaskName : @"无任务");
+            ti.textColor = [UIColor whiteColor];             // 原型 .p-hd h3 是 --txt 白，不随状态着色
+            ti.font = [UIFont boldSystemFontOfSize:13];      // 原型 .p-hd h3{font-size:var(--fz-2)=13px}
+            ti.lineBreakMode = NSLineBreakByTruncatingTail;
             [panel addSubview:ti];
             UIButton *cx = [UIButton buttonWithType:UIButtonTypeSystem];
             cx.frame = CGRectMake(w - 50, 6, 44, 26);
