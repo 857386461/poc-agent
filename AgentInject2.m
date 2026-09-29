@@ -211,6 +211,10 @@ static NSString *AIShapeFor(NSString *st);
 static UIColor  *AIColorFor(NSString *st);
 static NSString *AITaskLine(void);          // AIGuardRender(4452) 在定义(4779)之前要用
 static NSString *AITaskStateNow(void);      // v30：当前有效状态（含 fail 优先）
+static NSString *AITaskStateNorm(NSString *s);  // v44：状态归一（AIGuardRender 在定义之前要用）
+//                                           ↑ 忘加这行 = CI #75 的 4 个 error（bad receiver type 'int'）。
+//                                           G42 同类：定义在后面、调用在前面，就必须有声明，
+//                                           哪怕只差几百行 —— 编译器不猜。
 static NSDictionary *AITaskDict(void);      // /status 的 task{} —— AIExecCmd 在定义之前要用
 static NSDictionary *AIUiDict(void);        // /status 的 ui{}
 // v42 UI 结构实现：这几个函数定义在文件后段，被 AIGuardRender / AIFloatApply 提前调用。
