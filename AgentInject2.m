@@ -219,8 +219,21 @@ static void      AIDismissRecap(void);                    // 回顾卡「知道�
 static UIView   *AIStepRowView(NSDictionary *step, CGFloat w);   // L3 单行步骤视图
 static UIView   *AIRecapCardView(CGFloat screenW);        // 结束回顾卡
 static NSString *AITaskElapsedText(void);                 // 「用时 1:24」
-// v42：copysteps 命令要复用真实按钮的 AIFloatTarget，类与实例都定义在文件后段。
-@class AIFloatTarget;
+// v42：copysteps 命令要复用真实按钮的 AIFloatTarget。这里必须给**完整 @interface**（含
+// copySteps: 声明），只写 @class 前向声明没用 —— 前向声明只允许指针用法，
+// [[... alloc] init] 和发消息都会报 "receiver ... is a forward declaration"（CI #71 实测）。
+// 实现仍在文件后段，接口提上来即可。
+@interface AIFloatTarget : NSObject
+- (void)ballTapped:(id)sender;
+- (void)ballDragged:(UIPanGestureRecognizer *)g;
+- (void)sw:(UISwitch *)s;
+- (void)collapse:(id)sender;
+- (void)hideBall:(id)sender;
+- (void)toggleDiag:(id)sender;
+- (void)pauseTask:(id)sender;
+- (void)endTask:(id)sender;
+- (void)copySteps:(id)sender;
+@end
 static AIFloatTarget *gFT;                                // 球面板的目标对象（常驻单例）
 static void AITestTapAt(CGPoint pt, NSString *desc);
 static void AITestTapButton(void);
@@ -5290,8 +5303,6 @@ static void AICheckUpdateAsync(void) {
 //   小圆点可拖动，点一下展开面板：版本/心跳一览 + 几个开关。
 //   开关状态存 NSUserDefaults，重开 App 也记得住。
 // ---------------------------------------------------------------------------
-@interface AIFloatTarget : NSObject
-@end
 @implementation AIFloatTarget
 - (void)ballTapped:(id)sender {
     gFloatExpanded = !gFloatExpanded;
