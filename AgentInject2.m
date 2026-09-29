@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v42";   // v42 = v41 + UI 结构实现（会话主 · 补齐原型 v8 缺失的结构，共 12 处）。v41 只做了 5 处数值微调（颜色/alpha/形状/宽高），用户对比原型后指出「真机还是老界面，只有悬浮球变了」——因为 v41 没新增任何结构，而原型最核心的两块结构真机上根本不存在。本版补齐：① L3 步骤列表：一整块 9px Menlo 灰字 UITextView → UIScrollView + 逐行 AIStepRowView（图标 14 + 动作 12px #e9eef3 + 目标 + Menlo 10px 证据 + 0.5px 分隔线，按状态着色；行高 有证据 48/无 34）；② 结束回顾卡（规划 §8.1 收尾闭环）：原来只有一行 ▶ 拼在文本末尾 → 罩层中央 246×214 大卡（✓/■ + 任务完成·原因 + 用时·动作·失败 三数字 + 知道了 44pt）；③ L2 罩层进度条：「共 N 步 · 当前第 M 步」+ 196×6 进度条（填充 idx/total，与状态同色）；④ L1 球动效：脉动（exec/wait 1.8s 呼吸）+ done 徽标脉冲 + 吸边半隐（edge 开关，alpha .55 右移 18）；⑤ 减少动效：跟随 UIAccessibilityIsReduceMotionEnabled + reduce 开关强制；⑥ L3 副标题加「成功 ✓N」计数；⑦ L3 新增「⧉ 复制步骤全文」按钮（行视图后文字不可选，需显式出口）；⑧ 回顾卡状态机：gRecapShown/gRecapDismissed 双闸。—— 关键坑：AIGuardShouldShow 加 gRecapShown（任务收尾 gBusy 归零，否则罩在同帧落下，卡无容器）；task op 里显式 AIGuardRender（AIGuardSync 在罩已显示时不重绘，卡状态变了屏上还是旧的）；AITaskSet 清空分支仅在 gRecapDismissed 时清 gTaskResult（否则云端补发的 task{0,0} 会把刚弹的卡提前干掉）。v41 = v40 + UI 落地（会话主 · 原型 v8 → 真机源码，共 5 处）：① 失败形状 ✕→■（与原型 v4/v8 对齐，规划 §2 与 §9.2 自相矛盾取 ■；形状是语义载体，原型与源码不一致落地必错）；② L1 悬浮球可辨识性：黑 0.62 半透明无描边 → 不透明 #14161a + 2px 亮描边 rgba(255,255,255,.92)，双对比元素取最大值（原型实测 深色宿主旧值仅 1.13:1 近乎隐形，新值 深色 16.29/浅白 6.74/中性灰 12.48/高饱和 14.62 全 ≥3）；③ L1 球词优先读 task.brief（原实现忽略 brief，球上只有干巴巴的 3/7）；④ L2 罩层暗化 0.55→0.65（0.55 在浅色宿主上次级文字仅 3.33:1 不达 WCAG，0.65 是四种宿主全达标的最小可用值 6.57~15.64）；⑤ L3 面板暂停/结束按钮 32→44 高 + 面板 360→380（原注释写着「≥44pt 原则」实际只做 32，而这是唯一能叫停 AI 的安全入口）。v40 = v39 + G30 根治（G30：回执通道单边瘫死——飞行模式令域名 poll 连败 4 次后 gActiveBase 切 IP 兜底，轮询带 AITrustDelegate 活着，回执/心跳 POST（AIReportDict）却没带 → IP 直连证书 CN 不匹配 → -1202「证书无效」一切回执单边全灭；看门狗只看轮询 tick（命令还在执行）永不换代，IP 态又无自动回切路径 → 死锁到杀 App。修法：回执与轮询同待遇，IP 态同样 trustAny+Host 覆盖）。v39 = v38 + G28 看门狗三件套（会话B 合流）：① hang 阈值 45→150s（text/tree 全量 25~90s，45s 对慢命令必然误判换代）；② rst 每 60s 冷却回收 1（原 rst=8 永久放弃换代，13:12 事故通道瘫死实锤）；③ 积压 >3 只执行最后 1 条（换代后新代拉积压慢命令循环换代是耗尽主因）；④ 换代即落盘日志（取证）。v38 = v37 + 屏幕识字（会话A）：op=ocr 读整屏文字 / op=vfind 按文字找并点，参数 accurate + zh-Hans,en-US + correction=NO、坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程，.ips 实锤 AITaskDict 竞态 → SIGSEGV）
+static NSString * const kAIVer = @"v42";   // v42 = v41 + UI 结构实现（会话主 · 补齐原型 v8 缺失的结构，共 12 处）。v41 只做了 5 处数值微调（颜色/alpha/形状/宽高），用户对比原型后指出「真机还是老界面，只有悬浮球变了」——因为 v41 没新增任何结构，而原型最核心的两块结构真机上根本不存在。本版补齐：① L3 步骤列表：一整块 9px Menlo 灰字 UITextView → UIScrollView + 逐行 AIStepRowView（图标 14 + 动作 12px #e9eef3 + 目标 + Menlo 10px 证据 + 0.5px 分隔线，按状态着色；行高 有证据 48/无 34）；② 结束回顾卡（规划 §8.1 收尾闭环）：原来只有一行 ▶ 拼在文本末尾 → 罩层中央 246×214 大卡（✓/■ + 任务完成·原因 + 用时·动作·失败 三数字 + 知道了 44pt）；③ L2 罩层进度条：「共 N 步 · 当前第 M 步」+ 196×6 进度条（填充 idx/total，与状态同色）；④ L1 球动效：脉动（exec/wait 1.8s 呼吸）+ done 徽标脉冲 + 吸边半隐（edge 开关，alpha .55 右移 18）；⑤ 减少动效：跟随 UIAccessibilityIsReduceMotionEnabled + reduce 开关强制；⑥ L3 副标题加「成功 ✓N」计数；⑦ L3 新增「⧉ 复制步骤全文」按钮（行视图后文字不可选，需显式出口）；⑧ 回顾卡状态机：gRecapShown/gRecapDismissed 双闸。⑨ 结构可观测化（这一条是被否掉的 v41 最该有的东西）：ui{} 新增 panel.steps.n（步骤行数）/ panel.okcnt（成功步数）/ guard.recap（回顾卡在不在）/ guard.recaptext / guard.pct（进度条百分比）/ float.edge / float.reduce —— v41 的 ui{} 里一个结构字段都没有，脚本想测「步骤列表有没有每步一行」也无从下手，只能退化成测 dot 颜色，于是「15/15 全绿但用户不认」；⑩ 新增命令 recapknow（等价点「知道了」）/ copysteps（复制全文，回传剪贴板长度）/ flag（读写 edge·reduce 等开关），让上述结构量全部可被脚本远程断言。—— 关键坑：AIGuardShouldShow 加 gRecapShown（任务收尾 gBusy 归零，否则罩在同帧落下，卡无容器）；task op 里显式 AIGuardRender（AIGuardSync 在罩已显示时不重绘，卡状态变了屏上还是旧的）；AITaskSet 清空分支仅在 gRecapDismissed 时清 gTaskResult（否则云端补发的 task{0,0} 会把刚弹的卡提前干掉）。v41 = v40 + UI 落地（会话主 · 原型 v8 → 真机源码，共 5 处）：① 失败形状 ✕→■（与原型 v4/v8 对齐，规划 §2 与 §9.2 自相矛盾取 ■；形状是语义载体，原型与源码不一致落地必错）；② L1 悬浮球可辨识性：黑 0.62 半透明无描边 → 不透明 #14161a + 2px 亮描边 rgba(255,255,255,.92)，双对比元素取最大值（原型实测 深色宿主旧值仅 1.13:1 近乎隐形，新值 深色 16.29/浅白 6.74/中性灰 12.48/高饱和 14.62 全 ≥3）；③ L1 球词优先读 task.brief（原实现忽略 brief，球上只有干巴巴的 3/7）；④ L2 罩层暗化 0.55→0.65（0.55 在浅色宿主上次级文字仅 3.33:1 不达 WCAG，0.65 是四种宿主全达标的最小可用值 6.57~15.64）；⑤ L3 面板暂停/结束按钮 32→44 高 + 面板 360→380（原注释写着「≥44pt 原则」实际只做 32，而这是唯一能叫停 AI 的安全入口）。v40 = v39 + G30 根治（G30：回执通道单边瘫死——飞行模式令域名 poll 连败 4 次后 gActiveBase 切 IP 兜底，轮询带 AITrustDelegate 活着，回执/心跳 POST（AIReportDict）却没带 → IP 直连证书 CN 不匹配 → -1202「证书无效」一切回执单边全灭；看门狗只看轮询 tick（命令还在执行）永不换代，IP 态又无自动回切路径 → 死锁到杀 App。修法：回执与轮询同待遇，IP 态同样 trustAny+Host 覆盖）。v39 = v38 + G28 看门狗三件套（会话B 合流）：① hang 阈值 45→150s（text/tree 全量 25~90s，45s 对慢命令必然误判换代）；② rst 每 60s 冷却回收 1（原 rst=8 永久放弃换代，13:12 事故通道瘫死实锤）；③ 积压 >3 只执行最后 1 条（换代后新代拉积压慢命令循环换代是耗尽主因）；④ 换代即落盘日志（取证）。v38 = v37 + 屏幕识字（会话A）：op=ocr 读整屏文字 / op=vfind 按文字找并点，参数 accurate + zh-Hans,en-US + correction=NO、坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程，.ips 实锤 AITaskDict 竞态 → SIGSEGV）
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -219,6 +219,9 @@ static void      AIDismissRecap(void);                    // 回顾卡「知道�
 static UIView   *AIStepRowView(NSDictionary *step, CGFloat w);   // L3 单行步骤视图
 static UIView   *AIRecapCardView(CGFloat screenW);        // 结束回顾卡
 static NSString *AITaskElapsedText(void);                 // 「用时 1:24」
+// v42：copysteps 命令要复用真实按钮的 AIFloatTarget，类与实例都定义在文件后段。
+@class AIFloatTarget;
+static AIFloatTarget *gFT;                                // 球面板的目标对象（常驻单例）
 static void AITestTapAt(CGPoint pt, NSString *desc);
 static void AITestTapButton(void);
 static NSString *AINetDiag(void);           // AIExecCmd（~1500 行）在它的定义之前就要用
@@ -3926,6 +3929,35 @@ static void AIExecCmd(NSDictionary *cmd) {
             gFloatForce = YES; AIFloatApply();
         });
         AIReportDict(@{@"op": @"panel", @"ok": @YES, @"open": @(open ? 1 : 0)});
+    } else if ([op isEqualToString:@"recapknow"]) {
+        // v42：等价于点回顾卡上的「知道了」。给脚本一个入口，让「收卡 + 之后不再弹」
+        // 这条状态机能被自动化验证，而不必依赖真手指去点。
+        dispatch_async(dispatch_get_main_queue(), ^{ AIDismissRecap(); });
+        AIReportDict(@{@"op": @"recapknow", @"ok": @YES});
+    } else if ([op isEqualToString:@"copysteps"]) {
+        // v42：等价于点面板上的「复制步骤全文」，回传剪贴板长度供断言。
+        // 复用现成的 AIFloatTarget 实例 gFT（若尚未建，就在主线程补一个），
+        // 保证走的是和真实按钮**同一条**代码路径，不另起一套逻辑。
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!gFT) gFT = [[AIFloatTarget alloc] init];
+            [gFT copySteps:nil];
+        });
+        __block NSInteger clen = 0;
+        AIMainSync(^{ clen = (NSInteger)([UIPasteboard generalPasteboard].string.length); });
+        AIReportDict(@{@"op": @"copysteps", @"ok": @YES, @"len": @(clen)});
+    } else if ([op isEqualToString:@"flag"]) {
+        // v42：通用 flag 读写（edge / reduce / recap 等），让脚本能驱动那些
+        // 本来只跟系统设置/触摸挂钩的状态，从而可断言。
+        NSString *k = cmd[@"k"] ?: @"";
+        if (cmd[@"v"] != nil) AISetFlag(k, [cmd[@"v"] intValue] != 0);
+        if ([k isEqualToString:@"reduce"]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                gReduceMotion = ([cmd[@"v"] intValue] != 0);
+                gFloatForce = YES; AIFloatApply();
+            });
+        }
+        AIReportDict(@{@"op": @"flag", @"ok": @YES, @"k": k,
+                       @"v": @(AIFlag(k, NO) ? 1 : 0)});
     } else if ([op isEqualToString:@"status"]) {
         // v30：自报「我是谁」—— 本 dylib 在手机上的真实路径 + 构建时刻 + op 集。
         // 背景：v28 起存档把「源码版本」当「注入版本」写，导致 v27/v28 之争；
@@ -3945,7 +3977,7 @@ static void AIExecCmd(NSDictionary *cmd) {
                        @"ops": @"wait pick picktxt tapui tap scroll swipe rows tree toast probe "
                                @"back nav find rntap dismiss uioff uion gdtap wintap schemes open "
                                @"shot wins win gtap chain text dump update core ball overlay "
-                               @"status log hud task macro diag ocr vfind",
+                               @"status log hud task macro diag ocr vfind recapknow copysteps flag",
                        @"proc": gProcName, @"bundle": gBundleId, @"pid": @(getpid()),
                        @"tap": @(gBestTap), @"shot": @(gBestShot),
                        @"mon": @(gMonHits), @"se": @(gSendEventHits),
@@ -5328,7 +5360,7 @@ static void AICheckUpdateAsync(void) {
     AILog(@"  [ui] copySteps -> %lu 字符", (unsigned long)ms.length);
 }
 @end
-static AIFloatTarget *gFT = nil;
+// gFT 已在文件头部前置声明（v42：copysteps 命令要先用到它）
 
 // ============================================================
 // v30 · UI 三层任务态：状态源与编码（规划 §9.1 / §9.2）
@@ -5483,17 +5515,38 @@ static NSDictionary *AIUiDict(void) {
     NSString *st = AITaskStateNow();
     // v33：float 加可观测字段 —— 球到底在不在，看 win/vis/scn/frame 四个数，不用再靠肉眼猜
     CGRect ff = gFloatWindow ? gFloatWindow.frame : CGRectZero;
+    // ============ v42：结构可观测化（这是对被否掉的 v41 最直接的补救） ============
+    // v41 之所以「测试全绿但用户不认」，根因是回执里只有颜色/几何这类数值字段，
+    // 结构（步骤行、回顾卡、进度条）在回执里**根本不可见**，脚本想测也测不到，
+    // 于是只能退化成测颜色。v42 把结构量全部暴露出来，让脚本能对「用户要的东西」下断言。
+    //   结构量：panel.steps.n（步骤行数）、panel.okcnt（成功步数）
+    //           guard.recap（回顾卡在不在）、guard.pct（进度条百分比）
+    //           float.edge / float.reduce（吸边、减弱动效）
+    int okCnt = 0;
+    for (NSDictionary *d in gSteps) if ([d[@"s"] isEqualToString:@"ok"]) okCnt++;
+    int pct = (gTaskTotal > 0) ? (int)((gTaskIdx * 100.0) / gTaskTotal + 0.5) : 0;
+    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+    NSString *recapTxt = gTaskResult ? [NSString stringWithFormat:@"%@",
+                            (gTaskOk == 0 ? [@"任务没跑完 · " stringByAppendingString:gTaskResult]
+                                          : [@"任务完成 · " stringByAppendingString:gTaskResult])] : @"";
     return @{@"float": @{@"dot": st ?: @"idle", @"line": AITaskLine(),
                          @"win":  @(gFloatWindow ? 1 : 0),
                          @"vis":  (gFloatWindow && !gFloatWindow.hidden) ? @1 : @0,
                          @"scn":  (gFloatWindow && gFloatWindow.windowScene) ? @1 : @0,
+                         @"edge": @(AIFlag(@"edge", NO) ? 1 : 0),      // v42：吸边半隐
+                         @"reduce": @(gReduceMotion ? 1 : 0),          // v42：减弱动态效果
                          @"frame": [NSString stringWithFormat:@"%.0f,%.0f %.0fx%.0f",
                                     ff.origin.x, ff.origin.y, ff.size.width, ff.size.height]},
              @"guard": @{@"visible": (gOverlayWindow && !gOverlayWindow.hidden) ? @1 : @0,
                          @"want":    @(AIGuardShouldShow() ? 1 : 0),   // v32：真源 vs 实际的差就是 bug
                          @"mode":    gGuardMode ?: @"privacy",
-                         @"pinned":  @(gGuardPinned)},
-             @"panel": @{@"open": @(gFloatExpanded ? 1 : 0)}};
+                         @"pinned":  @(gGuardPinned),
+                         @"recap":   @(gRecapShown ? 1 : 0),           // v42：回顾卡可见
+                         @"recaptext": recapTxt,                       // v42：卡上文案
+                         @"pct":     @(pct)},                          // v42：进度条百分比
+             @"panel": @{@"open": @(gFloatExpanded ? 1 : 0),
+                         @"okcnt": @(okCnt),                           // v42：成功步数
+                         @"steps": @{@"n": @(gSteps.count)}}};          // v42：步骤行数
 }
 
 // L3 步骤列表：状态图标 + 动作 + 目标 + 结果侧证据
