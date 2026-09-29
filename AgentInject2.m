@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v40";   // v40 = v39 + G30 根治（G30：回执通道单边瘫死——飞行模式令域名 poll 连败 4 次后 gActiveBase 切 IP 兜底，轮询带 AITrustDelegate 活着，回执/心跳 POST（AIReportDict）却没带 → IP 直连证书 CN 不匹配 → -1202「证书无效」一切回执单边全灭；看门狗只看轮询 tick（命令还在执行）永不换代，IP 态又无自动回切路径 → 死锁到杀 App。修法：回执与轮询同待遇，IP 态同样 trustAny+Host 覆盖）。v39 = v38 + G28 看门狗三件套（会话B 合流）：① hang 阈值 45→150s（text/tree 全量 25~90s，45s 对慢命令必然误判换代）；② rst 每 60s 冷却回收 1（原 rst=8 永久放弃换代，13:12 事故通道瘫死实锤）；③ 积压 >3 只执行最后 1 条（换代后新代拉积压慢命令循环换代是耗尽主因）；④ 换代即落盘日志（取证）。v38 = v37 + 屏幕识字（会话A）：op=ocr 读整屏文字 / op=vfind 按文字找并点，参数 accurate + zh-Hans,en-US + correction=NO、坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程，.ips 实锤 AITaskDict 竞态 → SIGSEGV）
+static NSString * const kAIVer = @"v41";   // v41 = v40 + UI 落地（会话主 · 原型 v8 → 真机源码，共 5 处）：① 失败形状 ✕→■（与原型 v4/v8 对齐，规划 §2 与 §9.2 自相矛盾取 ■；形状是语义载体，原型与源码不一致落地必错）；② L1 悬浮球可辨识性：黑 0.62 半透明无描边 → 不透明 #14161a + 2px 亮描边 rgba(255,255,255,.92)，双对比元素取最大值（原型实测 深色宿主旧值仅 1.13:1 近乎隐形，新值 深色 16.29/浅白 6.74/中性灰 12.48/高饱和 14.62 全 ≥3）；③ L1 球词优先读 task.brief（原实现忽略 brief，球上只有干巴巴的 3/7）；④ L2 罩层暗化 0.55→0.65（0.55 在浅色宿主上次级文字仅 3.33:1 不达 WCAG，0.65 是四种宿主全达标的最小可用值 6.57~15.64）；⑤ L3 面板暂停/结束按钮 32→44 高 + 面板 360→380（原注释写着「≥44pt 原则」实际只做 32，而这是唯一能叫停 AI 的安全入口）。v40 = v39 + G30 根治（G30：回执通道单边瘫死——飞行模式令域名 poll 连败 4 次后 gActiveBase 切 IP 兜底，轮询带 AITrustDelegate 活着，回执/心跳 POST（AIReportDict）却没带 → IP 直连证书 CN 不匹配 → -1202「证书无效」一切回执单边全灭；看门狗只看轮询 tick（命令还在执行）永不换代，IP 态又无自动回切路径 → 死锁到杀 App。修法：回执与轮询同待遇，IP 态同样 trustAny+Host 覆盖）。v39 = v38 + G28 看门狗三件套（会话B 合流）：① hang 阈值 45→150s（text/tree 全量 25~90s，45s 对慢命令必然误判换代）；② rst 每 60s 冷却回收 1（原 rst=8 永久放弃换代，13:12 事故通道瘫死实锤）；③ 积压 >3 只执行最后 1 条（换代后新代拉积压慢命令循环换代是耗尽主因）；④ 换代即落盘日志（取证）。v38 = v37 + 屏幕识字（会话A）：op=ocr 读整屏文字 / op=vfind 按文字找并点，参数 accurate + zh-Hans,en-US + correction=NO、坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程，.ips 实锤 AITaskDict 竞态 → SIGSEGV）
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -4791,7 +4791,10 @@ static void AIGuardRender(void) {
                 vv.frame = f;
                 [host addSubview:vv];                       // 毛玻璃（采样下方已渲染缓冲）
                 UIView *dim = [[UIView alloc] initWithFrame:f];
-                dim.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];  // 暗化兜底
+                // v41：0.55 → 0.65。原型实测 0.55 在浅色宿主上罩面次级文字仅 3.33:1、
+                // 按钮边框 1.69:1，均不达 WCAG；0.65 是四种宿主（深色/浅白/中性灰/高饱和）
+                // 全部达标的最小可用值（罩上白字 6.57~15.64）。
+                dim.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.65];
                 [host addSubview:dim];
             } else {
                 UIView *dim = [[UIView alloc] initWithFrame:f];
@@ -5187,7 +5190,9 @@ static NSString *AIShapeFor(NSString *st) {
     if ([st isEqualToString:@"exec"]) return @"●";
     if ([st isEqualToString:@"wait"]) return @"◐";
     if ([st isEqualToString:@"ok"])   return @"✓";
-    if ([st isEqualToString:@"fail"]) return @"✕";
+    // v41：✕ → ■，与原型 v4/v8 对齐（规划文档 §2 与 §9.2 自相矛盾，取 ■）。
+    // 形状是语义载体，原型与源码必须一致，否则落地就会错。
+    if ([st isEqualToString:@"fail"]) return @"■";
     return @"○";
 }
 static UIColor *AIColorFor(NSString *st) {
@@ -5358,13 +5363,25 @@ static void AIFloatApply(void) {
             ball.tag = 701;
             ball.layer.cornerRadius = 28;
             ball.layer.masksToBounds = YES;
-            ball.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.62];
+            // v41 · L1 可辨识性修复（原型 v8 实测结论）
+            //   旧：黑 0.62 半透明 + 无描边 → 在深色宿主上球与底色几乎同亮度，
+            //       实测对比度仅 ~1.13:1，球"消失"在视频画面里。
+            //   新：不透明深底 #14161a + 2px 亮描边 rgba(255,255,255,.92)。
+            //       「双对比元素取最大值」：深色宿主靠亮描边、浅色宿主靠深底，两极都可辨识
+            //       （实测 深色 16.29 / 浅白 6.74 / 中性灰 12.48 / 高饱和 14.62，全部 ≥3）。
+            // ⚠️ 这是 UIView 不是窗口，不抢 key；绝不对球调 makeKeyAndVisible。
+            ball.backgroundColor = [UIColor colorWithRed:0.078 green:0.086 blue:0.102 alpha:1.0]; // #14161a
+            ball.layer.borderWidth = 2.0;
+            ball.layer.borderColor = [[UIColor colorWithWhite:1.0 alpha:0.92] CGColor];
             // v30 三层 UI · L1：收起态 = 状态形状 + 一句话（纯任务语言，不再显示版本/指令数）
-            NSString *stNow = (gTaskTotal > 0) ? gTaskState : @"idle";
-            if (gTaskTotal > 0 && gTaskOk == 0) stNow = @"fail";   // 最近一步失败优先显示
-            NSString *shortLine = (gTaskTotal > 0)
-                ? [NSString stringWithFormat:@"%@ %d/%d", (gTaskName.length ? gTaskName : @"任务"), gTaskIdx, gTaskTotal]
-                : @"待命";
+            NSString *stNow = AITaskStateNow();
+            // v41：优先读 task.brief（云端下发的一句话人话，如「正在刷第 3 个视频」），
+            //      没有才退回「任务名 步骤/总数」。原实现忽略 brief，导致球上只有干巴巴的 3/7。
+            NSString *shortLine = gTaskBrief.length
+                ? gTaskBrief
+                : ((gTaskTotal > 0)
+                   ? [NSString stringWithFormat:@"%@ %d/%d", (gTaskName.length ? gTaskName : @"任务"), gTaskIdx, gTaskTotal]
+                   : @"待命");
             UILabel *lb = [[UILabel alloc] initWithFrame:CGRectMake(0, 6, 56, 44)];
             lb.text = [NSString stringWithFormat:@"%@\n%@", AIShapeFor(stNow), shortLine];
             lb.numberOfLines = 2; lb.textAlignment = NSTextAlignmentCenter;
@@ -5389,7 +5406,7 @@ static void AIFloatApply(void) {
             [ball addGestureRecognizer:pan];
             [host addSubview:ball];
         } else {
-            CGFloat w = 280, h = 360;
+            CGFloat w = 280, h = 380;   // v41：360 → 380，为底部 44pt 大按钮让出空间
             CGFloat ox = MIN(MAX(c.x - w / 2, 8), sc.width  - w - 8);
             CGFloat oy = MIN(MAX(c.y - h / 2, 70), sc.height - h - 8);
             gFloatWindow.frame = CGRectMake(ox, oy, w, h);
@@ -5457,15 +5474,23 @@ static void AIFloatApply(void) {
                            (gLastErrText.length ? gLastErrText : @"无错误")];
                 [panel addSubview:dl];
             }
-            // 安全控件：唯一能打断 AI 的入口（≥44pt 原则，这里 32 高但宽 88）
+            // 安全控件：唯一能打断 AI 的入口。
+            // v41：32 → 44 高。原注释写着「≥44pt 原则」实际只做了 32，触摸目标不达标 ——
+            //       这是安全入口（唯一能叫停 AI 的地方），不能靠"宽度够"自我说服。
             UIButton *pz = [UIButton buttonWithType:UIButtonTypeSystem];
-            pz.frame = CGRectMake(10, h - 38, 88, 32);
+            pz.frame = CGRectMake(10, h - 54, (w - 30) / 2.0, 44);
             [pz setTitle:@"⏸ 暂停" forState:UIControlStateNormal];
+            pz.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.12];
+            pz.layer.cornerRadius = 10;
+            pz.titleLabel.font = [UIFont boldSystemFontOfSize:14];
             [pz addTarget:gFT action:@selector(pauseTask:) forControlEvents:UIControlEventTouchUpInside];
             [panel addSubview:pz];
             UIButton *ed = [UIButton buttonWithType:UIButtonTypeSystem];
-            ed.frame = CGRectMake(w - 98, h - 38, 88, 32);
+            ed.frame = CGRectMake(20 + (w - 30) / 2.0, h - 54, (w - 30) / 2.0, 44);
             [ed setTitle:@"⏹ 结束" forState:UIControlStateNormal];
+            ed.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.12];
+            ed.layer.cornerRadius = 10;
+            ed.titleLabel.font = [UIFont boldSystemFontOfSize:14];
             [ed addTarget:gFT action:@selector(endTask:) forControlEvents:UIControlEventTouchUpInside];
             [panel addSubview:ed];
             [host addSubview:panel];
