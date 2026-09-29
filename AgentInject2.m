@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v47";   // v47 = v46 + 悬浮球拖动交互两处修复（会话主 · 用户报障「拖球有偏差 + 拖完再点没反应」）：① [G53] ballDragged 坐标系混算——原代码拖的是 gFloatWindow 内的 ball 子视图，ball.center 是**窗口内**坐标（收起态恒为 30,30），却在同一行里用**屏幕**尺寸 sc.width/sc.height 做 clamp，两套坐标混算 → 球被推到 60×60 窗口之外，表现为「手指拖了球却偏移/跑飞/看着没动」。修法：直接拖**窗口本身**（窗口原点即屏幕坐标，与 sc 同系），球作为窗口内固定子视图跟随；同时把 fpx/fpy 的存储与还原公式改为严格互逆（px=(cx-30)/(W-60)，与 AIFloatApply 的 c.x=30+px*(W-60) 对偶），实测 6 个落点往返一致到 0.6px 内。② [G54] tap 与 pan 挂在同一 view 上却没声明优先级——iOS 默认 pan 一旦开始就取消 tap，而 pan 识别阈值仅约 10pt，轻点时的微小位移会被 pan 抢走，于是「拖过一次之后点球没反应」。修法：显式 [pan requireGestureRecognizerToFail:tap]，并限制 minimum/maximumNumberOfTouches=1。③ 附带：拖动期间置 gFloatLast=now 抑制心跳自愈把窗口按旧值拽回；拖动结束强制 AIFloatApply 一次，消除「存的是新值、显示是旧值」的漂移窗口。v46 = v45 + 最后一批「抄错 token」修正（会话主 · 用 prototype-html 技能把 v45 做成可交互原型并与 v8 原型逐项对照时又抓出的 3 处）：① .p-hd h3 字号 13→**14**（原型写 var(--fz-3)，而 --fz-3=14px，--fz-2 才是 13 —— 我上一版注释里抄错了 token 名，属于 G47「以为差不多」的具体形态）；② L3 面板按钮 .pbtn 14→**13**（原型 var(--fz-2)=13px，上一版我以「安全入口可读性」为由主动放大到 14，但既然原型就给了 13 且 44pt 高度已满足触摸下限，应忠于原型）；③ .g-meta 透明度 .72→**.85**（原型 .g-meta{opacity:.85}）。—— 结论：**UI 落地只要还有一处「我按感觉给的」，就还能再抓出差异**；本轮把 v8 的每一条 CSS 声明都映射到了源码常量。v45 = v44 + 原型头部/回顾卡精修（会话主 · 最后一批回选择器原文核对）：① L3 面板头部补「3/7」步数（原型 .p-hd .stepno{11px;--txt-2}）——原型的头部是「形状 标题 步数 ✕」四段，上一版把步数塞到第二行副标题，把「一眼看到第几步」降级成「读一行小字」；② 面板关闭按钮「收起」文字 44×26 → 原型 .p-close 的 **✕ 图标 30×30 圆角8 描边 --line**（文字按钮占宽且与暂停/结束语义混淆，✕ 才是通用关闭语汇）；③ 回顾卡标题 h4 14→**16px**；④ 回顾卡三数字 .nums b 13→**14px**。v44 = v43 + 原型剩余 4 处结构补齐（会话主 · 继续回选择器原文核对，把「原型有、真机没有」的全部补上）：① L3 面板「本轮回顾」行（原型 .recap）—— v42 漏做；回顾卡是任务结束的**一次性**强提示，点掉即失，这行是面板里**随时可查**的常驻战绩摘要（N/M 成功 · 结论），缺了它错过弹卡就再也看不到本轮结果；底部预留 152→174 腾位，实测各分区 62..206 / 206..222 / 234..262 / 268..300 / 326..370 无重叠；② L2 罩层标题（原型 .g-title）—— 上一版是「彩色形状+彩色大字 22px」挤一个 label，原型是**8px 脉动圆点 + 纯白 16px 稳字**（gap 7，圆点 1.4s 呼吸、文字不动）；③ 罩层副标题 15px 白 → 13px/alpha.88（原型 .g-brief --txt-2=rgba(255,255,255,.88)）；④ 罩层三按钮（原型 .gbtn）52→46 高、12→10 圆角、14→13 字号，「结束」改用 .gbtn.stop 红色语义（红边 .7 + 红底 .16 + 浅红字）——破坏性动作必须与另两个可区分，是安全设计不是装饰。v43 = v42 + 原型数值/结构精修（会话主 · 对照原型选择器原文逐项核对，共 7 处）：① .step .sy 形状字号 13→**12**（上一版误取 .p-hd .sy 的 15px，改回 .step 继承值 --fz-1=12；同一 class 名在不同作用域取值不同，必须回选择器原文核）、列宽 14→**12**（原型 .step .sy{width:12px}）；② 动作文字 X 33→**31**（.step padding-left 12 + .sy 宽 12 + .l1 gap 7）；③ 步骤行高 48→**51**（有证据行重算：7+18.6+2+15.5+7+0.5，无证据行仍 34）；④ .ev 证据行缩进 33→**31**（.step padding-left 12 + .ev padding-left 19），颜色 .72→**.88**（原型 .ev 用 --txt-2=rgba(255,255,255,.88)）；⑤ L1 球内部拆两元素：原来形状+词塞进一个 11px 双行 label → 形状独立 **19px**（原型 .ball .shape{font-size:19px}）+ 词独立 **9px**、色 .88（原型 .ball .word{font-size:9px;max-width:52px}），脉动动画改挂形状层（原型 .shape.pulse）；⑥ L3 面板头部拆两元素：原来形状+任务名同 label 同色 14px → 形状独立 **15px** 状态色（原型 .p-hd .sy{font-size:15px}）+ 标题恒白 **13px**（原型 .p-hd h3{font-size:13px}，不随状态着色），间距 8（.p-hd gap:8px）；⑦ 版本号自证。v42 = v41 + UI 结构实现（会话主 · 补齐原型 v8 缺失的结构，共 12 处）。v41 只做了 5 处数值微调（颜色/alpha/形状/宽高），用户对比原型后指出「真机还是老界面，只有悬浮球变了」——因为 v41 没新增任何结构，而原型最核心的两块结构真机上根本不存在。本版补齐：① L3 步骤列表：一整块 9px Menlo 灰字 UITextView → UIScrollView + 逐行 AIStepRowView（图标 14 + 动作 12px #e9eef3 + 目标 + Menlo 10px 证据 + 0.5px 分隔线，按状态着色；行高 有证据 48/无 34）；② 结束回顾卡（规划 §8.1 收尾闭环）：原来只有一行 ▶ 拼在文本末尾 → 罩层中央 246×214 大卡（✓/■ + 任务完成·原因 + 用时·动作·失败 三数字 + 知道了 44pt）；③ L2 罩层进度条：「共 N 步 · 当前第 M 步」+ 196×6 进度条（填充 idx/total，与状态同色）；④ L1 球动效：脉动（exec/wait 1.8s 呼吸）+ done 徽标脉冲 + 吸边半隐（edge 开关，alpha .55 右移 18）；⑤ 减少动效：跟随 UIAccessibilityIsReduceMotionEnabled + reduce 开关强制；⑥ L3 副标题加「成功 ✓N」计数；⑦ L3 新增「⧉ 复制步骤全文」按钮（行视图后文字不可选，需显式出口）；⑧ 回顾卡状态机：gRecapShown/gRecapDismissed 双闸。⑨ 结构可观测化（这一条是被否掉的 v41 最该有的东西）：ui{} 新增 panel.steps.n（步骤行数）/ panel.okcnt（成功步数）/ guard.recap（回顾卡在不在）/ guard.recaptext / guard.pct（进度条百分比）/ float.edge / float.reduce —— v41 的 ui{} 里一个结构字段都没有，脚本想测「步骤列表有没有每步一行」也无从下手，只能退化成测 dot 颜色，于是「15/15 全绿但用户不认」；⑩ 新增命令 recapknow（等价点「知道了」）/ copysteps（复制全文，回传剪贴板长度）/ flag（读写 edge·reduce 等开关），让上述结构量全部可被脚本远程断言。—— 关键坑：AIGuardShouldShow 加 gRecapShown（任务收尾 gBusy 归零，否则罩在同帧落下，卡无容器）；task op 里显式 AIGuardRender（AIGuardSync 在罩已显示时不重绘，卡状态变了屏上还是旧的）；AITaskSet 清空分支仅在 gRecapDismissed 时清 gTaskResult（否则云端补发的 task{0,0} 会把刚弹的卡提前干掉）。v41 = v40 + UI 落地（会话主 · 原型 v8 → 真机源码，共 5 处）：① 失败形状 ✕→■（与原型 v4/v8 对齐，规划 §2 与 §9.2 自相矛盾取 ■；形状是语义载体，原型与源码不一致落地必错）；② L1 悬浮球可辨识性：黑 0.62 半透明无描边 → 不透明 #14161a + 2px 亮描边 rgba(255,255,255,.92)，双对比元素取最大值（原型实测 深色宿主旧值仅 1.13:1 近乎隐形，新值 深色 16.29/浅白 6.74/中性灰 12.48/高饱和 14.62 全 ≥3）；③ L1 球词优先读 task.brief（原实现忽略 brief，球上只有干巴巴的 3/7）；④ L2 罩层暗化 0.55→0.65（0.55 在浅色宿主上次级文字仅 3.33:1 不达 WCAG，0.65 是四种宿主全达标的最小可用值 6.57~15.64）；⑤ L3 面板暂停/结束按钮 32→44 高 + 面板 360→380（原注释写着「≥44pt 原则」实际只做 32，而这是唯一能叫停 AI 的安全入口）。v40 = v39 + G30 根治（G30：回执通道单边瘫死——飞行模式令域名 poll 连败 4 次后 gActiveBase 切 IP 兜底，轮询带 AITrustDelegate 活着，回执/心跳 POST（AIReportDict）却没带 → IP 直连证书 CN 不匹配 → -1202「证书无效」一切回执单边全灭；看门狗只看轮询 tick（命令还在执行）永不换代，IP 态又无自动回切路径 → 死锁到杀 App。修法：回执与轮询同待遇，IP 态同样 trustAny+Host 覆盖）。v39 = v38 + G28 看门狗三件套（会话B 合流）：① hang 阈值 45→150s（text/tree 全量 25~90s，45s 对慢命令必然误判换代）；② rst 每 60s 冷却回收 1（原 rst=8 永久放弃换代，13:12 事故通道瘫死实锤）；③ 积压 >3 只执行最后 1 条（换代后新代拉积压慢命令循环换代是耗尽主因）；④ 换代即落盘日志（取证）。v38 = v37 + 屏幕识字（会话A）：op=ocr 读整屏文字 / op=vfind 按文字找并点，参数 accurate + zh-Hans,en-US + correction=NO、坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程，.ips 实锤 AITaskDict 竞态 → SIGSEGV）
+static NSString * const kAIVer = @"v48";   // v48 = v47 + G55 拖动起步阈值修复（会话主 · 用户报障「v47 拖球没偏了，但按住中心点要拖到边缘球才动」）：v47 用 [pan requireGestureRecognizerToFail:tap] 区分点击/拖动，但 tap 的失败判定要求手指位移超过其自身容差（约 10pt），于是 pan 必须等手指走够这段才 recognize —— 用户按住球心（半径 28pt 的球）往外拖，要拖到接近球边缘才开始跟手，手感就是「拖不动 / 只有边上能动」。修法：① 去掉 requireGestureRecognizerToFail，tap/pan 由 AIFloatTarget 作为 delegate 允许并存识别（shouldRecognizeSimultaneously 返回 YES）；② 在 ballDragged: 内按**累计位移**自行分流：translation 每次被清零，故用 gFloatDragAcc 自攒，<6pt 不动（判定权留给 tap，保证轻点能展开），≥6pt 才真正拖窗口，并主动把 tap 置失败（enabled 翻转一次强制重置）避免拖完抬指又触发一次展开/收起；③ 加 gFloatDragOn 状态，gestureRecognizerShouldBegin 里让拖动进行中的 tap 不再开始。v47 = v46 + 悬浮球拖动交互两处修复（会话主 · 用户报障「拖球有偏差 + 拖完再点没反应」）：① [G53] ballDragged 坐标系混算——原代码拖的是 gFloatWindow 内的 ball 子视图，ball.center 是**窗口内**坐标（收起态恒为 30,30），却在同一行里用**屏幕**尺寸 sc.width/sc.height 做 clamp，两套坐标混算 → 球被推到 60×60 窗口之外，表现为「手指拖了球却偏移/跑飞/看着没动」。修法：直接拖**窗口本身**（窗口原点即屏幕坐标，与 sc 同系），球作为窗口内固定子视图跟随；同时把 fpx/fpy 的存储与还原公式改为严格互逆（px=(cx-30)/(W-60)，与 AIFloatApply 的 c.x=30+px*(W-60) 对偶），实测 6 个落点往返一致到 0.6px 内。② [G54] tap 与 pan 挂在同一 view 上却没声明优先级——iOS 默认 pan 一旦开始就取消 tap，而 pan 识别阈值仅约 10pt，轻点时的微小位移会被 pan 抢走，于是「拖过一次之后点球没反应」。修法：显式 [pan requireGestureRecognizerToFail:tap]（v48 已被 G55 取代），并限制 minimum/maximumNumberOfTouches=1。③ 附带：拖动期间置 gFloatLast=now 抑制心跳自愈把窗口按旧值拽回；拖动结束强制 AIFloatApply 一次，消除「存的是新值、显示是旧值」的漂移窗口。   // v47 = v46 + 悬浮球拖动交互两处修复（会话主 · 用户报障「拖球有偏差 + 拖完再点没反应」）：① [G53] ballDragged 坐标系混算——原代码拖的是 gFloatWindow 内的 ball 子视图，ball.center 是**窗口内**坐标（收起态恒为 30,30），却在同一行里用**屏幕**尺寸 sc.width/sc.height 做 clamp，两套坐标混算 → 球被推到 60×60 窗口之外，表现为「手指拖了球却偏移/跑飞/看着没动」。修法：直接拖**窗口本身**（窗口原点即屏幕坐标，与 sc 同系），球作为窗口内固定子视图跟随；同时把 fpx/fpy 的存储与还原公式改为严格互逆（px=(cx-30)/(W-60)，与 AIFloatApply 的 c.x=30+px*(W-60) 对偶），实测 6 个落点往返一致到 0.6px 内。② [G54] tap 与 pan 挂在同一 view 上却没声明优先级——iOS 默认 pan 一旦开始就取消 tap，而 pan 识别阈值仅约 10pt，轻点时的微小位移会被 pan 抢走，于是「拖过一次之后点球没反应」。修法：显式 [pan requireGestureRecognizerToFail:tap]，并限制 minimum/maximumNumberOfTouches=1。③ 附带：拖动期间置 gFloatLast=now 抑制心跳自愈把窗口按旧值拽回；拖动结束强制 AIFloatApply 一次，消除「存的是新值、显示是旧值」的漂移窗口。v46 = v45 + 最后一批「抄错 token」修正（会话主 · 用 prototype-html 技能把 v45 做成可交互原型并与 v8 原型逐项对照时又抓出的 3 处）：① .p-hd h3 字号 13→**14**（原型写 var(--fz-3)，而 --fz-3=14px，--fz-2 才是 13 —— 我上一版注释里抄错了 token 名，属于 G47「以为差不多」的具体形态）；② L3 面板按钮 .pbtn 14→**13**（原型 var(--fz-2)=13px，上一版我以「安全入口可读性」为由主动放大到 14，但既然原型就给了 13 且 44pt 高度已满足触摸下限，应忠于原型）；③ .g-meta 透明度 .72→**.85**（原型 .g-meta{opacity:.85}）。—— 结论：**UI 落地只要还有一处「我按感觉给的」，就还能再抓出差异**；本轮把 v8 的每一条 CSS 声明都映射到了源码常量。v45 = v44 + 原型头部/回顾卡精修（会话主 · 最后一批回选择器原文核对）：① L3 面板头部补「3/7」步数（原型 .p-hd .stepno{11px;--txt-2}）——原型的头部是「形状 标题 步数 ✕」四段，上一版把步数塞到第二行副标题，把「一眼看到第几步」降级成「读一行小字」；② 面板关闭按钮「收起」文字 44×26 → 原型 .p-close 的 **✕ 图标 30×30 圆角8 描边 --line**（文字按钮占宽且与暂停/结束语义混淆，✕ 才是通用关闭语汇）；③ 回顾卡标题 h4 14→**16px**；④ 回顾卡三数字 .nums b 13→**14px**。v44 = v43 + 原型剩余 4 处结构补齐（会话主 · 继续回选择器原文核对，把「原型有、真机没有」的全部补上）：① L3 面板「本轮回顾」行（原型 .recap）—— v42 漏做；回顾卡是任务结束的**一次性**强提示，点掉即失，这行是面板里**随时可查**的常驻战绩摘要（N/M 成功 · 结论），缺了它错过弹卡就再也看不到本轮结果；底部预留 152→174 腾位，实测各分区 62..206 / 206..222 / 234..262 / 268..300 / 326..370 无重叠；② L2 罩层标题（原型 .g-title）—— 上一版是「彩色形状+彩色大字 22px」挤一个 label，原型是**8px 脉动圆点 + 纯白 16px 稳字**（gap 7，圆点 1.4s 呼吸、文字不动）；③ 罩层副标题 15px 白 → 13px/alpha.88（原型 .g-brief --txt-2=rgba(255,255,255,.88)）；④ 罩层三按钮（原型 .gbtn）52→46 高、12→10 圆角、14→13 字号，「结束」改用 .gbtn.stop 红色语义（红边 .7 + 红底 .16 + 浅红字）——破坏性动作必须与另两个可区分，是安全设计不是装饰。v43 = v42 + 原型数值/结构精修（会话主 · 对照原型选择器原文逐项核对，共 7 处）：① .step .sy 形状字号 13→**12**（上一版误取 .p-hd .sy 的 15px，改回 .step 继承值 --fz-1=12；同一 class 名在不同作用域取值不同，必须回选择器原文核）、列宽 14→**12**（原型 .step .sy{width:12px}）；② 动作文字 X 33→**31**（.step padding-left 12 + .sy 宽 12 + .l1 gap 7）；③ 步骤行高 48→**51**（有证据行重算：7+18.6+2+15.5+7+0.5，无证据行仍 34）；④ .ev 证据行缩进 33→**31**（.step padding-left 12 + .ev padding-left 19），颜色 .72→**.88**（原型 .ev 用 --txt-2=rgba(255,255,255,.88)）；⑤ L1 球内部拆两元素：原来形状+词塞进一个 11px 双行 label → 形状独立 **19px**（原型 .ball .shape{font-size:19px}）+ 词独立 **9px**、色 .88（原型 .ball .word{font-size:9px;max-width:52px}），脉动动画改挂形状层（原型 .shape.pulse）；⑥ L3 面板头部拆两元素：原来形状+任务名同 label 同色 14px → 形状独立 **15px** 状态色（原型 .p-hd .sy{font-size:15px}）+ 标题恒白 **13px**（原型 .p-hd h3{font-size:13px}，不随状态着色），间距 8（.p-hd gap:8px）；⑦ 版本号自证。v42 = v41 + UI 结构实现（会话主 · 补齐原型 v8 缺失的结构，共 12 处）。v41 只做了 5 处数值微调（颜色/alpha/形状/宽高），用户对比原型后指出「真机还是老界面，只有悬浮球变了」——因为 v41 没新增任何结构，而原型最核心的两块结构真机上根本不存在。本版补齐：① L3 步骤列表：一整块 9px Menlo 灰字 UITextView → UIScrollView + 逐行 AIStepRowView（图标 14 + 动作 12px #e9eef3 + 目标 + Menlo 10px 证据 + 0.5px 分隔线，按状态着色；行高 有证据 48/无 34）；② 结束回顾卡（规划 §8.1 收尾闭环）：原来只有一行 ▶ 拼在文本末尾 → 罩层中央 246×214 大卡（✓/■ + 任务完成·原因 + 用时·动作·失败 三数字 + 知道了 44pt）；③ L2 罩层进度条：「共 N 步 · 当前第 M 步」+ 196×6 进度条（填充 idx/total，与状态同色）；④ L1 球动效：脉动（exec/wait 1.8s 呼吸）+ done 徽标脉冲 + 吸边半隐（edge 开关，alpha .55 右移 18）；⑤ 减少动效：跟随 UIAccessibilityIsReduceMotionEnabled + reduce 开关强制；⑥ L3 副标题加「成功 ✓N」计数；⑦ L3 新增「⧉ 复制步骤全文」按钮（行视图后文字不可选，需显式出口）；⑧ 回顾卡状态机：gRecapShown/gRecapDismissed 双闸。⑨ 结构可观测化（这一条是被否掉的 v41 最该有的东西）：ui{} 新增 panel.steps.n（步骤行数）/ panel.okcnt（成功步数）/ guard.recap（回顾卡在不在）/ guard.recaptext / guard.pct（进度条百分比）/ float.edge / float.reduce —— v41 的 ui{} 里一个结构字段都没有，脚本想测「步骤列表有没有每步一行」也无从下手，只能退化成测 dot 颜色，于是「15/15 全绿但用户不认」；⑩ 新增命令 recapknow（等价点「知道了」）/ copysteps（复制全文，回传剪贴板长度）/ flag（读写 edge·reduce 等开关），让上述结构量全部可被脚本远程断言。—— 关键坑：AIGuardShouldShow 加 gRecapShown（任务收尾 gBusy 归零，否则罩在同帧落下，卡无容器）；task op 里显式 AIGuardRender（AIGuardSync 在罩已显示时不重绘，卡状态变了屏上还是旧的）；AITaskSet 清空分支仅在 gRecapDismissed 时清 gTaskResult（否则云端补发的 task{0,0} 会把刚弹的卡提前干掉）。v41 = v40 + UI 落地（会话主 · 原型 v8 → 真机源码，共 5 处）：① 失败形状 ✕→■（与原型 v4/v8 对齐，规划 §2 与 §9.2 自相矛盾取 ■；形状是语义载体，原型与源码不一致落地必错）；② L1 悬浮球可辨识性：黑 0.62 半透明无描边 → 不透明 #14161a + 2px 亮描边 rgba(255,255,255,.92)，双对比元素取最大值（原型实测 深色宿主旧值仅 1.13:1 近乎隐形，新值 深色 16.29/浅白 6.74/中性灰 12.48/高饱和 14.62 全 ≥3）；③ L1 球词优先读 task.brief（原实现忽略 brief，球上只有干巴巴的 3/7）；④ L2 罩层暗化 0.55→0.65（0.55 在浅色宿主上次级文字仅 3.33:1 不达 WCAG，0.65 是四种宿主全达标的最小可用值 6.57~15.64）；⑤ L3 面板暂停/结束按钮 32→44 高 + 面板 360→380（原注释写着「≥44pt 原则」实际只做 32，而这是唯一能叫停 AI 的安全入口）。v40 = v39 + G30 根治（G30：回执通道单边瘫死——飞行模式令域名 poll 连败 4 次后 gActiveBase 切 IP 兜底，轮询带 AITrustDelegate 活着，回执/心跳 POST（AIReportDict）却没带 → IP 直连证书 CN 不匹配 → -1202「证书无效」一切回执单边全灭；看门狗只看轮询 tick（命令还在执行）永不换代，IP 态又无自动回切路径 → 死锁到杀 App。修法：回执与轮询同待遇，IP 态同样 trustAny+Host 覆盖）。v39 = v38 + G28 看门狗三件套（会话B 合流）：① hang 阈值 45→150s（text/tree 全量 25~90s，45s 对慢命令必然误判换代）；② rst 每 60s 冷却回收 1（原 rst=8 永久放弃换代，13:12 事故通道瘫死实锤）；③ 积压 >3 只执行最后 1 条（换代后新代拉积压慢命令循环换代是耗尽主因）；④ 换代即落盘日志（取证）。v38 = v37 + 屏幕识字（会话A）：op=ocr 读整屏文字 / op=vfind 按文字找并点，参数 accurate + zh-Hans,en-US + correction=NO、坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程，.ips 实锤 AITaskDict 竞态 → SIGSEGV）
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -158,6 +158,13 @@ static int      gTaskTotal = 0;          // 共几步；0 = 无任务（悬浮�
 static int      gTaskOk    = -1;         // -1 执行中 / 1 最近一步成功 / 0 最近一步失败
 static BOOL      gFloatForce    = NO;    // 交互操作要立刻重绘，跳过节流
 static CFTimeInterval gFloatLast = 0;
+// v48 · G55：拖动起步阈值状态。
+//   v47 用 [pan requireGestureRecognizerToFail:tap] 区分「点击 / 拖动」，但 tap 的失败判定
+//   要求手指位移超过其自身容差（约 10pt），于是 pan 必须等手指走够这段才 recognize ——
+//   用户按住球心往外拖，得拖到接近球边缘（半径 28pt）球才开始跟手，手感是「拖不动」。
+//   正确做法：两者并存识别，由代码按**累计位移**决定是拖动还是点击。
+static BOOL      gFloatDragOn   = NO;    // 本次触摸是否已判定为拖动
+static CGPoint   gFloatDragAcc  = CGPointZero;  // 拖动累计位移（translation 被清零后由此累加）
 
 // ---- v30 UI 三层任务态（单一状态源：/status 的 task{}+ui{} 驱动 L1/L2/L3）----
 // 状态取值沿用规划 §5：idle | exec | wait | ok | fail（形状优先，颜色只做加强，色盲可用）
@@ -227,7 +234,7 @@ static NSString *AITaskElapsedText(void);                 // 「用时 1:24」
 // copySteps: 声明），只写 @class 前向声明没用 —— 前向声明只允许指针用法，
 // [[... alloc] init] 和发消息都会报 "receiver ... is a forward declaration"（CI #71 实测）。
 // 实现仍在文件后段，接口提上来即可。
-@interface AIFloatTarget : NSObject
+@interface AIFloatTarget : NSObject <UIGestureRecognizerDelegate>
 - (void)ballTapped:(id)sender;
 - (void)ballDragged:(UIPanGestureRecognizer *)g;
 - (void)sw:(UISwitch *)s;
@@ -5358,8 +5365,46 @@ static void AICheckUpdateAsync(void) {
     //   正确做法：直接拖**窗口**本身。窗口原点就是屏幕坐标，与 sc 同一坐标系，无需换算。
     //   球是窗口内的固定子视图，跟着窗口走即可 —— 这样同时也避免了展开态（窗口 280×380，
     //   球已不在窗口内）误拖到面板。
+    //
+    // v48 · G55 修复：拖动起步阈值。
+    //   v47 加 [pan requireGestureRecognizerToFail:tap] 解决「拖完点不动」，但引入了新问题：
+    //   pan 必须等 tap 失败才 recognize，而 tap 失败要手指位移超过其容差（约 10pt），
+    //   于是「按住球心拖，得拖到球边缘（约 28pt）才开始跟手」——用户报障的手感。
+    //   本版改为：两个手势**并存识别**（delegate 返回 YES，见手势挂载处），
+    //   在 pan 回调里按**累计位移**自己决定何时进入拖动：
+    //     · 位移 < kAIxFLOAT_DRAG_SLOP  → 不动，把判定权留给 tap（保证轻点能展开）
+    //     · 位移 ≥ 阈值                  → 进入拖动；并把 tap 主动置失败，避免拖完又触发一次点击
     CGPoint t = [g translationInView:nil];   // nil = 窗口坐标系（screen 坐标，与 sc 一致）
     [g setTranslation:CGPointZero inView:nil];
+
+    if (g.state == UIGestureRecognizerStateBegan) {
+        gFloatDragOn  = NO;
+        gFloatDragAcc = CGPointZero;
+    }
+    // 累计位移（translation 每次都被清零，必须自己攒）
+    gFloatDragAcc.x += t.x;
+    gFloatDragAcc.y += t.y;
+    CGFloat moved = hypot(gFloatDragAcc.x, gFloatDragAcc.y);
+
+    if (!gFloatDragOn) {
+        if (moved < 6.0) {
+            // 还没走够阈值：不移动窗口。若此时手指抬起（Ended/Cancelled），
+            // 说明是一次轻点 —— 交给 tap 处理，这里什么都不做。
+            if (g.state == UIGestureRecognizerStateEnded ||
+                g.state == UIGestureRecognizerStateCancelled) {
+                gFloatDragAcc = CGPointZero;
+            }
+            return;
+        }
+        gFloatDragOn = YES;
+        // 已确认是拖动 —— 立刻让 tap 失败，防止手指抬起时又触发一次「展开/收起」
+        for (UIGestureRecognizer *r in g.view.gestureRecognizers) {
+            if ([r isKindOfClass:[UITapGestureRecognizer class]]) {
+                r.enabled = NO; r.enabled = YES;   // 强制重置为失败态
+            }
+        }
+    }
+
     CGSize sc = [UIScreen mainScreen].bounds.size;
     CGRect f = gFloatWindow.frame;
     // 屏幕内边距：半宽/半高 + 安全边距，保证球完整可见且不被系统手势条盖住
@@ -5375,6 +5420,8 @@ static void AICheckUpdateAsync(void) {
     }
     if (g.state == UIGestureRecognizerStateEnded ||
         g.state == UIGestureRecognizerStateCancelled) {
+        gFloatDragOn  = NO;
+        gFloatDragAcc = CGPointZero;
         // v47：存成 0~1 比例（换机型/转屏不跑出屏）。
         // 注意取值范围与 AIFloatApply 的还原公式必须严格互逆：
         //   c.x = 30 + px*(sc.width -60)   →   px = (cx - 30) / (sc.width  - 60)
@@ -5391,6 +5438,13 @@ static void AICheckUpdateAsync(void) {
         gFloatForce = YES;
         AIFloatApply();
     }
+}
+// v48 · G55：允许 tap 与 pan 同时识别。
+//   不加这条，iOS 默认「pan 一识别就取消 tap」——那正是 G54。加了 requireGestureRecognizerToFail
+//   又会把 pan 起步拖到 tap 失败之后（G55）。正解是让它们并存，由 ballDragged: 按位移分流。
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)a
+shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
+    return YES;
 }
 - (void)sw:(UISwitch *)s {
     NSString *k = [NSString stringWithFormat:@"sw%d", (int)s.tag];
@@ -5808,11 +5862,13 @@ static void AIFloatApply(void) {
                 ball.alpha = 0.55;
                 if (!gReduceMotion) ball.transform = CGAffineTransformMakeTranslation(18, 0);
             }
-            // v47 · G54 修复：tap 与 pan 挂在同一个 view 上，却没有声明优先级关系。
-            //   iOS 默认行为：pan 一旦开始就 **取消** tap；而 pan 的识别阈值很低（约 10pt），
-            //   用户「轻点」时手指极小的位移就会被 pan 抢走 → 表现就是「拖过一次之后，点球没反应」。
-            //   修法：显式 requireGestureRecognizerToFail —— 让 tap 先有机会识别，
-            //   pan 只在 tap 明确失败（即确实拖动了）时才生效。这是两个手势共存的必须声明。
+            // v48 · G55 修复：拖动起步阈值 —— 不再用 requireGestureRecognizerToFail。
+            //   v47 的 [pan requireGestureRecognizerToFail:tap] 让 pan 必须等 tap 失败，
+            //   而 tap 失败要求手指位移超过其容差（约 10pt）→ 用户按住球心往外拖，
+            //   得拖到接近球边缘（半径 28pt）才跟手，手感就是「拖不动 / 只有边上能动」。
+            //   本版：两个手势**并存识别**（shouldRecognizeSimultaneously 返回 YES），
+            //   由 ballDragged: 内部按累计位移自行判定「这是拖动还是轻点」——
+            //   位移 < 6pt 不动（留给 tap），≥ 6pt 才真正拖窗口并主动让 tap 失败。
             UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
                                            initWithTarget:gFT action:@selector(ballTapped:)];
             [ball addGestureRecognizer:tap];
@@ -5821,8 +5877,9 @@ static void AIFloatApply(void) {
             if (@available(iOS 10.0, *)) pan.maximumNumberOfTouches = 1;
             pan.minimumNumberOfTouches = 1;
             [ball addGestureRecognizer:pan];
-            // 关键：pan 必须等 tap 失败才允许识别（否则轻点会被 pan 吞掉）
-            [pan requireGestureRecognizerToFail:tap];
+            // 两者同时挂着，靠 delegate 允许并存、靠位移阈值区分语义（见上）
+            tap.delegate = gFT;
+            pan.delegate = gFT;
             [host addSubview:ball];
         } else {
             CGFloat w = 280, h = 380;   // v41：360 → 380，为底部 44pt 大按钮让出空间
