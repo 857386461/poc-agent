@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v43";   // v43 = v42 + 原型数值/结构精修（会话主 · 对照原型选择器原文逐项核对，共 7 处）：① .step .sy 形状字号 13→**12**（上一版误取 .p-hd .sy 的 15px，改回 .step 继承值 --fz-1=12；同一 class 名在不同作用域取值不同，必须回选择器原文核）、列宽 14→**12**（原型 .step .sy{width:12px}）；② 动作文字 X 33→**31**（.step padding-left 12 + .sy 宽 12 + .l1 gap 7）；③ 步骤行高 48→**51**（有证据行重算：7+18.6+2+15.5+7+0.5，无证据行仍 34）；④ .ev 证据行缩进 33→**31**（.step padding-left 12 + .ev padding-left 19），颜色 .72→**.88**（原型 .ev 用 --txt-2=rgba(255,255,255,.88)）；⑤ L1 球内部拆两元素：原来形状+词塞进一个 11px 双行 label → 形状独立 **19px**（原型 .ball .shape{font-size:19px}）+ 词独立 **9px**、色 .88（原型 .ball .word{font-size:9px;max-width:52px}），脉动动画改挂形状层（原型 .shape.pulse）；⑥ L3 面板头部拆两元素：原来形状+任务名同 label 同色 14px → 形状独立 **15px** 状态色（原型 .p-hd .sy{font-size:15px}）+ 标题恒白 **13px**（原型 .p-hd h3{font-size:13px}，不随状态着色），间距 8（.p-hd gap:8px）；⑦ 版本号自证。v42 = v41 + UI 结构实现（会话主 · 补齐原型 v8 缺失的结构，共 12 处）。v41 只做了 5 处数值微调（颜色/alpha/形状/宽高），用户对比原型后指出「真机还是老界面，只有悬浮球变了」——因为 v41 没新增任何结构，而原型最核心的两块结构真机上根本不存在。本版补齐：① L3 步骤列表：一整块 9px Menlo 灰字 UITextView → UIScrollView + 逐行 AIStepRowView（图标 14 + 动作 12px #e9eef3 + 目标 + Menlo 10px 证据 + 0.5px 分隔线，按状态着色；行高 有证据 48/无 34）；② 结束回顾卡（规划 §8.1 收尾闭环）：原来只有一行 ▶ 拼在文本末尾 → 罩层中央 246×214 大卡（✓/■ + 任务完成·原因 + 用时·动作·失败 三数字 + 知道了 44pt）；③ L2 罩层进度条：「共 N 步 · 当前第 M 步」+ 196×6 进度条（填充 idx/total，与状态同色）；④ L1 球动效：脉动（exec/wait 1.8s 呼吸）+ done 徽标脉冲 + 吸边半隐（edge 开关，alpha .55 右移 18）；⑤ 减少动效：跟随 UIAccessibilityIsReduceMotionEnabled + reduce 开关强制；⑥ L3 副标题加「成功 ✓N」计数；⑦ L3 新增「⧉ 复制步骤全文」按钮（行视图后文字不可选，需显式出口）；⑧ 回顾卡状态机：gRecapShown/gRecapDismissed 双闸。⑨ 结构可观测化（这一条是被否掉的 v41 最该有的东西）：ui{} 新增 panel.steps.n（步骤行数）/ panel.okcnt（成功步数）/ guard.recap（回顾卡在不在）/ guard.recaptext / guard.pct（进度条百分比）/ float.edge / float.reduce —— v41 的 ui{} 里一个结构字段都没有，脚本想测「步骤列表有没有每步一行」也无从下手，只能退化成测 dot 颜色，于是「15/15 全绿但用户不认」；⑩ 新增命令 recapknow（等价点「知道了」）/ copysteps（复制全文，回传剪贴板长度）/ flag（读写 edge·reduce 等开关），让上述结构量全部可被脚本远程断言。—— 关键坑：AIGuardShouldShow 加 gRecapShown（任务收尾 gBusy 归零，否则罩在同帧落下，卡无容器）；task op 里显式 AIGuardRender（AIGuardSync 在罩已显示时不重绘，卡状态变了屏上还是旧的）；AITaskSet 清空分支仅在 gRecapDismissed 时清 gTaskResult（否则云端补发的 task{0,0} 会把刚弹的卡提前干掉）。v41 = v40 + UI 落地（会话主 · 原型 v8 → 真机源码，共 5 处）：① 失败形状 ✕→■（与原型 v4/v8 对齐，规划 §2 与 §9.2 自相矛盾取 ■；形状是语义载体，原型与源码不一致落地必错）；② L1 悬浮球可辨识性：黑 0.62 半透明无描边 → 不透明 #14161a + 2px 亮描边 rgba(255,255,255,.92)，双对比元素取最大值（原型实测 深色宿主旧值仅 1.13:1 近乎隐形，新值 深色 16.29/浅白 6.74/中性灰 12.48/高饱和 14.62 全 ≥3）；③ L1 球词优先读 task.brief（原实现忽略 brief，球上只有干巴巴的 3/7）；④ L2 罩层暗化 0.55→0.65（0.55 在浅色宿主上次级文字仅 3.33:1 不达 WCAG，0.65 是四种宿主全达标的最小可用值 6.57~15.64）；⑤ L3 面板暂停/结束按钮 32→44 高 + 面板 360→380（原注释写着「≥44pt 原则」实际只做 32，而这是唯一能叫停 AI 的安全入口）。v40 = v39 + G30 根治（G30：回执通道单边瘫死——飞行模式令域名 poll 连败 4 次后 gActiveBase 切 IP 兜底，轮询带 AITrustDelegate 活着，回执/心跳 POST（AIReportDict）却没带 → IP 直连证书 CN 不匹配 → -1202「证书无效」一切回执单边全灭；看门狗只看轮询 tick（命令还在执行）永不换代，IP 态又无自动回切路径 → 死锁到杀 App。修法：回执与轮询同待遇，IP 态同样 trustAny+Host 覆盖）。v39 = v38 + G28 看门狗三件套（会话B 合流）：① hang 阈值 45→150s（text/tree 全量 25~90s，45s 对慢命令必然误判换代）；② rst 每 60s 冷却回收 1（原 rst=8 永久放弃换代，13:12 事故通道瘫死实锤）；③ 积压 >3 只执行最后 1 条（换代后新代拉积压慢命令循环换代是耗尽主因）；④ 换代即落盘日志（取证）。v38 = v37 + 屏幕识字（会话A）：op=ocr 读整屏文字 / op=vfind 按文字找并点，参数 accurate + zh-Hans,en-US + correction=NO、坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程，.ips 实锤 AITaskDict 竞态 → SIGSEGV）
+static NSString * const kAIVer = @"v44";   // v44 = v43 + 原型剩余 4 处结构补齐（会话主 · 继续回选择器原文核对，把「原型有、真机没有」的全部补上）：① L3 面板「本轮回顾」行（原型 .recap）—— v42 漏做；回顾卡是任务结束的**一次性**强提示，点掉即失，这行是面板里**随时可查**的常驻战绩摘要（N/M 成功 · 结论），缺了它错过弹卡就再也看不到本轮结果；底部预留 152→174 腾位，实测各分区 62..206 / 206..222 / 234..262 / 268..300 / 326..370 无重叠；② L2 罩层标题（原型 .g-title）—— 上一版是「彩色形状+彩色大字 22px」挤一个 label，原型是**8px 脉动圆点 + 纯白 16px 稳字**（gap 7，圆点 1.4s 呼吸、文字不动）；③ 罩层副标题 15px 白 → 13px/alpha.88（原型 .g-brief --txt-2=rgba(255,255,255,.88)）；④ 罩层三按钮（原型 .gbtn）52→46 高、12→10 圆角、14→13 字号，「结束」改用 .gbtn.stop 红色语义（红边 .7 + 红底 .16 + 浅红字）——破坏性动作必须与另两个可区分，是安全设计不是装饰。v43 = v42 + 原型数值/结构精修（会话主 · 对照原型选择器原文逐项核对，共 7 处）：① .step .sy 形状字号 13→**12**（上一版误取 .p-hd .sy 的 15px，改回 .step 继承值 --fz-1=12；同一 class 名在不同作用域取值不同，必须回选择器原文核）、列宽 14→**12**（原型 .step .sy{width:12px}）；② 动作文字 X 33→**31**（.step padding-left 12 + .sy 宽 12 + .l1 gap 7）；③ 步骤行高 48→**51**（有证据行重算：7+18.6+2+15.5+7+0.5，无证据行仍 34）；④ .ev 证据行缩进 33→**31**（.step padding-left 12 + .ev padding-left 19），颜色 .72→**.88**（原型 .ev 用 --txt-2=rgba(255,255,255,.88)）；⑤ L1 球内部拆两元素：原来形状+词塞进一个 11px 双行 label → 形状独立 **19px**（原型 .ball .shape{font-size:19px}）+ 词独立 **9px**、色 .88（原型 .ball .word{font-size:9px;max-width:52px}），脉动动画改挂形状层（原型 .shape.pulse）；⑥ L3 面板头部拆两元素：原来形状+任务名同 label 同色 14px → 形状独立 **15px** 状态色（原型 .p-hd .sy{font-size:15px}）+ 标题恒白 **13px**（原型 .p-hd h3{font-size:13px}，不随状态着色），间距 8（.p-hd gap:8px）；⑦ 版本号自证。v42 = v41 + UI 结构实现（会话主 · 补齐原型 v8 缺失的结构，共 12 处）。v41 只做了 5 处数值微调（颜色/alpha/形状/宽高），用户对比原型后指出「真机还是老界面，只有悬浮球变了」——因为 v41 没新增任何结构，而原型最核心的两块结构真机上根本不存在。本版补齐：① L3 步骤列表：一整块 9px Menlo 灰字 UITextView → UIScrollView + 逐行 AIStepRowView（图标 14 + 动作 12px #e9eef3 + 目标 + Menlo 10px 证据 + 0.5px 分隔线，按状态着色；行高 有证据 48/无 34）；② 结束回顾卡（规划 §8.1 收尾闭环）：原来只有一行 ▶ 拼在文本末尾 → 罩层中央 246×214 大卡（✓/■ + 任务完成·原因 + 用时·动作·失败 三数字 + 知道了 44pt）；③ L2 罩层进度条：「共 N 步 · 当前第 M 步」+ 196×6 进度条（填充 idx/total，与状态同色）；④ L1 球动效：脉动（exec/wait 1.8s 呼吸）+ done 徽标脉冲 + 吸边半隐（edge 开关，alpha .55 右移 18）；⑤ 减少动效：跟随 UIAccessibilityIsReduceMotionEnabled + reduce 开关强制；⑥ L3 副标题加「成功 ✓N」计数；⑦ L3 新增「⧉ 复制步骤全文」按钮（行视图后文字不可选，需显式出口）；⑧ 回顾卡状态机：gRecapShown/gRecapDismissed 双闸。⑨ 结构可观测化（这一条是被否掉的 v41 最该有的东西）：ui{} 新增 panel.steps.n（步骤行数）/ panel.okcnt（成功步数）/ guard.recap（回顾卡在不在）/ guard.recaptext / guard.pct（进度条百分比）/ float.edge / float.reduce —— v41 的 ui{} 里一个结构字段都没有，脚本想测「步骤列表有没有每步一行」也无从下手，只能退化成测 dot 颜色，于是「15/15 全绿但用户不认」；⑩ 新增命令 recapknow（等价点「知道了」）/ copysteps（复制全文，回传剪贴板长度）/ flag（读写 edge·reduce 等开关），让上述结构量全部可被脚本远程断言。—— 关键坑：AIGuardShouldShow 加 gRecapShown（任务收尾 gBusy 归零，否则罩在同帧落下，卡无容器）；task op 里显式 AIGuardRender（AIGuardSync 在罩已显示时不重绘，卡状态变了屏上还是旧的）；AITaskSet 清空分支仅在 gRecapDismissed 时清 gTaskResult（否则云端补发的 task{0,0} 会把刚弹的卡提前干掉）。v41 = v40 + UI 落地（会话主 · 原型 v8 → 真机源码，共 5 处）：① 失败形状 ✕→■（与原型 v4/v8 对齐，规划 §2 与 §9.2 自相矛盾取 ■；形状是语义载体，原型与源码不一致落地必错）；② L1 悬浮球可辨识性：黑 0.62 半透明无描边 → 不透明 #14161a + 2px 亮描边 rgba(255,255,255,.92)，双对比元素取最大值（原型实测 深色宿主旧值仅 1.13:1 近乎隐形，新值 深色 16.29/浅白 6.74/中性灰 12.48/高饱和 14.62 全 ≥3）；③ L1 球词优先读 task.brief（原实现忽略 brief，球上只有干巴巴的 3/7）；④ L2 罩层暗化 0.55→0.65（0.55 在浅色宿主上次级文字仅 3.33:1 不达 WCAG，0.65 是四种宿主全达标的最小可用值 6.57~15.64）；⑤ L3 面板暂停/结束按钮 32→44 高 + 面板 360→380（原注释写着「≥44pt 原则」实际只做 32，而这是唯一能叫停 AI 的安全入口）。v40 = v39 + G30 根治（G30：回执通道单边瘫死——飞行模式令域名 poll 连败 4 次后 gActiveBase 切 IP 兜底，轮询带 AITrustDelegate 活着，回执/心跳 POST（AIReportDict）却没带 → IP 直连证书 CN 不匹配 → -1202「证书无效」一切回执单边全灭；看门狗只看轮询 tick（命令还在执行）永不换代，IP 态又无自动回切路径 → 死锁到杀 App。修法：回执与轮询同待遇，IP 态同样 trustAny+Host 覆盖）。v39 = v38 + G28 看门狗三件套（会话B 合流）：① hang 阈值 45→150s（text/tree 全量 25~90s，45s 对慢命令必然误判换代）；② rst 每 60s 冷却回收 1（原 rst=8 永久放弃换代，13:12 事故通道瘫死实锤）；③ 积压 >3 只执行最后 1 条（换代后新代拉积压慢命令循环换代是耗尽主因）；④ 换代即落盘日志（取证）。v38 = v37 + 屏幕识字（会话A）：op=ocr 读整屏文字 / op=vfind 按文字找并点，参数 accurate + zh-Hans,en-US + correction=NO、坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程，.ips 实锤 AITaskDict 竞态 → SIGSEGV）
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -4965,18 +4965,38 @@ static void AIGuardRender(void) {
                 [host addSubview:dim];
             }
 
+            // v43：罩层标题对齐原型 .g-title —— 原型是一个 8px **脉动圆点** + 纯白标题（gap 7），
+            // 不是「形状 + 彩色标题」挤在一个 label 里。
+            //   .g-title{font-size:16px;font-weight:650;color:#fff;display:flex;align-items:center;gap:7px}
+            //   .g-title i{width:8px;height:8px;border-radius:50%;background:var(--ok)}
+            //   .g-title i.spin{animation:breathe 1.4s}   ← 脉动只给圆点，文字不动
+            // 上一版把形状当标题前缀且整体上色，视觉上是个「彩色大符号+彩色字」，与原型的
+            // 「小白点呼吸 + 稳重白字」气质完全不同 —— 这正是用户说「界面还是原来的」的原因之一。
             NSString *stG = (gTaskTotal > 0) ? gTaskState : @"exec";
             if (gTaskTotal > 0 && gTaskOk == 0) stG = @"fail";
             CGFloat cy = f.size.height * 0.30;
-            UILabel *tl = [[UILabel alloc] initWithFrame:CGRectMake(20, cy, f.size.width - 40, 32)];
-            tl.text = [NSString stringWithFormat:@"%@ AI 正在操作手机", AIShapeFor(stG)];
-            tl.textColor = AIColorFor(stG);
-            tl.font = [UIFont boldSystemFontOfSize:22];
+            BOOL spin = ([AITaskStateNorm(stG) isEqualToString:@"exec"] ||
+                         [AITaskStateNorm(stG) isEqualToString:@"wait"]) && !gReduceMotion;
+            UIView *gdot = [[UIView alloc] initWithFrame:CGRectMake((f.size.width - 178) / 2.0, cy + 11, 8, 8)];
+            gdot.backgroundColor = AIColorFor(stG);          // 圆点随状态着色（原型默认 --ok）
+            gdot.layer.cornerRadius = 4;
+            if (spin) {
+                CABasicAnimation *a1 = [CABasicAnimation animationWithKeyPath:@"opacity"];
+                a1.fromValue = @1.0; a1.toValue = @0.45; a1.duration = 1.4;
+                a1.autoreverses = YES; a1.repeatCount = HUGE_VALF;
+                [gdot.layer addAnimation:a1 forKey:@"spin"];
+            }
+            [host addSubview:gdot];
+            UILabel *tl = [[UILabel alloc] initWithFrame:CGRectMake(0, cy, f.size.width, 32)];
+            tl.text = @"AI 正在操作手机";
+            tl.textColor = [UIColor whiteColor];             // 原型 .g-title color:#fff（不随状态变色）
+            tl.font = [UIFont boldSystemFontOfSize:16];      // 原型 .g-title{font-size:var(--fz-4)=16px}
             tl.textAlignment = NSTextAlignmentCenter;
             [host addSubview:tl];
             UILabel *bl = [[UILabel alloc] initWithFrame:CGRectMake(20, cy + 38, f.size.width - 40, 60)];
             bl.numberOfLines = 3; bl.textAlignment = NSTextAlignmentCenter;
-            bl.textColor = [UIColor whiteColor]; bl.font = [UIFont systemFontOfSize:15];
+            bl.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.88];   // 原型 .g-brief --txt-2
+            bl.font = [UIFont systemFontOfSize:13];          // 原型 .g-brief{font-size:var(--fz-2)=13px}
             bl.text = AITaskLine();
             [host addSubview:bl];
 
@@ -5011,19 +5031,30 @@ static void AIGuardRender(void) {
             [barBg addSubview:fill];
             [host addSubview:barBg];
 
-            // 三个大控件（88×52 ≥44pt）：人类唯一可打断 AI 的入口（安全设计）
+            // 三个大控件对齐原型 .gbtn：高度 46（≥44pt 触摸下限，原型实测值）、圆角 10（--r1）、
+            // 字 13（--fz-2）、gap 8（--sp2）。v43：52→46 高 / 12→10 圆角 / 14→13 字号，全部回原型。
+            // 「结束」用 .gbtn.stop 的红色语义（原型 border rgba(255,93,93,.7) + bg rgba(255,93,93,.16)）——
+            // 破坏性动作必须与另两个在视觉上可区分，这是安全设计不是装饰。
             if (!gGT) gGT = [AIGuardTarget new];
-            NSString *bt[] = {@"⏸ 暂停", (verify ? @"👁 恢复模糊" : @"👁 露出 App"), @"⏹ 结束任务"};
+            NSString *bt[] = {@"⏸ 暂停", (verify ? @"👁 恢复模糊" : @"👁 露出 App"), @"⏹ 结束"};
             SEL ba[] = {@selector(guardPause:), @selector(guardVerify:), @selector(guardEnd:)};
-            CGFloat bw = (f.size.width - 60) / 3.0;
+            CGFloat bw = (f.size.width - 40 - 16) / 3.0;      // 左右各 20 边距 + 2 个 8px gap
             for (int i = 0; i < 3; i++) {
+                BOOL isStop = (i == 2);
                 UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-                b.frame = CGRectMake(20 + i * (bw + 10), f.size.height - 116, bw, 52);
-                b.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.18];
-                b.layer.cornerRadius = 12;
+                b.frame = CGRectMake(20 + i * (bw + 8), f.size.height - 110, bw, 46);
+                b.backgroundColor = isStop
+                    ? [UIColor colorWithRed:1.0 green:0.365 blue:0.365 alpha:0.16]    // 原型 .gbtn.stop 底
+                    : [[UIColor whiteColor] colorWithAlphaComponent:0.10];            // 原型 .gbtn 底
+                b.layer.cornerRadius = 10;
+                b.layer.borderWidth = 1;
+                b.layer.borderColor = isStop
+                    ? [UIColor colorWithRed:1.0 green:0.365 blue:0.365 alpha:0.7].CGColor
+                    : [[UIColor whiteColor] colorWithAlphaComponent:0.52].CGColor;
                 [b setTitle:bt[i] forState:UIControlStateNormal];
-                [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-                b.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+                [b setTitleColor:(isStop ? [UIColor colorWithRed:1.0 green:0.835 blue:0.835 alpha:1.0]
+                                          : [UIColor whiteColor]) forState:UIControlStateNormal];
+                b.titleLabel.font = [UIFont boldSystemFontOfSize:13];
                 [b addTarget:gGT action:ba[i] forControlEvents:UIControlEventTouchUpInside];
                 [host addSubview:b];
             }
@@ -5806,7 +5837,9 @@ static void AIFloatApply(void) {
             // 旧实现把 30~60 条步骤 appendFormat 成一块 9px Menlo 纯文本塞进 UITextView：
             // 无结构、无着色、无色阶层次 —— 用户对比原型后一句「界面还是原来的」即指此处。
             // 现改为 UIScrollView 内逐行 AIStepRowView：图标/动作/目标/证据/分隔线，按状态着色。
-            CGFloat stepsY = 62, stepsH = h - 152 - stepsY;     // 底部依次留：诊断 28 + 复制 32 + 按钮 44 + 间距
+            // v43：底部预留 152 → 174，为新增的 .recap 本轮回顾行（16px + 上分隔线 + 间距）腾位。
+            // 顺序（自上而下）：步骤区 / recap行 / 诊断 / 复制 / 暂停+结束。
+            CGFloat stepsY = 62, stepsH = h - 174 - stepsY;
             UIScrollView *sv = [[UIScrollView alloc] initWithFrame:CGRectMake(10, stepsY, w - 20, stepsH)];
             sv.backgroundColor = [UIColor colorWithWhite:0.13 alpha:1.0];
             sv.layer.cornerRadius = 8; sv.clipsToBounds = YES;
@@ -5828,6 +5861,31 @@ static void AIFloatApply(void) {
             }
             sv.contentSize = CGSizeMake(w - 20, MAX(ry + 4, stepsH));
             [panel addSubview:sv];
+
+            // v43：面板底部「本轮回顾」行（原型 .recap）——v42 漏做的一处结构。
+            //   原型：.recap{display:flex;justify-content:space-between;padding:8px 12px;font-size:11px;
+            //                border-top:1px solid var(--line)}  内容「本轮回顾」…「N/M 成功 · <证据>」
+            // 为什么要有：回顾卡是「任务结束时的强提示」，一旦点掉就没了；面板里这行是**随时可查**的
+            //   常驻摘要，二者不是一个东西，缺了它用户错过弹卡就没有任何地方能看到本轮战绩。
+            // 只在有结论时显示（与原型 recap.style.display = rec?'flex':'none' 同判据）。
+            if (gTaskTotal > 0) {
+                UIView *rline = [[UIView alloc] initWithFrame:CGRectMake(10, h - 174, w - 20, 1)];
+                rline.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.10];   // 原型 --line
+                [panel addSubview:rline];
+                UILabel *rl = [[UILabel alloc] initWithFrame:CGRectMake(12, h - 172, 60, 16)];
+                rl.text = @"本轮回顾";
+                rl.font = [UIFont systemFontOfSize:11];
+                rl.textColor = [UIColor lightGrayColor];
+                [panel addSubview:rl];
+                UILabel *rr = [[UILabel alloc] initWithFrame:CGRectMake(72, h - 172, w - 84, 16)];
+                rr.textAlignment = NSTextAlignmentRight;
+                rr.font = [UIFont systemFontOfSize:11];
+                rr.textColor = [UIColor lightGrayColor];
+                rr.lineBreakMode = NSLineBreakByTruncatingHead;
+                rr.text = [NSString stringWithFormat:@"%d/%d 成功 · %@", okCnt, gTaskTotal,
+                           (gTaskResult.length ? gTaskResult : @"—")];
+                [panel addSubview:rr];
+            }
 
             // 诊断区（默认折叠）：HUD 退役后，网络/版本/中继只在这里
             UIButton *dg = [UIButton buttonWithType:UIButtonTypeSystem];
