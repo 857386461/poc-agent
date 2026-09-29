@@ -164,7 +164,9 @@ static CFTimeInterval gFloatLast = 0;
 //   用户按住球心往外拖，得拖到接近球边缘（半径 28pt）球才开始跟手，手感是「拖不动」。
 //   正确做法：两者并存识别，由代码按**累计位移**决定是拖动还是点击。
 static BOOL      gFloatDragOn   = NO;    // 本次触摸是否已判定为拖动
-static CGPoint   gFloatDragAcc  = CGPointZero;  // 拖动累计位移（translation 被清零后由此累加）
+static CGPoint   gFloatDragAcc  = {0, 0};   // 拖动累计位移（translation 被清零后由此累加）
+//   注意：不能用 CGPointZero —— 它是 CGPointMake() 的函数调用，不是编译期常量，
+//   文件作用域初始化会报 "initializer element is not a compile-time constant"（CI #80 实测）。
 
 // ---- v30 UI 三层任务态（单一状态源：/status 的 task{}+ui{} 驱动 L1/L2/L3）----
 // 状态取值沿用规划 §5：idle | exec | wait | ok | fail（形状优先，颜色只做加强，色盲可用）
