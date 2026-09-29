@@ -4050,10 +4050,15 @@ static void AIExecCmd(NSDictionary *cmd) {
             AITaskSet(name, idx, total, state, ok, brief);
             gTaskStep = step;              // v37：主线程写（原轮询线程裸写，G25 竞态点）
             if (ok >= 0 && total > 0) {
-                // 结束回顾卡：写原因，不写「操作失败」（规划 §8.1）
+                // 结束回顾卡：只写「原因」，不写标题也不写形状（规划 §8.1）。
+                // v42 修：原来这里写成 "✓ 任务完成 · 名字 N 步" / "✕ 任务没跑完 · 卡在第 N 步：xxx"，
+                //   而 AIRecapCardView 自己已经有 ✓/■ 大图形 + "任务完成"/"任务没跑完" 标题，
+                //   于是同一句话在卡上出现两遍（实测卡面：「■ / 任务没跑完 / ✕ 任务没跑完 · 卡在第 5 步：…」），
+                //   且形状还自相矛盾（标题区 ■，正文里 ✕）。现改为只留纯原因，标题与形状交给卡自己渲染。
                 gTaskResult = (ok == 1)
-                    ? [NSString stringWithFormat:@"✓ 任务完成 · %@ %d 步", (name.length ? name : @"任务"), total]
-                    : [NSString stringWithFormat:@"✕ 任务没跑完 · 卡在第 %d 步：%@", idx,
+                    ? [NSString stringWithFormat:@"%@ %d 步全部完成",
+                       (name.length ? name : @"任务"), total]
+                    : [NSString stringWithFormat:@"卡在第 %d 步：%@", idx,
                        (step.length ? step : (brief.length ? brief : @"未知原因"))];
                 // v42：弹出回顾卡（罩层中央大卡，规划 §8.1「收尾闭环」）。
                 // AIGuardShouldShow 已含 gRecapShown，故任务结束 gBusy 归零后罩仍保持显示给卡当容器。
@@ -4859,7 +4864,8 @@ static UIView *AIRecapCardView(CGFloat screenW) {
     t.textAlignment = NSTextAlignmentCenter;
     [card addSubview:t];
 
-    // 原因文案：gTaskResult 已在 task op 里按成功/失败分别写好（不写"操作失败"，写原因）
+    // 原因文案：gTaskResult 只存纯原因（v42 修：形状与标题由本卡自己渲染，不再重复）。
+    // 卡面整体读作：「■ / 任务没跑完 / 卡在第 5 步：xxx」——无重复、无形状矛盾。
     UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(12, 76, cw - 24, 34)];
     sub.numberOfLines = 2;
     sub.textAlignment = NSTextAlignmentCenter;
@@ -5537,9 +5543,11 @@ static NSDictionary *AIUiDict(void) {
     for (NSDictionary *d in gSteps) if ([d[@"s"] isEqualToString:@"ok"]) okCnt++;
     int pct = (gTaskTotal > 0) ? (int)((gTaskIdx * 100.0) / gTaskTotal + 0.5) : 0;
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
-    NSString *recapTxt = gTaskResult ? [NSString stringWithFormat:@"%@",
-                            (gTaskOk == 0 ? [@"任务没跑完 · " stringByAppendingString:gTaskResult]
-                                          : [@"任务完成 · " stringByAppendingString:gTaskResult])] : @"";
+    // recaptext 回显「卡面上真正看到的一段话」，供脚本断言。
+    // v42 修：gTaskResult 现在只存纯原因，所以这里必须把卡自己的标题拼回来才等价于屏上所见
+    //   （原来 gTaskResult 自带标题，这里再拼一次 → 「任务没跑完 · ✕ 任务没跑完 · …」重复）。
+    NSString *recapTxt = gTaskResult ? [NSString stringWithFormat:@"%@ · %@",
+                            (gTaskOk == 0 ? @"任务没跑完" : @"任务完成"), gTaskResult] : @"";
     return @{@"float": @{@"dot": st ?: @"idle", @"line": AITaskLine(),
                          @"win":  @(gFloatWindow ? 1 : 0),
                          @"vis":  (gFloatWindow && !gFloatWindow.hidden) ? @1 : @0,
