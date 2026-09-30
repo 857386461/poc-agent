@@ -222,7 +222,7 @@ static volatile int32_t gNetCnt  = 0;      // 累计记录条数（含已被环�
 // ★ 这个判断只认 host，不认端口 —— 中继可能换端口，宁可多避让也不能漏。
 static BOOL AINetIsRelayHost(NSString *host) {
     if (!host.length) return NO;
-    if ([host isEqualToString:kAINetHost])     return YES;   // 域名
+    if (NO && [host isEqualToString:kAINetHost]) return YES;   // ★临时自测：不避让中继，验证 hook 是否真的会被调用
     if ([host hasPrefix:@"49.233."])           return YES;   // IP 直连兜底（AIHttpEx trustAny 那条）
     if ([host hasPrefix:@"127."])              return YES;   // 本机回环
     if ([host isEqualToString:@"localhost"])   return YES;
