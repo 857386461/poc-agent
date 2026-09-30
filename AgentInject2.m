@@ -222,7 +222,7 @@ static volatile int32_t gNetCnt  = 0;      // 累计记录条数（含已被环�
 // ★ 这个判断只认 host，不认端口 —— 中继可能换端口，宁可多避让也不能漏。
 static BOOL AINetIsRelayHost(NSString *host) {
     if (!host.length) return NO;
-    if (NO && [host isEqualToString:kAINetHost]) return YES;   // ★临时自测：不避让中继，验证 hook 是否真的会被调用
+    if ([host isEqualToString:kAINetHost])     return YES;   // 域名
     if ([host hasPrefix:@"49.233."])           return YES;   // IP 直连兜底（AIHttpEx trustAny 那条）
     if ([host hasPrefix:@"127."])              return YES;   // 本机回环
     if ([host isEqualToString:@"localhost"])   return YES;
@@ -4282,6 +4282,19 @@ static void AIExecCmd(NSDictionary *cmd) {
         gNetUntil = (sec > 0) ? (gNetT0 + sec) : 0;
         gNetOn   = gNetKilled ? 0 : 1;
         AILog(@"  [cmd] net.on sec=%d killed=%d", sec, gNetKilled);
+        // ★★ 临时自测（v49-selftest）：net.on 时主动打一个**已知会走 NSURLSession**的请求，
+        //    用来看「我的 protocol 层到底会不会被系统调用」。苹果官网不在中继避让名单里。
+        //    验证完删除，不并入正式版。
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            @autoreleasepool {
+                [NSThread sleepForTimeInterval:2.0];
+                NSData *d = nil; NSError *e2 = nil; NSInteger c2 = 0; NSTimeInterval m2 = 0;
+                BOOL o = AIHttpEx(@"https://www.apple.com/library/test/success.html", nil, 12.0,
+                                  NO, nil, &d, &e2, &c2, &m2);
+                AILog(@"  [selftest] 苹果官网 ok=%d code=%ld bytes=%lu 抓到的 net.cnt=%d",
+                      o, (long)c2, (unsigned long)d.length, gNetCnt);
+            }
+        });
         AIReportDict(@{@"op": @"net.on", @"ok": @(gNetOn ? YES : NO),
                        @"on": @(gNetOn), @"sec": @(sec), @"reg": @(gNetRegistered),
                        @"killed": @(gNetKilled),
