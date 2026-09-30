@@ -109,7 +109,34 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v49";   // v49 = v48 + 路线一「通用网络监听」（会话主 · 用户拍板「改成 api 版好辨识，可以开工」）。给注入器加一层 **App 无关的网络观测层**：用系统设计接口 NSURLProtocol 的**注册式** hook（registerClass:，不 swizzle、不替换任何原方法、可 unregister 干净撤销）旁路记录目标 App 自己发出的 HTTP 往返，让云端 AI 能直接读接口返回的 JSON 字段，而不是只靠 OCR 从像素猜数字；同时给操作判定提供「请求真的发出去了」这第二条证据。三条红线：① **绝不修改任何请求**（不加 header、不改 body、不重写响应，纯只读旁路）；② 只记摘要（方法/路径/状态码/耗时/字节数/Content-Type，json 才留前 300 字符）；③ 敏感 query 参数脱敏。**核心风险 = NSURLProtocol 全局生效会连中继通信一起拦**（AIHttp/AIHttpErr/AIHttpEx/AIReportDict 也是 NSURLSession）→ 一旦实现有 bug 就是中继断、设备失联、只能重新注入。故设三道闸做源头隔离：① canInitWithRequest: 里对中继域名/49.233.x.x IP 兜底/127.x/localhost **直接返回 NO**（让中继请求连进都不进我的代码，这是关键 —— 放到 startLoading 里过滤等于没隔离）；② gNetOn 默认关且限时（net.on 默认 120s 自动过期）；③ propertyForKey: 打防递归标记（我的 startLoading 内部发起的真实请求会再经 canInit，不打标必无限递归 —— NSURLProtocol 最经典的坑）。另加不依赖网络的兜底：/var/mobile/agent_net_off 文件存在即强制关闭且永不注册（中继被拖死时唯一的救援通道）。新增三个 op：net.on / net.off / net.tail；status 加 net{} 观测块。**路径保留完整 URL（含 host）而非只留 path** —— 用户要求「api 版好辨识」：同一 App 常有多个域名（快手就有 api./log./js. 等），只留 path 会把 api.kuaishou.com/v1/feed 和 log.kuaishou.com/v1/feed 记成同一条，看不出是哪个接口。同时对**长数字段**（≥6 位连续数字）折叠成 <n位>，避免设备号/时间戳这类长数字把路径撑爆、也让同类接口聚拢成同一形状好辨识。v48 = v47 + G55 拖动起步阈值修复（会话主 · 用户报障「v47 拖球没偏了，但按住中心点要拖到边缘球才动」）：v47 用 [pan requireGestureRecognizerToFail:tap] 区分点击/拖动，但 tap 的失败判定要求手指位移超过其自身容差（约 10pt），于是 pan 必须等手指走够这段才 recognize —— 用户按住球心（半径 28pt 的球）往外拖，要拖到接近球边缘才开始跟手，手感就是「拖不动 / 只有边上能动」。修法：① 去掉 requireGestureRecognizerToFail，tap/pan 由 AIFloatTarget 作为 delegate 允许并存识别（shouldRecognizeSimultaneously 返回 YES）；② 在 ballDragged: 内按**累计位移**自行分流：translation 每次被清零，故用 gFloatDragAcc 自攒，<6pt 不动（判定权留给 tap，保证轻点能展开），≥6pt 才真正拖窗口，并主动把 tap 置失败（enabled 翻转一次强制重置）避免拖完抬指又触发一次展开/收起；③ 加 gFloatDragOn 状态标记本次触摸是否已进入拖动，拖动确认时把 tap 的 enabled 翻转一次强制其失败（比 gestureRecognizerShouldBegin 可靠 —— 后者对 tap 的判定发生在触摸落下时，那时还没有位移信息，判不出拖动）。v47 = v46 + 悬浮球拖动交互两处修复（会话主 · 用户报障「拖球有偏差 + 拖完再点没反应」）：① [G53] ballDragged 坐标系混算——原代码拖的是 gFloatWindow 内的 ball 子视图，ball.center 是**窗口内**坐标（收起态恒为 30,30），却在同一行里用**屏幕**尺寸 sc.width/sc.height 做 clamp，两套坐标混算 → 球被推到 60×60 窗口之外，表现为「手指拖了球却偏移/跑飞/看着没动」。修法：直接拖**窗口本身**（窗口原点即屏幕坐标，与 sc 同系），球作为窗口内固定子视图跟随；同时把 fpx/fpy 的存储与还原公式改为严格互逆（px=(cx-30)/(W-60)，与 AIFloatApply 的 c.x=30+px*(W-60) 对偶），实测 6 个落点往返一致到 0.6px 内。② [G54] tap 与 pan 挂在同一 view 上却没声明优先级——iOS 默认 pan 一旦开始就取消 tap，而 pan 识别阈值仅约 10pt，轻点时的微小位移会被 pan 抢走，于是「拖过一次之后点球没反应」。修法：显式 [pan requireGestureRecognizerToFail:tap]（v48 已被 G55 取代），并限制 minimum/maximumNumberOfTouches=1。③ 附带：拖动期间置 gFloatLast=now 抑制心跳自愈把窗口按旧值拽回；拖动结束强制 AIFloatApply 一次，消除「存的是新值、显示是旧值」的漂移窗口。   // v47 = v46 + 悬浮球拖动交互两处修复（会话主 · 用户报障「拖球有偏差 + 拖完再点没反应」）：① [G53] ballDragged 坐标系混算——原代码拖的是 gFloatWindow 内的 ball 子视图，ball.center 是**窗口内**坐标（收起态恒为 30,30），却在同一行里用**屏幕**尺寸 sc.width/sc.height 做 clamp，两套坐标混算 → 球被推到 60×60 窗口之外，表现为「手指拖了球却偏移/跑飞/看着没动」。修法：直接拖**窗口本身**（窗口原点即屏幕坐标，与 sc 同系），球作为窗口内固定子视图跟随；同时把 fpx/fpy 的存储与还原公式改为严格互逆（px=(cx-30)/(W-60)，与 AIFloatApply 的 c.x=30+px*(W-60) 对偶），实测 6 个落点往返一致到 0.6px 内。② [G54] tap 与 pan 挂在同一 view 上却没声明优先级——iOS 默认 pan 一旦开始就取消 tap，而 pan 识别阈值仅约 10pt，轻点时的微小位移会被 pan 抢走，于是「拖过一次之后点球没反应」。修法：显式 [pan requireGestureRecognizerToFail:tap]，并限制 minimum/maximumNumberOfTouches=1。③ 附带：拖动期间置 gFloatLast=now 抑制心跳自愈把窗口按旧值拽回；拖动结束强制 AIFloatApply 一次，消除「存的是新值、显示是旧值」的漂移窗口。v46 = v45 + 最后一批「抄错 token」修正（会话主 · 用 prototype-html 技能把 v45 做成可交互原型并与 v8 原型逐项对照时又抓出的 3 处）：① .p-hd h3 字号 13→**14**（原型写 var(--fz-3)，而 --fz-3=14px，--fz-2 才是 13 —— 我上一版注释里抄错了 token 名，属于 G47「以为差不多」的具体形态）；② L3 面板按钮 .pbtn 14→**13**（原型 var(--fz-2)=13px，上一版我以「安全入口可读性」为由主动放大到 14，但既然原型就给了 13 且 44pt 高度已满足触摸下限，应忠于原型）；③ .g-meta 透明度 .72→**.85**（原型 .g-meta{opacity:.85}）。—— 结论：**UI 落地只要还有一处「我按感觉给的」，就还能再抓出差异**；本轮把 v8 的每一条 CSS 声明都映射到了源码常量。v45 = v44 + 原型头部/回顾卡精修（会话主 · 最后一批回选择器原文核对）：① L3 面板头部补「3/7」步数（原型 .p-hd .stepno{11px;--txt-2}）——原型的头部是「形状 标题 步数 ✕」四段，上一版把步数塞到第二行副标题，把「一眼看到第几步」降级成「读一行小字」；② 面板关闭按钮「收起」文字 44×26 → 原型 .p-close 的 **✕ 图标 30×30 圆角8 描边 --line**（文字按钮占宽且与暂停/结束语义混淆，✕ 才是通用关闭语汇）；③ 回顾卡标题 h4 14→**16px**；④ 回顾卡三数字 .nums b 13→**14px**。v44 = v43 + 原型剩余 4 处结构补齐（会话主 · 继续回选择器原文核对，把「原型有、真机没有」的全部补上）：① L3 面板「本轮回顾」行（原型 .recap）—— v42 漏做；回顾卡是任务结束的**一次性**强提示，点掉即失，这行是面板里**随时可查**的常驻战绩摘要（N/M 成功 · 结论），缺了它错过弹卡就再也看不到本轮结果；底部预留 152→174 腾位，实测各分区 62..206 / 206..222 / 234..262 / 268..300 / 326..370 无重叠；② L2 罩层标题（原型 .g-title）—— 上一版是「彩色形状+彩色大字 22px」挤一个 label，原型是**8px 脉动圆点 + 纯白 16px 稳字**（gap 7，圆点 1.4s 呼吸、文字不动）；③ 罩层副标题 15px 白 → 13px/alpha.88（原型 .g-brief --txt-2=rgba(255,255,255,.88)）；④ 罩层三按钮（原型 .gbtn）52→46 高、12→10 圆角、14→13 字号，「结束」改用 .gbtn.stop 红色语义（红边 .7 + 红底 .16 + 浅红字）——破坏性动作必须与另两个可区分，是安全设计不是装饰。v43 = v42 + 原型数值/结构精修（会话主 · 对照原型选择器原文逐项核对，共 7 处）：① .step .sy 形状字号 13→**12**（上一版误取 .p-hd .sy 的 15px，改回 .step 继承值 --fz-1=12；同一 class 名在不同作用域取值不同，必须回选择器原文核）、列宽 14→**12**（原型 .step .sy{width:12px}）；② 动作文字 X 33→**31**（.step padding-left 12 + .sy 宽 12 + .l1 gap 7）；③ 步骤行高 48→**51**（有证据行重算：7+18.6+2+15.5+7+0.5，无证据行仍 34）；④ .ev 证据行缩进 33→**31**（.step padding-left 12 + .ev padding-left 19），颜色 .72→**.88**（原型 .ev 用 --txt-2=rgba(255,255,255,.88)）；⑤ L1 球内部拆两元素：原来形状+词塞进一个 11px 双行 label → 形状独立 **19px**（原型 .ball .shape{font-size:19px}）+ 词独立 **9px**、色 .88（原型 .ball .word{font-size:9px;max-width:52px}），脉动动画改挂形状层（原型 .shape.pulse）；⑥ L3 面板头部拆两元素：原来形状+任务名同 label 同色 14px → 形状独立 **15px** 状态色（原型 .p-hd .sy{font-size:15px}）+ 标题恒白 **13px**（原型 .p-hd h3{font-size:13px}，不随状态着色），间距 8（.p-hd gap:8px）；⑦ 版本号自证。v42 = v41 + UI 结构实现（会话主 · 补齐原型 v8 缺失的结构，共 12 处）。v41 只做了 5 处数值微调（颜色/alpha/形状/宽高），用户对比原型后指出「真机还是老界面，只有悬浮球变了」——因为 v41 没新增任何结构，而原型最核心的两块结构真机上根本不存在。本版补齐：① L3 步骤列表：一整块 9px Menlo 灰字 UITextView → UIScrollView + 逐行 AIStepRowView（图标 14 + 动作 12px #e9eef3 + 目标 + Menlo 10px 证据 + 0.5px 分隔线，按状态着色；行高 有证据 48/无 34）；② 结束回顾卡（规划 §8.1 收尾闭环）：原来只有一行 ▶ 拼在文本末尾 → 罩层中央 246×214 大卡（✓/■ + 任务完成·原因 + 用时·动作·失败 三数字 + 知道了 44pt）；③ L2 罩层进度条：「共 N 步 · 当前第 M 步」+ 196×6 进度条（填充 idx/total，与状态同色）；④ L1 球动效：脉动（exec/wait 1.8s 呼吸）+ done 徽标脉冲 + 吸边半隐（edge 开关，alpha .55 右移 18）；⑤ 减少动效：跟随 UIAccessibilityIsReduceMotionEnabled + reduce 开关强制；⑥ L3 副标题加「成功 ✓N」计数；⑦ L3 新增「⧉ 复制步骤全文」按钮（行视图后文字不可选，需显式出口）；⑧ 回顾卡状态机：gRecapShown/gRecapDismissed 双闸。⑨ 结构可观测化（这一条是被否掉的 v41 最该有的东西）：ui{} 新增 panel.steps.n（步骤行数）/ panel.okcnt（成功步数）/ guard.recap（回顾卡在不在）/ guard.recaptext / guard.pct（进度条百分比）/ float.edge / float.reduce —— v41 的 ui{} 里一个结构字段都没有，脚本想测「步骤列表有没有每步一行」也无从下手，只能退化成测 dot 颜色，于是「15/15 全绿但用户不认」；⑩ 新增命令 recapknow（等价点「知道了」）/ copysteps（复制全文，回传剪贴板长度）/ flag（读写 edge·reduce 等开关），让上述结构量全部可被脚本远程断言。—— 关键坑：AIGuardShouldShow 加 gRecapShown（任务收尾 gBusy 归零，否则罩在同帧落下，卡无容器）；task op 里显式 AIGuardRender（AIGuardSync 在罩已显示时不重绘，卡状态变了屏上还是旧的）；AITaskSet 清空分支仅在 gRecapDismissed 时清 gTaskResult（否则云端补发的 task{0,0} 会把刚弹的卡提前干掉）。v41 = v40 + UI 落地（会话主 · 原型 v8 → 真机源码，共 5 处）：① 失败形状 ✕→■（与原型 v4/v8 对齐，规划 §2 与 §9.2 自相矛盾取 ■；形状是语义载体，原型与源码不一致落地必错）；② L1 悬浮球可辨识性：黑 0.62 半透明无描边 → 不透明 #14161a + 2px 亮描边 rgba(255,255,255,.92)，双对比元素取最大值（原型实测 深色宿主旧值仅 1.13:1 近乎隐形，新值 深色 16.29/浅白 6.74/中性灰 12.48/高饱和 14.62 全 ≥3）；③ L1 球词优先读 task.brief（原实现忽略 brief，球上只有干巴巴的 3/7）；④ L2 罩层暗化 0.55→0.65（0.55 在浅色宿主上次级文字仅 3.33:1 不达 WCAG，0.65 是四种宿主全达标的最小可用值 6.57~15.64）；⑤ L3 面板暂停/结束按钮 32→44 高 + 面板 360→380（原注释写着「≥44pt 原则」实际只做 32，而这是唯一能叫停 AI 的安全入口）。v40 = v39 + G30 根治（G30：回执通道单边瘫死——飞行模式令域名 poll 连败 4 次后 gActiveBase 切 IP 兜底，轮询带 AITrustDelegate 活着，回执/心跳 POST（AIReportDict）却没带 → IP 直连证书 CN 不匹配 → -1202「证书无效」一切回执单边全灭；看门狗只看轮询 tick（命令还在执行）永不换代，IP 态又无自动回切路径 → 死锁到杀 App。修法：回执与轮询同待遇，IP 态同样 trustAny+Host 覆盖）。v39 = v38 + G28 看门狗三件套（会话B 合流）：① hang 阈值 45→150s（text/tree 全量 25~90s，45s 对慢命令必然误判换代）；② rst 每 60s 冷却回收 1（原 rst=8 永久放弃换代，13:12 事故通道瘫死实锤）；③ 积压 >3 只执行最后 1 条（换代后新代拉积压慢命令循环换代是耗尽主因）；④ 换代即落盘日志（取证）。v38 = v37 + 屏幕识字（会话A）：op=ocr 读整屏文字 / op=vfind 按文字找并点，参数 accurate + zh-Hans,en-US + correction=NO、坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程，.ips 实锤 AITaskDict 竞态 → SIGSEGV）
+static NSString * const kAIVer = @"v50";   // v50 = v48 + 去掉 v49 的网络监听层（会话主 · 用户拍板「不用管 49 了，下个版本把它去掉」）。
+//   ---------------------------------------------------------------------------
+//   v49（路线一 · 通用网络监听）的结论留痕 —— 写在版本号旁边，避免后人再走一遍：
+//
+//   【做了什么】用 NSURLProtocol 注册式 hook 旁路记录 App 的 HTTP 往返，
+//     想让 AI 直接读接口 JSON 而不是靠 OCR 猜数字。三道闸隔离做得很干净
+//     （中继 host 在 canInitWithRequest: 就 return NO、总开关默认关且限时、
+//      propertyForKey: 防递归），真机实测中继全程稳定、零误抓。
+//
+//   【为什么撤掉】2026-09-30 真机实测判定 —— **快手不走 NSURLSession**。
+//     证据（[FACT]，同一 300s 监听窗口内）：
+//       · 监听层确实工作：抓到 https://www.apple.com/library/test/success.html
+//         -> 200 84ms 69 text（与 diag 的「①苹果 ✅ 200」互证，cnt 精确 =1）
+//       · 快手确实有网络活动：滑 8 条视频后 feed 内容变化、luma 37→137
+//       · 同一窗口内快手零记录：cnt 恒为 1（就是苹果那条）
+//     机理：快手这类大厂用自研 HTTP 客户端（基于 CFNetwork/自封装 socket+TLS），
+//     绕过 NSURLSession —— 而 NSURLProtocol 只对 NSURLSession 生效。
+//     业界做 App 网络观测之所以普遍用抓包（VPN/代理）而非 NSURLProtocol，就是这个原因。
+//
+//   【适用边界】NSURLProtocol 这条路对「仍用 NSURLSession 的 App」有效，
+//     但对快手无效；想覆盖快手需 hook 更底层的 CFNetwork（NSURLConnection/
+//     CFURLConnection，C API，难度高一档），或走抓包（需用户装描述文件，
+//     违背本项目「注入即用、不要用户电脑」的第一性目标）。
+//
+//   【反例/边界】本结论限于「快手极速版 com.kwai.nebula，2026-09-30 观测」；
+//     不代表所有 App 都不走 NSURLSession。
+//   ---------------------------------------------------------------------------
+// v48 = v47 + G55 拖动起步阈值修复（会话主 · 用户报障「v47 拖球没偏了，但按住中心点要拖到边缘球才动」）：v47 用 [pan requireGestureRecognizerToFail:tap] 区分点击/拖动，但 tap 的失败判定要求手指位移超过其自身容差（约 10pt），于是 pan 必须等手指走够这段才 recognize —— 用户按住球心（半径 28pt 的球）往外拖，要拖到接近球边缘才开始跟手，手感就是「拖不动 / 只有边上能动」。修法：① 去掉 requireGestureRecognizerToFail，tap/pan 由 AIFloatTarget 作为 delegate 允许并存识别（shouldRecognizeSimultaneously 返回 YES）；② 在 ballDragged: 内按**累计位移**自行分流：translation 每次被清零，故用 gFloatDragAcc 自攒，<6pt 不动（判定权留给 tap，保证轻点能展开），≥6pt 才真正拖窗口，并主动把 tap 置失败（enabled 翻转一次强制重置）避免拖完抬指又触发一次展开/收起；③ 加 gFloatDragOn 状态标记本次触摸是否已进入拖动，拖动确认时把 tap 的 enabled 翻转一次强制其失败（比 gestureRecognizerShouldBegin 可靠 —— 后者对 tap 的判定发生在触摸落下时，那时还没有位移信息，判不出拖动）。v47 = v46 + 悬浮球拖动交互两处修复（会话主 · 用户报障「拖球有偏差 + 拖完再点没反应」）：① [G53] ballDragged 坐标系混算——原代码拖的是 gFloatWindow 内的 ball 子视图，ball.center 是**窗口内**坐标（收起态恒为 30,30），却在同一行里用**屏幕**尺寸 sc.width/sc.height 做 clamp，两套坐标混算 → 球被推到 60×60 窗口之外，表现为「手指拖了球却偏移/跑飞/看着没动」。修法：直接拖**窗口本身**（窗口原点即屏幕坐标，与 sc 同系），球作为窗口内固定子视图跟随；同时把 fpx/fpy 的存储与还原公式改为严格互逆（px=(cx-30)/(W-60)，与 AIFloatApply 的 c.x=30+px*(W-60) 对偶），实测 6 个落点往返一致到 0.6px 内。② [G54] tap 与 pan 挂在同一 view 上却没声明优先级——iOS 默认 pan 一旦开始就取消 tap，而 pan 识别阈值仅约 10pt，轻点时的微小位移会被 pan 抢走，于是「拖过一次之后点球没反应」。修法：显式 [pan requireGestureRecognizerToFail:tap]（v48 已被 G55 取代），并限制 minimum/maximumNumberOfTouches=1。③ 附带：拖动期间置 gFloatLast=now 抑制心跳自愈把窗口按旧值拽回；拖动结束强制 AIFloatApply 一次，消除「存的是新值、显示是旧值」的漂移窗口。   // v47 = v46 + 悬浮球拖动交互两处修复（会话主 · 用户报障「拖球有偏差 + 拖完再点没反应」）：① [G53] ballDragged 坐标系混算——原代码拖的是 gFloatWindow 内的 ball 子视图，ball.center 是**窗口内**坐标（收起态恒为 30,30），却在同一行里用**屏幕**尺寸 sc.width/sc.height 做 clamp，两套坐标混算 → 球被推到 60×60 窗口之外，表现为「手指拖了球却偏移/跑飞/看着没动」。修法：直接拖**窗口本身**（窗口原点即屏幕坐标，与 sc 同系），球作为窗口内固定子视图跟随；同时把 fpx/fpy 的存储与还原公式改为严格互逆（px=(cx-30)/(W-60)，与 AIFloatApply 的 c.x=30+px*(W-60) 对偶），实测 6 个落点往返一致到 0.6px 内。② [G54] tap 与 pan 挂在同一 view 上却没声明优先级——iOS 默认 pan 一旦开始就取消 tap，而 pan 识别阈值仅约 10pt，轻点时的微小位移会被 pan 抢走，于是「拖过一次之后点球没反应」。修法：显式 [pan requireGestureRecognizerToFail:tap]，并限制 minimum/maximumNumberOfTouches=1。③ 附带：拖动期间置 gFloatLast=now 抑制心跳自愈把窗口按旧值拽回；拖动结束强制 AIFloatApply 一次，消除「存的是新值、显示是旧值」的漂移窗口。v46 = v45 + 最后一批「抄错 token」修正（会话主 · 用 prototype-html 技能把 v45 做成可交互原型并与 v8 原型逐项对照时又抓出的 3 处）：① .p-hd h3 字号 13→**14**（原型写 var(--fz-3)，而 --fz-3=14px，--fz-2 才是 13 —— 我上一版注释里抄错了 token 名，属于 G47「以为差不多」的具体形态）；② L3 面板按钮 .pbtn 14→**13**（原型 var(--fz-2)=13px，上一版我以「安全入口可读性」为由主动放大到 14，但既然原型就给了 13 且 44pt 高度已满足触摸下限，应忠于原型）；③ .g-meta 透明度 .72→**.85**（原型 .g-meta{opacity:.85}）。—— 结论：**UI 落地只要还有一处「我按感觉给的」，就还能再抓出差异**；本轮把 v8 的每一条 CSS 声明都映射到了源码常量。v45 = v44 + 原型头部/回顾卡精修（会话主 · 最后一批回选择器原文核对）：① L3 面板头部补「3/7」步数（原型 .p-hd .stepno{11px;--txt-2}）——原型的头部是「形状 标题 步数 ✕」四段，上一版把步数塞到第二行副标题，把「一眼看到第几步」降级成「读一行小字」；② 面板关闭按钮「收起」文字 44×26 → 原型 .p-close 的 **✕ 图标 30×30 圆角8 描边 --line**（文字按钮占宽且与暂停/结束语义混淆，✕ 才是通用关闭语汇）；③ 回顾卡标题 h4 14→**16px**；④ 回顾卡三数字 .nums b 13→**14px**。v44 = v43 + 原型剩余 4 处结构补齐（会话主 · 继续回选择器原文核对，把「原型有、真机没有」的全部补上）：① L3 面板「本轮回顾」行（原型 .recap）—— v42 漏做；回顾卡是任务结束的**一次性**强提示，点掉即失，这行是面板里**随时可查**的常驻战绩摘要（N/M 成功 · 结论），缺了它错过弹卡就再也看不到本轮结果；底部预留 152→174 腾位，实测各分区 62..206 / 206..222 / 234..262 / 268..300 / 326..370 无重叠；② L2 罩层标题（原型 .g-title）—— 上一版是「彩色形状+彩色大字 22px」挤一个 label，原型是**8px 脉动圆点 + 纯白 16px 稳字**（gap 7，圆点 1.4s 呼吸、文字不动）；③ 罩层副标题 15px 白 → 13px/alpha.88（原型 .g-brief --txt-2=rgba(255,255,255,.88)）；④ 罩层三按钮（原型 .gbtn）52→46 高、12→10 圆角、14→13 字号，「结束」改用 .gbtn.stop 红色语义（红边 .7 + 红底 .16 + 浅红字）——破坏性动作必须与另两个可区分，是安全设计不是装饰。v43 = v42 + 原型数值/结构精修（会话主 · 对照原型选择器原文逐项核对，共 7 处）：① .step .sy 形状字号 13→**12**（上一版误取 .p-hd .sy 的 15px，改回 .step 继承值 --fz-1=12；同一 class 名在不同作用域取值不同，必须回选择器原文核）、列宽 14→**12**（原型 .step .sy{width:12px}）；② 动作文字 X 33→**31**（.step padding-left 12 + .sy 宽 12 + .l1 gap 7）；③ 步骤行高 48→**51**（有证据行重算：7+18.6+2+15.5+7+0.5，无证据行仍 34）；④ .ev 证据行缩进 33→**31**（.step padding-left 12 + .ev padding-left 19），颜色 .72→**.88**（原型 .ev 用 --txt-2=rgba(255,255,255,.88)）；⑤ L1 球内部拆两元素：原来形状+词塞进一个 11px 双行 label → 形状独立 **19px**（原型 .ball .shape{font-size:19px}）+ 词独立 **9px**、色 .88（原型 .ball .word{font-size:9px;max-width:52px}），脉动动画改挂形状层（原型 .shape.pulse）；⑥ L3 面板头部拆两元素：原来形状+任务名同 label 同色 14px → 形状独立 **15px** 状态色（原型 .p-hd .sy{font-size:15px}）+ 标题恒白 **13px**（原型 .p-hd h3{font-size:13px}，不随状态着色），间距 8（.p-hd gap:8px）；⑦ 版本号自证。v42 = v41 + UI 结构实现（会话主 · 补齐原型 v8 缺失的结构，共 12 处）。v41 只做了 5 处数值微调（颜色/alpha/形状/宽高），用户对比原型后指出「真机还是老界面，只有悬浮球变了」——因为 v41 没新增任何结构，而原型最核心的两块结构真机上根本不存在。本版补齐：① L3 步骤列表：一整块 9px Menlo 灰字 UITextView → UIScrollView + 逐行 AIStepRowView（图标 14 + 动作 12px #e9eef3 + 目标 + Menlo 10px 证据 + 0.5px 分隔线，按状态着色；行高 有证据 48/无 34）；② 结束回顾卡（规划 §8.1 收尾闭环）：原来只有一行 ▶ 拼在文本末尾 → 罩层中央 246×214 大卡（✓/■ + 任务完成·原因 + 用时·动作·失败 三数字 + 知道了 44pt）；③ L2 罩层进度条：「共 N 步 · 当前第 M 步」+ 196×6 进度条（填充 idx/total，与状态同色）；④ L1 球动效：脉动（exec/wait 1.8s 呼吸）+ done 徽标脉冲 + 吸边半隐（edge 开关，alpha .55 右移 18）；⑤ 减少动效：跟随 UIAccessibilityIsReduceMotionEnabled + reduce 开关强制；⑥ L3 副标题加「成功 ✓N」计数；⑦ L3 新增「⧉ 复制步骤全文」按钮（行视图后文字不可选，需显式出口）；⑧ 回顾卡状态机：gRecapShown/gRecapDismissed 双闸。⑨ 结构可观测化（这一条是被否掉的 v41 最该有的东西）：ui{} 新增 panel.steps.n（步骤行数）/ panel.okcnt（成功步数）/ guard.recap（回顾卡在不在）/ guard.recaptext / guard.pct（进度条百分比）/ float.edge / float.reduce —— v41 的 ui{} 里一个结构字段都没有，脚本想测「步骤列表有没有每步一行」也无从下手，只能退化成测 dot 颜色，于是「15/15 全绿但用户不认」；⑩ 新增命令 recapknow（等价点「知道了」）/ copysteps（复制全文，回传剪贴板长度）/ flag（读写 edge·reduce 等开关），让上述结构量全部可被脚本远程断言。—— 关键坑：AIGuardShouldShow 加 gRecapShown（任务收尾 gBusy 归零，否则罩在同帧落下，卡无容器）；task op 里显式 AIGuardRender（AIGuardSync 在罩已显示时不重绘，卡状态变了屏上还是旧的）；AITaskSet 清空分支仅在 gRecapDismissed 时清 gTaskResult（否则云端补发的 task{0,0} 会把刚弹的卡提前干掉）。v41 = v40 + UI 落地（会话主 · 原型 v8 → 真机源码，共 5 处）：① 失败形状 ✕→■（与原型 v4/v8 对齐，规划 §2 与 §9.2 自相矛盾取 ■；形状是语义载体，原型与源码不一致落地必错）；② L1 悬浮球可辨识性：黑 0.62 半透明无描边 → 不透明 #14161a + 2px 亮描边 rgba(255,255,255,.92)，双对比元素取最大值（原型实测 深色宿主旧值仅 1.13:1 近乎隐形，新值 深色 16.29/浅白 6.74/中性灰 12.48/高饱和 14.62 全 ≥3）；③ L1 球词优先读 task.brief（原实现忽略 brief，球上只有干巴巴的 3/7）；④ L2 罩层暗化 0.55→0.65（0.55 在浅色宿主上次级文字仅 3.33:1 不达 WCAG，0.65 是四种宿主全达标的最小可用值 6.57~15.64）；⑤ L3 面板暂停/结束按钮 32→44 高 + 面板 360→380（原注释写着「≥44pt 原则」实际只做 32，而这是唯一能叫停 AI 的安全入口）。v40 = v39 + G30 根治（G30：回执通道单边瘫死——飞行模式令域名 poll 连败 4 次后 gActiveBase 切 IP 兜底，轮询带 AITrustDelegate 活着，回执/心跳 POST（AIReportDict）却没带 → IP 直连证书 CN 不匹配 → -1202「证书无效」一切回执单边全灭；看门狗只看轮询 tick（命令还在执行）永不换代，IP 态又无自动回切路径 → 死锁到杀 App。修法：回执与轮询同待遇，IP 态同样 trustAny+Host 覆盖）。v39 = v38 + G28 看门狗三件套（会话B 合流）：① hang 阈值 45→150s（text/tree 全量 25~90s，45s 对慢命令必然误判换代）；② rst 每 60s 冷却回收 1（原 rst=8 永久放弃换代，13:12 事故通道瘫死实锤）；③ 积压 >3 只执行最后 1 条（换代后新代拉积压慢命令循环换代是耗尽主因）；④ 换代即落盘日志（取证）。v38 = v37 + 屏幕识字（会话A）：op=ocr 读整屏文字 / op=vfind 按文字找并点，参数 accurate + zh-Hans,en-US + correction=NO、坐标 y=(1-y_vn-h)*H。v37 = v36 + G25 竞态修复（task/status 的 gTask* 读写统一挪主线程，.ips 实锤 AITaskDict 竞态 → SIGSEGV）
 static volatile int32_t gPollOK = 0, gPollErr = 0;
 static volatile int32_t gRepOK  = 0, gRepErr  = 0;
 static volatile int32_t gCmdGot = 0;
@@ -200,33 +227,6 @@ static BOOL AIFlag(NSString *k, BOOL def) {
 static void AISetFlag(NSString *k, BOOL b) {
     [[NSUserDefaults standardUserDefaults] setBool:b forKey:AIK(k)];
     [[NSUserDefaults standardUserDefaults] synchronize];
-}
-
-// ---------------------------------------------------------------------------
-// v49：路线一「通用网络监听」的全局状态 —— 放在文件最前，
-//   因为 AINetSniffer 的 canInitWithRequest: 是「进程里任意线程、任意时刻」都可能被
-//   系统回调的（App 每发一个请求都会问一遍），它必须能立刻读到这几个量。
-//   与 gLog 同套路：NSLock 保护，只存摘要、绝不全量落 body。
-// ---------------------------------------------------------------------------
-static NSString * const kAINetHost = @"aa0c466b5cdb559bb.app.workbuddy.host";  // 中继域名（必须避让）
-static NSString * const kAINetMark = @"ai2_net_mark";     // 防递归标记 key（NSURLProtocol 经典坑）
-static NSMutableArray *gNetRing  = nil;    // 环形缓冲：最多 200 条摘要字典，超出丢最旧
-static NSLock         *gNetLock  = nil;
-static volatile int32_t gNetOn    = 0;     // 总开关（volatile：任意线程读）
-static volatile int32_t gNetKilled = 0;    // v49 兜底：/var/mobile/agent_net_off 存在 → 永不注册
-static double          gNetUntil = 0;      // 限时到期（时间戳）；<=0 表示不限时
-static double          gNetT0    = 0;      // 开启时刻，用于算「+12.4s」这种相对时间
-static volatile int32_t gNetCnt  = 0;      // 累计记录条数（含已被环形缓冲挤掉的）
-
-// 中继地址一律避让：域名 + IP 直连兜底段 + 本机回环。
-// ★ 这个判断只认 host，不认端口 —— 中继可能换端口，宁可多避让也不能漏。
-static BOOL AINetIsRelayHost(NSString *host) {
-    if (!host.length) return NO;
-    if ([host isEqualToString:kAINetHost])     return YES;   // 域名
-    if ([host hasPrefix:@"49.233."])           return YES;   // IP 直连兜底（AIHttpEx trustAny 那条）
-    if ([host hasPrefix:@"127."])              return YES;   // 本机回环
-    if ([host isEqualToString:@"localhost"])   return YES;
-    return NO;
 }
 
 // 前向声明：sendEvent hook 里要在定义之前调用 AIBoot
@@ -3088,263 +3088,6 @@ static NSString *AIBase(void) {
 
 
 // ---------------------------------------------------------------------------
-// 12a. v49 · 路线一「通用网络监听」
-//
-//  目的：让云端 AI 能直接读到目标 App 接口返回的真实数据，而不是只靠 OCR
-//        从像素里猜数字；同时给「操作是否生效」提供第二条证据（请求真发出去了）。
-//
-//  为什么用 NSURLProtocol 而不是 swizzle：
-//    NSURLProtocol 是系统**设计给**第三方做协议扩展的正式接口，registerClass: 注册、
-//    unregisterClass: 撤销，全程**不替换任何已有方法**。swizzle __NSCFURLSessionTask
-//    这类私有类才是真正危险的（iOS 每次大版本可能改名 → 注入即崩）。
-//
-//  ★★ 本方案唯一的致命风险，以及为什么这样隔离 ★★
-//    NSURLProtocol 注册后，**进程内所有 NSURLSession / NSURLConnection 请求**都会先经过
-//    canInitWithRequest: —— 这**包含注入器自己的中继通信**（AIHttp / AIHttpErr /
-//    AIHttpEx / AIReportDict，即 /poll、/report 链路）。若我的实现里出现死锁、异常、
-//    提前 release、或者 startLoading 忘了转发，**中继会断 → 设备彻底失联 →
-//    用户只能重新注入才能恢复**。这是全方案唯一「一失手就要用户返工」的点。
-//
-//    隔离做法（三道闸，全部在 canInitWithRequest: 这一层就拦住，绝不拖到 startLoading）：
-//      闸① 中继 host 直接 return NO —— 中继请求**连进都不进我的代码**。
-//          为什么不能放 startLoading 里过滤：那时请求已经进了我的实现，
-//          实现有 bug 照样把中继搞死，等于没隔离。
-//      闸② gNetOn 默认 0 且限时（net.on 默认 120s 后自动过期）—— 暴露面可控。
-//      闸③ propertyForKey: 防递归标记 —— 我 startLoading 内部发起的真实请求
-//          会**再经一遍** canInitWithRequest:，不打标必然无限递归（NSURLProtocol 最经典的坑）。
-//    另加不依赖网络的兜底：/var/mobile/agent_net_off 文件存在 → 强制关闭且永不注册。
-//    这是「中继被拖死」时唯一不需要网络、不需要重装的救援通道。
-// ---------------------------------------------------------------------------
-
-// 「api 版好辨识」——用户明确要求。
-//   路径保留 **完整 URL（含 host）**：同一个 App 常有多个域名（快手就有 api. / log. /
-//   js. / txmov2. 等），只留 path 会把 api.kuaishou.com/v1/feed 和 log.kuaishou.com/v1/feed
-//   记成同一条，看不出是哪个接口。带 host 才能一眼认出「这是哪个服务的哪类接口」。
-//   同时对长数字段（≥6 位连续数字）折叠成 <n位>：设备号/时间戳/视频 id 这类长数字
-//   会把路径撑爆、也让同一接口每次看起来都不一样；折叠后同类接口聚成同一形状，好辨识。
-static NSString *AINetFoldDigits(NSString *s) {
-    if (!s.length) return @"";
-    NSMutableString *out = [NSMutableString string];
-    NSUInteger i = 0, n = s.length;
-    while (i < n) {
-        unichar c = [s characterAtIndex:i];
-        if (c >= '0' && c <= '9') {
-            NSUInteger j = i;
-            while (j < n) { unichar d = [s characterAtIndex:j]; if (d < '0' || d > '9') break; j++; }
-            NSUInteger run = j - i;
-            if (run >= 6) [out appendFormat:@"<%@位>", (unsigned long)run];
-            else          [out appendString:[s substringWithRange:NSMakeRange(i, run)]];
-            i = j;
-            continue;
-        }
-        [out appendFormat:@"%C", c];
-        i++;
-    }
-    return out;
-}
-
-// 敏感 query 参数脱敏：token / sign / 密码 / 会话 / 手机号 / 用户 id 这些值不能带回云端。
-//   只替换**参数值**，绝不动路径 —— 路径本身就是「这是什么接口」的关键信息。
-static NSString *AINetMaskQuery(NSString *q) {
-    if (!q.length) return @"";
-    static NSArray *kSens = nil;
-    if (!kSens) kSens = @[@"token", @"sign", @"signature", @"password", @"passwd", @"pwd",
-                          @"auth", @"sid", @"session", @"sessionid", @"phone", @"mobile",
-                          @"uid", @"userid", @"user_id", @"access_token", @"refresh_token",
-                          @"secret", @"key", @"ticket", @"cookie"];
-    NSMutableArray *parts = [NSMutableArray array];
-    for (NSString *kv in [q componentsSeparatedByString:@"&"]) {
-        NSRange eq = [kv rangeOfString:@"="];
-        if (eq.location == NSNotFound || eq.location == 0) { [parts addObject:kv]; continue; }
-        NSString *k = [kv substringToIndex:eq.location];
-        NSString *kl = [k lowercaseString];
-        BOOL hit = NO;
-        for (NSString *s in kSens) if ([kl isEqualToString:s] || [kl hasSuffix:[@"_" stringByAppendingString:s]]) { hit = YES; break; }
-        [parts addObject:hit ? [NSString stringWithFormat:@"%@=***", k] : kv];
-    }
-    return [parts componentsJoinedByString:@"&"];
-}
-
-// 把一次网络往返压成一行摘要字符串（net.tail 的 lines 元素，便于脚本直接 grep）。
-//   形如：+12.4s GET https://api.kuaishou.com/rest/v1/feed -> 200 340ms 12KB json
-static NSString *AINetLine(NSDictionary *d) {
-    NSString *ct = d[@"ct"] ?: @"-";
-    NSString *head = d[@"head"];
-    NSString *one = [NSString stringWithFormat:@"+%.1fs %@ %@ -> %@ %@ms %@ %@",
-                     [d[@"t"] doubleValue], d[@"m"] ?: @"?", d[@"u"] ?: @"?",
-                     d[@"s"] ?: @"0", d[@"ms"] ?: @0, d[@"len"] ?: @0, ct];
-    if ([head length]) {
-        NSString *h = [head stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
-        one = [one stringByAppendingFormat:@" %@", h];
-    }
-    return one;
-}
-
-static void AINetRecord(NSString *method, NSString *url, NSInteger status,
-                        double ms, NSUInteger len, NSString *ctype, NSData *body) {
-    if (!gNetOn || gNetKilled) return;
-    if (gNetUntil > 0 && [[NSDate date] timeIntervalSince1970] > gNetUntil) {
-        gNetOn = 0;                 // 限时到期，自动收手（不在这里 unregister，交给 net.off/下次 net.on）
-        return;
-    }
-    @try {
-        // 路径：完整 URL（含 host），折叠长数字
-        NSString *u = AINetFoldDigits(url ?: @"");
-        if (u.length > 200) u = [[u substringToIndex:200] stringByAppendingString:@"…"];
-
-        // Content-Type 归一
-        NSString *ct = @"other";
-        NSString *cl = [(ctype ?: @"") lowercaseString];
-        if ([cl containsString:@"json"])                     ct = @"json";
-        else if ([cl containsString:@"image"])               ct = @"img";
-        else if ([cl containsString:@"text"] || [cl containsString:@"html"]) ct = @"text";
-
-        NSMutableDictionary *e = [NSMutableDictionary dictionary];
-        e[@"t"]    = @(gNetT0 > 0 ? [[NSDate date] timeIntervalSince1970] - gNetT0 : 0);
-        e[@"m"]    = method.length ? method : @"GET";
-        e[@"u"]    = u;
-        e[@"s"]    = @(status);
-        e[@"ms"]   = @((NSInteger)(ms * 1000.0 + 0.5));
-        e[@"len"]  = @(len);
-        e[@"ct"]   = ct;
-        // 只有 json 留前 300 字符 —— 这是唯一会把 App 数据带回云端的地方，
-        // 但也是「能读到字段名」的关键（否则这个能力价值大打折扣）。已做 query 脱敏。
-        if ([ct isEqualToString:@"json"] && body.length) {
-            NSString *s = [[NSString alloc] initWithData:[body subdataWithRange:
-                            NSMakeRange(0, MIN((NSUInteger)400, body.length))]
-                                                encoding:NSUTF8StringEncoding];
-            if (s.length) e[@"head"] = s.length > 300 ? [s substringToIndex:300] : s;
-        }
-
-        if (!gNetLock) gNetLock = [NSLock new];
-        [gNetLock lock];
-        if (!gNetRing) gNetRing = [NSMutableArray new];
-        [gNetRing addObject:e];
-        while (gNetRing.count > 200) [gNetRing removeObjectAtIndex:0];   // 环形：丢最旧
-        [gNetLock unlock];
-        gNetCnt++;
-    } @catch (id e) {}
-}
-
-@interface AINetSniffer : NSURLProtocol
-@end
-
-@implementation AINetSniffer
-
-// ★ 闸在这里。整个方案的风险隔离全部集中在这个方法。
-+ (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    @try {
-        if (!gNetOn || gNetKilled) return NO;                       // 闸②：默认关 / 文件兜底关
-        NSURL *u = request.URL;
-        if (!u) return NO;
-        NSString *sch = [u.scheme lowercaseString];
-        if (![sch isEqualToString:@"http"] && ![sch isEqualToString:@"https"]) return NO;
-        // 闸③：防递归 —— 我 startLoading 内部发起的真实请求会再经这里，必须放行
-        if ([NSURLProtocol propertyForKey:kAINetMark inRequest:request]) return NO;
-        // 闸①：中继一律避让（中继请求连进都不进我的代码）
-        if (AINetIsRelayHost(u.host)) return NO;
-        return YES;
-    } @catch (id e) { return NO; }   // 出任何意外一律「不接管」—— 宁可漏记，不可断网
-}
-
-+ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
-
-// 默认按 URL 缓存：这里必须返回 NO —— 否则同 URL 的第二次请求会被系统缓存掉，
-//   看不到真实的第二次往返（我们要观测的是「App 真实发了什么」，不能被缓存改写）。
-+ (BOOL)requestIsCacheEquivalent:(NSURLRequest *)a toRequest:(NSURLRequest *)b { return NO; }
-
-- (void)startLoading {
-    // 防递归：给自己发出去的真实请求打标
-    NSMutableURLRequest *rq = [self.request mutableCopy];
-    [NSURLProtocol setProperty:@YES forKey:kAINetMark inRequest:rq];
-    NSDate *t0 = [NSDate date];
-    __weak AINetSniffer *weakSelf = self;
-
-    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    // 中转 session 不做任何缓存，保证观测到的是真实网络行为
-    cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
-    NSURLSession *s = [NSURLSession sessionWithConfiguration:cfg
-                                                   delegate:nil
-                                              delegateQueue:nil];
-    NSURLSessionDataTask *t = [s dataTaskWithRequest:rq completionHandler:
-        ^(NSData *data, NSURLResponse *resp, NSError *err) {
-            AINetSniffer *me = weakSelf;
-            if (!me) return;
-            double ms = [[NSDate date] timeIntervalSinceDate:t0];
-
-            if (err) {
-                // 网络失败也记一笔（看得到 App 在重试什么），并把错误原样交还
-                AINetRecord(me.request.HTTPMethod, me.request.URL.absoluteString,
-                            0, ms, 0, nil, nil);
-                [me.client URLProtocol:me didFailWithError:err];
-                return;
-            }
-
-            NSInteger code = 0;
-            NSString *ct = nil;
-            if ([resp isKindOfClass:[NSHTTPURLResponse class]]) {
-                NSHTTPURLResponse *hr = (NSHTTPURLResponse *)resp;
-                code = hr.statusCode;
-                ct = hr.allHeaderFields[@"Content-Type"];
-            }
-            // 带 host 的完整 URL（用户要求「api 版好辨识」）
-            AINetRecord(me.request.HTTPMethod, me.request.URL.absoluteString,
-                        code, ms, data.length, ct, data);
-
-            // 原样回填：响应头 + 响应体，一个字节都不改
-            [me.client URLProtocol:me didReceiveResponse:resp
-                cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-            if (data.length) [me.client URLProtocol:me didLoadData:data];
-            [me.client URLProtocolDidFinishLoading:me];
-            @try { [s finishTasksAndInvalidate]; } @catch (id e) {}
-        }];
-    [t resume];
-}
-
-- (void)stopLoading {
-    // 系统要求 stopLoading 能被打断 —— 这里我们的 task 由 session 自己收尾，
-    // 不持有强引用也不主动 cancel（cancel 会让 completion 回一个 NSURLErrorCancelled
-    // 被误记成「App 请求失败」）。s 会在 completion 里 finishTasksAndInvalidate。
-}
-@end
-
-// 注册/撤销：幂等且必须先做「文件兜底」检查。
-static BOOL gNetRegistered = NO;
-static void AINetRegister(BOOL on) {
-    // v49 兜底：/var/mobile/agent_net_off 存在 → 永不注册（中继被拖死时的救援通道，不依赖任何网络）
-    if (on) {
-        @try {
-            if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/agent_net_off"]) {
-                gNetKilled = 1;
-                AILog(@"  🛑 发现 /var/mobile/agent_net_off，网络监听强制禁用（不注册）");
-                return;
-            }
-        } @catch (id e) {}
-    }
-    @try {
-        if (on && !gNetRegistered) {
-            [NSURLProtocol registerClass:[AINetSniffer class]];
-            gNetRegistered = YES;
-            AILog(@"  🛰 网络监听已注册（NSURLProtocol/注册式，中继 host 已避让）");
-        } else if (!on && gNetRegistered) {
-            [NSURLProtocol unregisterClass:[AINetSniffer class]];
-            gNetRegistered = NO;
-            AILog(@"  🛰 网络监听已撤销");
-        }
-    } @catch (id e) { AILog(@"  ⚠️ 网络监听注册异常 %@", e); }
-}
-
-// 开机时无条件撤销一次：防止「上一版本留下注册、这一版本以新逻辑接管」这种跨版本脏状态。
-static void AINetReset(void) {
-    @try {
-        [NSURLProtocol unregisterClass:[AINetSniffer class]];
-    } @catch (id e) {}
-    gNetRegistered = NO;
-    gNetOn = 0;
-    gNetUntil = 0;
-}
-
-// ---------------------------------------------------------------------------
 // 12b. 内置 HTTP 控制服务
 //
 //  为什么不再是「反向轮询外部服务器」：那需要额外部署一台中继，且手机必须能出网。
@@ -4268,78 +4011,6 @@ static void AIExecCmd(NSDictionary *cmd) {
         }
         AIReportDict(@{@"op": @"flag", @"ok": @YES, @"k": k,
                        @"v": @(AIFlag(k, NO) ? 1 : 0)});
-    } else if ([op isEqualToString:@"net.on"]) {       // v49：开网络监听（默认限时 120s）
-        int sec = cmd[@"sec"] ? [cmd[@"sec"] intValue] : 120;
-        if (sec < 0) sec = 0;                          // 0 = 不限时（手动 net.off 才关）
-        AINetRegister(YES);
-        // 先清缓冲再置开关，避免把上一轮的残留混进来
-        [gNetLock lock];
-        if (!gNetRing) gNetRing = [NSMutableArray new];
-        [gNetRing removeAllObjects];
-        [gNetLock unlock];
-        gNetCnt  = 0;
-        gNetT0   = [[NSDate date] timeIntervalSince1970];
-        gNetUntil = (sec > 0) ? (gNetT0 + sec) : 0;
-        gNetOn   = gNetKilled ? 0 : 1;
-        AILog(@"  [cmd] net.on sec=%d killed=%d", sec, gNetKilled);
-        // ★★ 临时自测（v49-selftest）：net.on 时主动打一个**已知会走 NSURLSession**的请求，
-        //    用来看「我的 protocol 层到底会不会被系统调用」。苹果官网不在中继避让名单里。
-        //    验证完删除，不并入正式版。
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            @autoreleasepool {
-                [NSThread sleepForTimeInterval:2.0];
-                NSData *d = nil; NSError *e2 = nil; NSInteger c2 = 0; NSTimeInterval m2 = 0;
-                BOOL o = AIHttpEx(@"https://www.apple.com/library/test/success.html", nil, 12.0,
-                                  NO, nil, &d, &e2, &c2, &m2);
-                AILog(@"  [selftest] 苹果官网 ok=%d code=%ld bytes=%lu 抓到的 net.cnt=%d",
-                      o, (long)c2, (unsigned long)d.length, gNetCnt);
-            }
-        });
-        AIReportDict(@{@"op": @"net.on", @"ok": @(gNetOn ? YES : NO),
-                       @"on": @(gNetOn), @"sec": @(sec), @"reg": @(gNetRegistered),
-                       @"killed": @(gNetKilled),
-                       @"err": gNetKilled ? @"/var/mobile/agent_net_off 存在，网络监听被强制禁用" : @""});
-    } else if ([op isEqualToString:@"net.off"]) {      // v49：关网络监听并撤销注册
-        gNetOn = 0;
-        gNetUntil = 0;
-        AINetRegister(NO);
-        int n = 0;
-        [gNetLock lock];
-        n = (int)gNetRing.count;
-        [gNetRing removeAllObjects];       // 关闭即清空 —— 数据不留在内存里
-        [gNetLock unlock];
-        AILog(@"  [cmd] net.off（清掉 %d 条）", n);
-        AIReportDict(@{@"op": @"net.off", @"ok": @YES, @"on": @0, @"n": @(n)});
-    } else if ([op isEqualToString:@"net.tail"]) {     // v49：读网络监听环形缓冲
-        int want = cmd[@"n"] ? [cmd[@"n"] intValue] : 50;
-        if (want <= 0) want = 50;
-        if (want > 200) want = 200;
-        NSString *f = cmd[@"f"];       // 可选关键词过滤（如 f=json 只看接口返回）
-        NSArray *snap = nil;
-        int total = 0;
-        [gNetLock lock];
-        total = (int)gNetRing.count;
-        snap = [gNetRing copy];
-        [gNetLock unlock];
-        // 取最后 want 条，按时间正序（最旧→最新），便于顺序阅读
-        NSUInteger from = (snap.count > (NSUInteger)want) ? (snap.count - (NSUInteger)want) : 0;
-        NSMutableArray *lines = [NSMutableArray array];
-        for (NSUInteger i = from; i < snap.count; i++) {
-            NSDictionary *d = snap[i];
-            NSString *one = AINetLine(d);
-            if (f.length && [one rangeOfString:f options:NSCaseInsensitiveSearch].location == NSNotFound)
-                continue;
-            [lines addObject:one];
-        }
-        int left = 0;
-        if (gNetOn && gNetUntil > 0)
-            left = (int)MAX(0, gNetUntil - [[NSDate date] timeIntervalSince1970]);
-        AIReportDict(@{@"op": @"net.tail", @"ok": @YES,
-                       @"on": @(gNetOn), @"n": @(lines.count), @"total": @(total),
-                       @"cnt": @(gNetCnt), @"left": @(left),
-                       @"lines": lines, @"text": [lines componentsJoinedByString:@"\n"]});
-        AILog(@"  [cmd] net.tail n=%d -> %lu 行（缓冲 %d 条）",
-              want, (unsigned long)lines.count, total);
     } else if ([op isEqualToString:@"status"]) {
         // v30：自报「我是谁」—— 本 dylib 在手机上的真实路径 + 构建时刻 + op 集。
         // 背景：v28 起存档把「源码版本」当「注入版本」写，导致 v27/v28 之争；
@@ -4359,8 +4030,7 @@ static void AIExecCmd(NSDictionary *cmd) {
                        @"ops": @"wait pick picktxt tapui tap scroll swipe rows tree toast probe "
                                @"back nav find rntap dismiss uioff uion gdtap wintap schemes open "
                                @"shot wins win gtap chain text dump update core ball overlay "
-                               @"status log hud task macro diag ocr vfind recapknow copysteps flag "
-                               @"panel wininfo net.on net.off net.tail",
+                               @"status log hud task macro diag ocr vfind recapknow copysteps flag",
                        @"proc": gProcName, @"bundle": gBundleId, @"pid": @(getpid()),
                        @"tap": @(gBestTap), @"shot": @(gBestShot),
                        @"mon": @(gMonHits), @"se": @(gSendEventHits),
@@ -4375,14 +4045,6 @@ static void AIExecCmd(NSDictionary *cmd) {
                                 @"age": @((long long)(gPollTick > 0
                                           ? ([[NSDate date] timeIntervalSince1970] - gPollTick) : -1.0)),
                                 @"mainLag": @((long long)gMainLag)},
-                       // v49：网络监听状态（能力层，不动 ui{} 结构）
-                       @"net": @{@"on": @(gNetOn ? 1 : 0), @"reg": @(gNetRegistered ? 1 : 0),
-                                 @"n": @(gNetRing ? (int)gNetRing.count : 0),
-                                 @"cnt": @(gNetCnt),
-                                 @"killed": @(gNetKilled ? 1 : 0),
-                                 @"left": @(gNetOn && gNetUntil > 0
-                                            ? (int)MAX(0, gNetUntil - [[NSDate date] timeIntervalSince1970])
-                                            : 0)},
                        @"task": tsk,
                        @"ui":   ui});
     } else if ([op isEqualToString:@"log"]) {
@@ -4695,9 +4357,6 @@ static void AINetLoop(void) {
         }
     });
     @try { AIStartServer(); AISleep(0.6); } @catch (NSException *e) { AILog(@"  服务启动异常 %@", e); }  // 等端口真正 bind 上再打印
-    // v49：无条件撤销一次网络监听注册。防「上一版本留下注册、这一版本以新逻辑接管」的
-    //      跨版本脏状态（NSURLProtocol 的注册是进程级的，dylib 换了不代表注册没了）。
-    AINetReset();
     gBase = AIBase();
     gActiveBase = gBase;
     AILog(@"  版本=%@ 中继: %@", kAIVer, gBase);
