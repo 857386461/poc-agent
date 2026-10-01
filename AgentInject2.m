@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v51";   // v51 = v50 + 通用 HTTP 原语（http op + AIHttpEx 支持自定义头）。会话主拍板「2，写进插件内」。
+static NSString * const kAIVer = @"v51c";  // v51c = v51b + http op 改异步派发（修轮询线程被 dispatch_semaphore_wait 占死的死锁）。会话主拍板「2，写进插件内」。
 //   ---------------------------------------------------------------------------
 //   v49（路线一 · 通用网络监听）的结论留痕 —— 写在版本号旁边，避免后人再走一遍：
 //
@@ -4249,31 +4249,46 @@ static void AIExecCmd(NSDictionary *cmd) {
             if (![v isKindOfClass:[NSString class]]) v = [v description];
             @try { [rq setValue:(NSString *)v forHTTPHeaderField:k]; } @catch (id ex) {}
         }
-        __block NSData *out = nil; __block NSError *e = nil; __block NSInteger code = 0;
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        NSDate *t0 = [NSDate date];
-        NSURLSessionDataTask *t = [[NSURLSession sharedSession]
-            dataTaskWithRequest:rq
-              completionHandler:^(NSData *dd, NSURLResponse *r, NSError *er) {
-                out = dd; e = er;
-                if ([r isKindOfClass:[NSHTTPURLResponse class]]) code = [(NSHTTPURLResponse *)r statusCode];
-                dispatch_semaphore_signal(sem);
-            }];
-        [t resume];
-        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)((tmo + 2.0) * NSEC_PER_SEC)));
-        NSTimeInterval ms = [[NSDate date] timeIntervalSinceDate:t0];
-
-        NSString *txt = out ? [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding] : nil;
-        if (!txt && out) txt = [out base64EncodedStringWithOptions:0];
-        NSUInteger cap = 20000;   // 回执体积上限，避免撑爆中继
-        if (txt.length > cap) txt = [[txt substringToIndex:cap] stringByAppendingString:@"…(截断)"];
-        AILog(@"  [cmd] http %@ %@ -> code=%ld %ldB %.0fms cookie=%ld",
-              method, url, (long)code, (long)out.length, ms * 1000, (long)nCookie);
-        AIReportDict(@{@"op": @"http", @"ok": @(out != nil && e == nil),
-                       @"code": @(code), @"ms": @(ms * 1000),
-                       @"len": @(out.length), @"nCookie": @(nCookie),
-                       @"text": txt ?: @"",
-                       @"err": e ? e.localizedDescription : @""});
+        // ★ v51c：不能在轮询线程上 dispatch_semaphore_wait 死等 ——
+        // v51b 实测：一进这个分支，轮询线程被占死，之后连 status/probe 都不再消费，
+        // 整条通道瘫掉（lastOp 冻住、beat 还在跳）。改用「异步 + 独立线程」：
+        // 请求在后台线程发，回执从那里上报，轮询线程立刻返回继续接下一串。
+        __block NSString *bu = url, *bm = method;
+        __block NSInteger bnCookie = nCookie;
+        NSMutableURLRequest *rqC = [rq copy];
+        [NSThread detachNewThreadWithBlock:^{
+            @autoreleasepool {
+                NSData *out = nil; NSError *e = nil; NSInteger code = 0;
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                NSDate *t0 = [NSDate date];
+                NSURLSessionDataTask *t = [[NSURLSession sharedSession]
+                    dataTaskWithRequest:rqC
+                      completionHandler:^(NSData *dd, NSURLResponse *r, NSError *er) {
+                        out = dd; e = er;
+                        if ([r isKindOfClass:[NSHTTPURLResponse class]])
+                            code = [(NSHTTPURLResponse *)r statusCode];
+                        dispatch_semaphore_signal(sem);
+                    }];
+                [t resume];
+                // 后台线程同步等；即使超时也只卡这条 detached 线程，绝不碰轮询线程
+                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
+                                        (int64_t)((tmo + 2.0) * NSEC_PER_SEC)));
+                NSTimeInterval ms = [[NSDate date] timeIntervalSinceDate:t0];
+                NSString *txt = out ? [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding] : nil;
+                if (!txt && out) txt = [out base64EncodedStringWithOptions:0];
+                NSUInteger cap = 20000;   // 回执体积上限，避免撑爆中继
+                if (txt.length > cap) txt = [[txt substringToIndex:cap] stringByAppendingString:@"…(截断)"];
+                AILog(@"  [cmd] http %@ %@ -> code=%ld %ldB %.0fms cookie=%ld",
+                      bm, bu, (long)code, (long)out.length, ms * 1000, (long)bnCookie);
+                AIReportDict(@{@"op": @"http", @"ok": @(out != nil && e == nil),
+                               @"code": @(code), @"ms": @(ms * 1000),
+                               @"len": @(out.length), @"nCookie": @(bnCookie),
+                               @"text": txt ?: @"",
+                               @"err": e ? e.localizedDescription : @""});
+            }
+        }];
+        // 立刻回一条 ack，让调用方知道命令被受理（真实结果随后异步到达）
+        AILog(@"  [cmd] http %@ %@ 已派发（异步）", method, url);
     } else if ([op isEqualToString:@"back"]) {
         // v18：绕开 UI，直接命令导航栈返回（治 Flutter/游戏这类"看得见点不着"的返回键）
         NSString *t = AIBack();
