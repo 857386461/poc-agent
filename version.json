@@ -1,10 +1,10 @@
 {
  "ver": "51",
- "tag": "inject2-88",
- "url": "https://github.com/857386461/poc-agent/releases/download/inject2-88/AgentInject2.dylib",
- "asset_size": 557648,
- "local": "AgentInject2-v51b.dylib",
- "md5": "ecc9cb6c945f2012d52a0370ac2dfb81",
+ "tag": "inject2-90",
+ "url": "https://github.com/857386461/poc-agent/releases/download/inject2-90/AgentInject2.dylib",
+ "asset_size": 557856,
+ "local": "AgentInject2-v51c.dylib",
+ "md5": "5ef80e52cc4750f38d3561f85b0058e8",
  "prev": {
   "ver": "40",
   "tag": "inject2-66",
@@ -12,8 +12,8 @@
   "md5": "606e28cd01a07a1b92d758adf9f89e0d",
   "note": "v40 = v39 + G30 根治：AIReportDict 回执 POST 与轮询同待遇（gActiveBase 为 IP 兜底 https://4 时同样 trustAny+Host 覆盖回域名），根除「飞行模式→切 IP→回执 -1202 证书无效→上行单边全灭→看门狗盲区→死锁到杀 App」链；另补 status ops 清单串 ocr vfind（v39 遗留）。判据：run66 he"
  },
- "note": "v51b = v51 修正版（★ 关键：v51 首版漏改 ops 列表，导致设备不认 http op）。改动：① http op 全量落地（与 tap/scroll 平级，含 cookieJar 自动带本进程 Cookie、method/headers/body 全交给调用方）；② AIHttpEx 尾部加 NSDictionary *headers 参数，8 个旧调用点传 nil 向后兼容；③ ★ 修正 status 的 ops 列表补上 'http' —— 原先漏加，设备端 status 回显无 http，且实测发 http 命令被静默丢弃（lastOp 不更新、无回执）。判据：run88 全 step success；产物 md5 ecc9cb6c945f2012d52a0370ac2dfb81；strings 验证 ops 串含 'probe http'（旧版为 'probe' 后直接 back）。",
+ "note": "v51c = v51b + http op 改「异步派发」（修死锁）。★ 三版演进：v51 漏改 ops 列表→设备静默丢弃 http 命令；v51b 补了 ops 但 http 分支在轮询线程 dispatch_semaphore_wait 死等，一执行就把轮询线程占死、之后 status/probe 全不消费（通道瘫掉）；v51c 改为 NSThread.detachNewThreadWithBlock 后台派发，轮询线程立即返回，回执从后台线程上报。编译期还踩了 __block：内层 completionHandler block 要写外层的 out/e/code，外层声明必须带 __block（run89 报 3 errors not assignable）。",
  "min": "30",
- "verify": "判 v51b 生效：① status 回执 ops 串应含 'http'；② 发 {op:'http',url:'https://www.baidu.com'} 应 5~10s 内回执，含 code=200。★ 检索法教训：不要用 strings 搜带空格/中文的字符串常量（编译器会合并/重排），判分支有无要认 ops 串和实测回执，不能只看 strings。",
+ "verify": "判 v51c 生效：① status 的 ops 串含 'http'；② 发 http 命令后 lastOp 应变为 http；③ 回执异步到达（几秒内），含 code/len/nCookie/text。★ 关键回归项：发完 http 后立刻发 probe，probe 必须仍能回（v51b 就是发 http 后 probe 也死了）。",
  "redline": "改 C 函数签名时 前向声明/定义/调用点 三处一起改（G12 类）。http op 不得进 kTouchOps（只读类，不该点亮罩层）。★★ CI 判据纠正（G73）：run.conclusion==failure ≠ 编译失败，必须查 jobs 的 step 级 conclusion 与 inject2log-N 的 ERROR LINES 是否为空。上一轮 buildctl.py 的提示「改 C 函数签名时三处一起改」是脚本猜测，不是编译器输出 —— 差点误修。"
 }
