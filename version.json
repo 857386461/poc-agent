@@ -14,6 +14,6 @@
  },
  "note": "v51c = v51b + http op 改「异步派发」（修死锁）。★ 三版演进：v51 漏改 ops 列表→设备静默丢弃 http 命令；v51b 补了 ops 但 http 分支在轮询线程 dispatch_semaphore_wait 死等，一执行就把轮询线程占死、之后 status/probe 全不消费（通道瘫掉）；v51c 改为 NSThread.detachNewThreadWithBlock 后台派发，轮询线程立即返回，回执从后台线程上报。编译期还踩了 __block：内层 completionHandler block 要写外层的 out/e/code，外层声明必须带 __block（run89 报 3 errors not assignable）。",
  "min": "30",
- "verify": "判 v51c 生效：① status 的 ops 串含 'http'；② 发 http 命令后 lastOp 应变为 http；③ 回执异步到达（几秒内），含 code/len/nCookie/text。★ 关键回归项：发完 http 后立刻发 probe，probe 必须仍能回（v51b 就是发 http 后 probe 也死了）。",
+ "verify": "★ v51c 实测结论(2026-10-02)：http op 已通。① status 的 ops 串含 'http'；② ks_api.py probe -> ok=True code=200；③ http 请求 http://a.cn -> code=200 len=7697。★ 注意：url 用 https://www.baidu.com 会卡（无回执），http://a.cn 正常 —— 同 op 不同域名表现不同，判据要用能通的域名。④ 快手 basicInfo 返回 {\"result\":40} 且 nCookie=0 —— 快手鉴权走自定义头+__NS_sig3 签名，NSHTTPCookieStorage 里没快手 cookie，所以 cookieJar 对快手势接口无效。",
  "redline": "改 C 函数签名时 前向声明/定义/调用点 三处一起改（G12 类）。http op 不得进 kTouchOps（只读类，不该点亮罩层）。★★ CI 判据纠正（G73）：run.conclusion==failure ≠ 编译失败，必须查 jobs 的 step 级 conclusion 与 inject2log-N 的 ERROR LINES 是否为空。上一轮 buildctl.py 的提示「改 C 函数签名时三处一起改」是脚本猜测，不是编译器输出 —— 差点误修。"
 }
