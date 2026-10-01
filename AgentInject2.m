@@ -4041,7 +4041,7 @@ static void AIExecCmd(NSDictionary *cmd) {
         AIReportDict(@{@"op": @"status", @"ok": @YES, @"ver": kAIVer,
                        @"built": @(__DATE__ " " __TIME__),        // v30：编译器固化的构建时刻
                        @"lib": libPath,                            // v30：注入文件真实路径
-                       @"ops": @"wait pick picktxt tapui tap scroll swipe rows tree toast probe "
+                       @"ops": @"wait pick picktxt tapui tap scroll swipe rows tree toast probe http "
                                @"back nav find rntap dismiss uioff uion gdtap wintap schemes open "
                                @"shot wins win gtap chain text dump update core ball overlay "
                                @"status log hud task macro diag ocr vfind recapknow copysteps flag",
