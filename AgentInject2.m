@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v53";   // v53 = v52 侦察能力的增强版（仍纯只读）。v52 真机暴露三处不足：① scan 关键词 sign/secur 太宽泛，60 个候选里 33 个是 Apple 系统框架，快手网络层类被挤掉 → 加「自定义关键词 k=」+「只看快手自有类 app=1」+ 上限 150；② hook 只记头名值不记 URL → 拿到 200 条记录却不知道属于哪个请求 → AISigRecord 补记 URL；③ dump 只回「像签名」的且上限 200 一眨眼满 → 加 all=1/h=域名过滤/hosts 域名统计/clear=1、上限 800。
+static NSString * const kAIVer = @"v54";   // v54 = v53 侦察「记录保真度」修复（仍纯只读）。v53 真机暴露：① URL/value 截断 160 太狠，__NS_sig3 / kuaishou.api_st / __NSWJ 全被切掉，抄回来的头不全 → 提到 600 并显式标 ⟨TRUNC⟩；② 我们自己的中继流量占了 800 名额里的一大块（实测 315 条中 78 条）→ 在 AISigRecord 入口直接丢弃 workbuddy.host；③ 不记 method/body → POST 接口无从复刻 → 补录 m/b。
 //   ---------------------------------------------------------------------------
 //   v49（路线一 · 通用网络监听）的结论留痕 —— 写在版本号旁边，避免后人再走一遍：
 //
@@ -3723,25 +3723,48 @@ static IMP gOrigSetValue = NULL, gOrigAddValue = NULL;
 // v53：多传一个 req（用于取 URL）。教训（v52 真机）：hook 记了 200 条头，
 //      但不知道每条属于哪个请求 → 无法判断「这 200 条到底是不是快手的」。
 //      现在把 URL 一起记下来，dump 时按域名过滤就能看出来。
+// 截断上限（v54：160→600。教训：真机 URL 带几十个查询参数、Cookie 几百字符，
+//                160 会把 __NS_sig3 / kuaishou.api_st / __NSWJ 全部切掉，抄不全 = 白抓）
+#define AISIG_TRUNC 600
+
+static NSString *AITrunc(NSString *s) {
+    if (!s) return @"";
+    return (s.length > AISIG_TRUNC) ? [[s substringToIndex:AISIG_TRUNC] stringByAppendingString:@"…⟨TRUNC⟩"] : s;
+}
+
 static void AISigRecord(id req, NSString *field, NSString *value) {
     if (!gSigHookOn || !field) return;
     if (!gSigHeaderLog) gSigHeaderLog = [NSMutableArray array];
+    // ★ v54：先把 URL 取出来，若是咱们自己的中继流量就直接丢 —— 否则 800 个名额
+    //   几百条就被自己占满（v53 实测：315 条里 78 条是中继），快手真流量只能捡剩的。
+    NSString *u0 = @"";
+    @try {
+        if ([req respondsToSelector:@selector(URL)]) {
+            NSURL *uu = [(NSURLRequest *)req URL];
+            u0 = uu.absoluteString ?: @"";
+        }
+    } @catch (id e) {}
+    if ([u0 rangeOfString:@"workbuddy.host"].location != NSNotFound) return;   // 中继：丢弃
     @synchronized (gSigHeaderLog) {
-        if (gSigHeaderLog.count >= 800) return;   // v53：200→800（200 一眨眼就满）
+        if (gSigHeaderLog.count >= 800) return;
         NSString *f = field, *v = value ?: @"";
-        NSString *u = @"";
+        NSString *u = u0; NSString *m = @""; NSString *bd = @"";
         @try {
-            if ([req respondsToSelector:@selector(URL)]) {
-                NSURL *uu = [(NSURLRequest *)req URL];
-                u = uu.absoluteString ?: @"";
+            if ([req respondsToSelector:@selector(HTTPMethod)]) m = [(NSURLRequest *)req HTTPMethod] ?: @"";
+            // v54：把 body 也记下来（POST 接口全靠它）。只取前若干字节，避免回执爆炸。
+            if ([req respondsToSelector:@selector(HTTPBody)]) {
+                NSData *d = [(NSURLRequest *)req HTTPBody];
+                if (d.length) {
+                    NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+                    bd = s ?: [NSString stringWithFormat:@"<非UTF8 %lu字节>", (unsigned long)d.length];
+                }
             }
         } @catch (id e) {}
         BOOL looksSig = ([f rangeOfString:@"sig"  options:NSCaseInsensitiveSearch].location != NSNotFound
                       || [f rangeOfString:@"token" options:NSCaseInsensitiveSearch].location != NSNotFound
                       || [f hasPrefix:@"__NS"]);
-        [gSigHeaderLog addObject:@{@"u": (u.length > 160 ? [[u substringToIndex:160] stringByAppendingString:@"…"] : u),
-                                   @"f": f,
-                                   @"v": (v.length > 160 ? [[v substringToIndex:160] stringByAppendingString:@"…"] : v),
+        [gSigHeaderLog addObject:@{@"u": AITrunc(u), @"f": f, @"v": AITrunc(v),
+                                   @"m": m, @"b": AITrunc(bd),
                                    @"sig": @(looksSig)}];
     }
 }
