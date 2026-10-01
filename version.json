@@ -1,0 +1,19 @@
+{
+ "ver": "51",
+ "tag": "inject2-87",
+ "url": "https://github.com/857386461/poc-agent/releases/download/inject2-87/AgentInject2.dylib",
+ "asset_size": 557648,
+ "local": "AgentInject2-v51.dylib",
+ "md5": "88c4ed2c705e5781f822f89853986fdc",
+ "prev": {
+  "ver": "40",
+  "tag": "inject2-66",
+  "url": "https://github.com/857386461/poc-agent/releases/download/inject2-66/AgentInject2.dylib",
+  "md5": "606e28cd01a07a1b92d758adf9f89e0d",
+  "note": "v40 = v39 + G30 根治：AIReportDict 回执 POST 与轮询同待遇（gActiveBase 为 IP 兜底 https://4 时同样 trustAny+Host 覆盖回域名），根除「飞行模式→切 IP→回执 -1202 证书无效→上行单边全灭→看门狗盲区→死锁到杀 App」链；另补 status ops 清单串 ocr vfind（v39 遗留）。判据：run66 he"
+ },
+ "note": "v51 = v50 + 通用 HTTP 原语。① AIHttpEx 尾部新增 NSDictionary *headers 参数（自定义请求头，8 个旧调用点传 nil 保持原行为，完全向后兼容）；② 新增 http op：{op:'http',url,method,headers,body,tmo,cookieJar}，cookieJar=1 自动附本进程 Cookie 且只发与目标域相关的。回执 {ok,code,ms,len,nCookie,text,err}，text 上限 20000 字符。为什么进插件：沙箱脚本发请求要手抄 Cookie/设备指纹、抄错就废、过期就失效，而设备内发请求 Cookie 就在 NSHTTPCookieStorage 里、指纹天然真实——这是「通用能力」与「App 专属胶水」的分界线（会话主拍板「写进插件内」）。",
+ "min": "30",
+ "verify": "判版本用 ks.py status / wayfind.alive() 主动取实时回执（中继缓存会滞后，G16）。判 v51 生效：发 {op:'probe'} 之外的 http 探测，或看 status 返回 ver=v51。",
+ "redline": "改 C 函数签名时 前向声明/定义/调用点 三处一起改（G12 类）。http op 不得进 kTouchOps（只读类，不该点亮罩层）。★★ CI 判据纠正（G73）：run.conclusion==failure ≠ 编译失败，必须查 jobs 的 step 级 conclusion 与 inject2log-N 的 ERROR LINES 是否为空。上一轮 buildctl.py 的提示「改 C 函数签名时三处一起改」是脚本猜测，不是编译器输出 —— 差点误修。"
+}
