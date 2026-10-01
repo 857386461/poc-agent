@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v51c";  // v51c = v51b + http op 改异步派发（修轮询线程被 dispatch_semaphore_wait 占死的死锁）。会话主拍板「2，写进插件内」。
+static NSString * const kAIVer = @"v52";   // v52 = v51c + sigprobe 诊断 op（签名侦察，只读）。为「设备内带签名访问快手接口」探路。
 //   ---------------------------------------------------------------------------
 //   v49（路线一 · 通用网络监听）的结论留痕 —— 写在版本号旁边，避免后人再走一遍：
 //
@@ -3598,6 +3598,130 @@ static void AIStartServer(void) {
     AILog(@"  ❌ 8080-8085 全部绑定失败");
 }
 
+// ---------------------------------------------------------------------------
+// v52：签名侦察（sigprobe）—— 纯只读，只枚举/观察，不改 App 任何行为
+//
+// 背景：v51c 的 http op 能发请求，但快手接口要 __NS_sig3 每请求签名，
+//       而快手【不走 NSURLSession】（v49 真机实证）→ 抄不到。
+//       所以必须先【侦察】签名藏在哪：① 哪些 ObjC 类像签名器；
+//       ② 哪些 C 符号像签名函数；③ 快手请求头到底由谁写。
+// 三部分全部只读：枚举类/方法、dlsym 探符号、旁路记录（不阻断不篡改）。
+// ---------------------------------------------------------------------------
+
+// —— ① 扫 ObjC 类：找名字像「签名/安全/加密」的类，列出其方法 ——
+static NSArray *AIScanSignClasses(void) {
+    NSMutableArray *hits = [NSMutableArray array];
+    int n = objc_getClassList(NULL, 0);
+    if (n <= 0) return hits;
+    Class *buf = (Class *)calloc(n, sizeof(Class));
+    if (!buf) return hits;
+    n = objc_getClassList(buf, n);
+    // 关键词：命中任一即收录（大小写不敏感）
+    NSArray *kws = @[@"sign", @"signat", @"security", @"secur", @"crypto",
+                     @"kws", @"nebula", @"encrypt", @"hash", @"hmac", @"token"];
+    for (int i = 0; i < n; i++) {
+        Class c = buf[i];
+        if (!c) continue;
+        const char *cn = class_getName(c);
+        if (!cn) continue;
+        NSString *name = [NSString stringWithUTF8String:cn];
+        if (!name.length) continue;
+        NSString *low = [name lowercaseString];
+        BOOL hit = NO;
+        for (NSString *k in kws) { if ([low rangeOfString:k].location != NSNotFound) { hit = YES; break; } }
+        if (!hit) continue;
+        // 收集该类的实例方法 + 类方法名（只收名字，不收实现）
+        NSMutableArray *ms = [NSMutableArray array];
+        unsigned int mc = 0;
+        Method *ml = class_copyMethodList(c, &mc);
+        for (unsigned int j = 0; j < mc && j < 400; j++) {
+            const char *sn = sel_getName(method_getName(ml[j]));
+            if (sn) [ms addObject:[NSString stringWithUTF8String:sn]];
+        }
+        if (ml) free(ml);
+        unsigned int cmc = 0;
+        Method *cml = class_copyMethodList(object_getClass(c), &cmc);
+        for (unsigned int j = 0; j < cmc && j < 200; j++) {
+            const char *sn = sel_getName(method_getName(cml[j]));
+            if (sn) [ms addObject:[NSString stringWithFormat:@"+%@", [NSString stringWithUTF8String:sn]]];
+        }
+        if (cml) free(cml);
+        [hits addObject:@{@"cls": name, @"n": @(ms.count), @"m": ms}];
+        if (hits.count >= 60) break;      // 上限，避免回执爆炸
+    }
+    free(buf);
+    return hits;
+}
+
+// —— ② 探 C 符号：dlsym 找可能算签名的函数 ——
+static NSDictionary *AIProbeSignSymbols(void) {
+    const char *cands[] = {
+        // 常见签名/摘要
+        "CC_MD5", "CC_SHA1", "CC_SHA256", "CCHmac", "CCCrypt",
+        "MD5", "SHA1", "SHA256", "HMAC",
+        // 网络层（快手若走 CFNetwork，这些会有）
+        "CFURLConnectionCreateWithProperties", "CFReadStreamCreateForHTTPRequest",
+        "CFHTTPMessageCreateRequest", "CFHTTPMessageSetHeaderFieldValue",
+        // socket/TLS（自封装栈的迹象）
+        "SSLHandshake", "SSLWrite", "SSLRead", "tls_handshake",
+        "CFNetworkExecuteLocalProxyServer",
+        // 快手可能的自有符号（猜测，命中即惊喜）
+        "KWSecuritySign", "kwai_sign", "nebula_sign", "KWSign",
+        "NSURLSessionConfiguration",   // 只看符号在不在，不说明快手用
+    };
+    NSMutableDictionary *r = [NSMutableDictionary dictionary];
+    NSMutableArray *found = [NSMutableArray array], *miss = [NSMutableArray array];
+    for (int i = 0; i < (int)(sizeof(cands)/sizeof(cands[0])); i++) {
+        void *p = dlsym(RTLD_DEFAULT, cands[i]);
+        if (p) [found addObject:[NSString stringWithUTF8String:cands[i]]];
+        else   [miss  addObject:[NSString stringWithUTF8String:cands[i]]];
+    }
+    r[@"found"] = found; r[@"miss"] = miss;
+    return r;
+}
+
+// —— ③ 旁路：hook NSMutableURLRequest 的 header setter，只记录不改 ——
+static NSMutableArray *gSigHeaderLog = nil;     // [{url, field, value}]
+static BOOL gSigHookOn = NO;
+static IMP gOrigSetValue = NULL, gOrigAddValue = NULL;
+
+static void AISigRecord(NSString *field, NSString *value) {
+    if (!gSigHookOn || !field) return;
+    if (!gSigHeaderLog) gSigHeaderLog = [NSMutableArray array];
+    @synchronized (gSigHeaderLog) {
+        if (gSigHeaderLog.count >= 200) return;   // 上限
+        NSString *f = field, *v = value ?: @"";
+        // 只留「像签名」的头，或全部（可配）
+        BOOL looksSig = ([f rangeOfString:@"sig"  options:NSCaseInsensitiveSearch].location != NSNotFound
+                      || [f rangeOfString:@"token" options:NSCaseInsensitiveSearch].location != NSNotFound
+                      || [f hasPrefix:@"__NS"]);
+        [gSigHeaderLog addObject:@{@"f": f,
+                                   @"v": (v.length > 120 ? [[v substringToIndex:120] stringByAppendingString:@"…"] : v),
+                                   @"sig": @(looksSig)}];
+    }
+}
+
+static void AIHookSetValue(id self, SEL _cmd, NSString *value, NSString *field) {
+    AISigRecord(field, value);
+    if (gOrigSetValue) ((void (*)(id, SEL, id, id))gOrigSetValue)(self, _cmd, value, field);
+}
+static void AIHookAddValue(id self, SEL _cmd, NSString *value, NSString *field) {
+    AISigRecord(field, value);
+    if (gOrigAddValue) ((void (*)(id, SEL, id, id))gOrigAddValue)(self, _cmd, value, field);
+}
+
+static NSString *AISigHookEnable(void) {
+    if (gSigHookOn) return @"已在监听";
+    Class c = objc_getClass("NSMutableURLRequest");
+    if (!c) return @"找不到 NSMutableURLRequest";
+    Method m1 = class_getInstanceMethod(c, @selector(setValue:forHTTPHeaderField:));
+    Method m2 = class_getInstanceMethod(c, @selector(addValue:forHTTPHeaderField:));
+    if (m1) { gOrigSetValue = method_setImplementation(m1, (IMP)AIHookSetValue); }
+    if (m2) { gOrigAddValue = method_setImplementation(m2, (IMP)AIHookAddValue); }
+    gSigHookOn = YES;
+    return [NSString stringWithFormat:@"已挂 setValue:%@ addValue:%@", m1?@"OK":@"无", m2?@"OK":@"无"];
+}
+
 // 统一上报：所有结果都 POST 回中继，我在沙箱里 GET /report?dev=... 就能读到
 static void AIReportDict(NSDictionary *d) {
     NSMutableDictionary *m = [d mutableCopy];
@@ -4041,7 +4165,7 @@ static void AIExecCmd(NSDictionary *cmd) {
         AIReportDict(@{@"op": @"status", @"ok": @YES, @"ver": kAIVer,
                        @"built": @(__DATE__ " " __TIME__),        // v30：编译器固化的构建时刻
                        @"lib": libPath,                            // v30：注入文件真实路径
-                       @"ops": @"wait pick picktxt tapui tap scroll swipe rows tree toast probe http "
+                       @"ops": @"wait pick picktxt tapui tap scroll swipe rows tree toast probe http sigprobe "
                                @"back nav find rntap dismiss uioff uion gdtap wintap schemes open "
                                @"shot wins win gtap chain text dump update core ball overlay "
                                @"status log hud task macro diag ocr vfind recapknow copysteps flag",
@@ -4290,6 +4414,61 @@ static void AIExecCmd(NSDictionary *cmd) {
         }];
         // 立刻回一条 ack，让调用方知道命令被受理（真实结果随后异步到达）
         AILog(@"  [cmd] http %@ %@ 已派发（异步）", method, url);
+    } else if ([op isEqualToString:@"sigprobe"]) {
+        // v52：签名侦察（只读）。子动作由 cmd[@"a"] 指定：
+        //   a=scan   → 扫象名字像签名器的 ObjC 类 + 探 C 符号
+        //   a=on     → 挂 NSMutableURLRequest 头 setter 旁路
+        //   a=dump   → 读已记录的头（含签名候选）
+        //   a=off    → 摘钩（不还原实现，只停记录；本版够用）
+        //   a=status → 看钩子/记录状态
+        NSString *a = [cmd[@"a"] isKindOfClass:[NSString class]] ? cmd[@"a"] : @"scan";
+        if ([a isEqualToString:@"on"]) {
+            NSString *r = AISigHookEnable();
+            AILog(@"  [cmd] sigprobe on -> %@", r);
+            AIReportDict(@{@"op": @"sigprobe", @"a": a, @"ok": @YES, @"how": r,
+                           @"note": @"旁路只记录 NSMutableURLRequest 的 setValue/addValue，不改行为"});
+        } else if ([a isEqualToString:@"off"]) {
+            gSigHookOn = NO;
+            AILog(@"  [cmd] sigprobe off");
+            AIReportDict(@{@"op": @"sigprobe", @"a": a, @"ok": @YES, @"n": @(gSigHeaderLog.count)});
+        } else if ([a isEqualToString:@"dump"]) {
+            NSArray *snap;
+            @synchronized (gSigHeaderLog) { snap = [gSigHeaderLog copy] ?: @[]; }
+            // 只回「像签名」的那些 + 总条数，避免回执被普通头淹掉
+            NSMutableArray *sig = [NSMutableArray array];
+            for (NSDictionary *e in snap) if ([e[@"sig"] boolValue]) [sig addObject:e];
+            NSUInteger cap = 60;
+            NSArray *show = sig.count > cap ? [sig subarrayWithRange:NSMakeRange(sig.count - cap, cap)] : sig;
+            AILog(@"  [cmd] sigprobe dump -> 总 %lu 条，像签名 %lu 条",
+                  (unsigned long)snap.count, (unsigned long)sig.count);
+            AIReportDict(@{@"op": @"sigprobe", @"a": a, @"ok": @YES,
+                           @"total": @(snap.count), @"nsig": @(sig.count),
+                           @"sig": show});
+        } else if ([a isEqualToString:@"status"]) {
+            AIReportDict(@{@"op": @"sigprobe", @"a": a, @"ok": @YES,
+                           @"hooked": @(gSigHookOn),
+                           @"n": @(gSigHeaderLog ? gSigHeaderLog.count : 0)});
+        } else {   // scan（默认）
+            NSArray *cls = AIScanSignClasses();
+            NSDictionary *syms = AIProbeSignSymbols();
+            NSMutableString *s = [NSMutableString string];
+            [s appendFormat:@"类候选 %lu 个：\n", (unsigned long)cls.count];
+            for (NSDictionary *c in cls) {
+                [s appendFormat:@"  %@  (%@ 方法)\n", c[@"cls"], c[@"n"]];
+                NSArray *ms = c[@"m"];
+                NSUInteger shown = MIN(ms.count, (NSUInteger)12);
+                for (NSUInteger i = 0; i < shown; i++) [s appendFormat:@"      %@\n", ms[i]];
+                if (ms.count > shown) [s appendFormat:@"      …另 %lu 个\n", (unsigned long)(ms.count - shown)];
+            }
+            [s appendFormat:@"\n符号命中：%@\n", [syms[@"found"] componentsJoinedByString:@", "]];
+            AILog(@"  [cmd] sigprobe scan -> 类 %lu / 符号命中 %lu",
+                  (unsigned long)cls.count, (unsigned long)[syms[@"found"] count]);
+            AIReportDict(@{@"op": @"sigprobe", @"a": a, @"ok": @YES,
+                           @"ncls": @(cls.count),
+                           @"classes": cls,
+                           @"symFound": syms[@"found"],
+                           @"text": s});
+        }
     } else if ([op isEqualToString:@"back"]) {
         // v18：绕开 UI，直接命令导航栈返回（治 Flutter/游戏这类"看得见点不着"的返回键）
         NSString *t = AIBack();
