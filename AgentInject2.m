@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v50";   // v50 = v48 + 去掉 v49 的网络监听层（会话主 · 用户拍板「不用管 49 了，下个版本把它去掉」）。
+static NSString * const kAIVer = @"v51";   // v51 = v50 + 通用 HTTP 原语（http op + AIHttpEx 支持自定义头）。会话主拍板「2，写进插件内」。
 //   ---------------------------------------------------------------------------
 //   v49（路线一 · 通用网络监听）的结论留痕 —— 写在版本号旁边，避免后人再走一遍：
 //
@@ -3025,10 +3025,15 @@ didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
 static AITrustDelegate *gTrustDel = nil;
 
 // trustAny=YES 时跳过证书校验；host 不为空时覆盖 Host 头（IP 直连时给负载均衡用）。
+// headers 不为空时逐项写入请求头（v51 新增：通用 HTTP 能力的核心）。
+//   —— 为什么必须加这个：此前只能设 Host 一个头，发任何第三方接口都缺 Cookie / UA，
+//      等于「有网络层但没有头部入口」。快手/哈啰这类需要 Cookie + 设备指纹的接口全废。
+//      加字典参数后，旧调用点传 nil 即可，完全向后兼容。
 // 返回 YES 表示拿到了响应体；响应体本身通过 *out 返回。
 static BOOL AIHttpEx(NSString *urlStr, NSData *body, NSTimeInterval tmo,
                      BOOL trustAny, NSString *host, NSData **out, NSError **errOut,
-                     NSInteger *httpCode, NSTimeInterval *ms) {
+                     NSInteger *httpCode, NSTimeInterval *ms,
+                     NSDictionary *headers) {
     NSURL *u = [NSURL URLWithString:urlStr];
     if (!u) { if (errOut) *errOut = [NSError errorWithDomain:@"AI" code:-1
                                      userInfo:@{NSLocalizedDescriptionKey: @"URL 非法"}]; return NO; }
@@ -3038,6 +3043,15 @@ static BOOL AIHttpEx(NSString *urlStr, NSData *body, NSTimeInterval tmo,
     if (body) { rq.HTTPMethod = @"POST"; rq.HTTPBody = body;
                 [rq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"]; }
     if (host.length) [rq setValue:host forHTTPHeaderField:@"Host"];
+    // v51：自定义头。放在 Host 之后，允许调用方覆盖上面设的默认值。
+    if ([headers isKindOfClass:[NSDictionary class]]) {
+        for (NSString *k in headers) {
+            if (![k isKindOfClass:[NSString class]]) continue;
+            id v = headers[k];
+            if (![v isKindOfClass:[NSString class]]) v = [v description];
+            @try { [rq setValue:(NSString *)v forHTTPHeaderField:k]; } @catch (id e) {}
+        }
+    }
 
     __block NSData *got = nil;
     __block NSError *err = nil;
@@ -3602,7 +3616,7 @@ static void AIReportDict(NSDictionary *d) {
         NSError *e = nil;
         AIHttpEx([(gActiveBase ?: gBase) stringByAppendingString:@"/report"], bd, 15.0,
                  isIP, isIP ? @"aa0c466b5cdb559bb.app.workbuddy.host" : nil,
-                 &out, &e, &httpCode, &ms);
+                 &out, &e, &httpCode, &ms, nil);
         if (e || httpCode >= 400) {
             gRepErr++; gLastErrCode = e ? e.code : httpCode;
             gLastErrText = e.localizedDescription
@@ -4174,6 +4188,92 @@ static void AIExecCmd(NSDictionary *cmd) {
         AIMainSync(^{ @try { d = AIScrollAt(p, dy, dx, anim, fire); } @catch (NSException *e) {} });
         AILog(@"  [cmd] scroll dy=%.0f -> %@", dy, d);
         AIReportDict(@{@"op": @"scroll", @"info": d ?: @{@"err": @"scroll 返回 nil"}});
+    } else if ([op isEqualToString:@"http"]) {
+        // v51：通用 HTTP 原语 —— 与 tap / scroll / find 平级。
+        //
+        //  为什么进插件而不是写沙箱脚本：脚本发请求必须手抄 Cookie 与设备指纹，
+        //  抄错就失败、过期就失效；而设备内发请求时，Cookie 就在本进程的
+        //  NSHTTPCookieStorage 里、UA/egid 天然是真的 —— 这是「通用能力」与
+        //  「快手专属胶水」的分界线。
+        //
+        //  参数：url(必填) / method(默认 GET) / headers(字典) / body(字符串) / tmo(秒)
+        //  cookieJar=1 时自动附带全量 Cookie（只发与目标域相关的）。
+        NSString *url = cmd[@"url"];
+        if (![url isKindOfClass:[NSString class]] || !url.length) {
+            AIReportDict(@{@"op": @"http", @"ok": @NO, @"err": @"缺 url"});
+            return;
+        }
+        NSString *method = [cmd[@"method"] isKindOfClass:[NSString class]]
+                         ? [cmd[@"method"] uppercaseString] : @"GET";
+        NSTimeInterval tmo = cmd[@"tmo"] ? [cmd[@"tmo"] doubleValue] : 15.0;
+        if (tmo <= 0 || tmo > 120) tmo = 15.0;
+
+        NSMutableDictionary *hs = [NSMutableDictionary dictionary];
+        if ([cmd[@"headers"] isKindOfClass:[NSDictionary class]]) {
+            [hs addEntriesFromDictionary:cmd[@"headers"]];
+        }
+        // cookieJar=1：把本进程 Cookie 带上（快手这类接口的鉴权主体）
+        NSInteger nCookie = 0;
+        if ([cmd[@"cookieJar"] respondsToSelector:@selector(boolValue)] && [cmd[@"cookieJar"] boolValue]) {
+            NSArray<NSHTTPCookie *> *ck = [[NSHTTPCookieStorage sharedHTTPCookieStorage] cookies];
+            NSMutableArray *kv = [NSMutableArray array];
+            for (NSHTTPCookie *c in ck) {
+                if (!c.name || !c.value) continue;
+                // 只发与目标域相关的 cookie，避免把中继域名的凭证也漏出去
+                if (c.domain.length > 1 && [url rangeOfString:c.domain options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+                [kv addObject:[NSString stringWithFormat:@"%@=%@", c.name, c.value]];
+            }
+            nCookie = kv.count;
+            if (kv.count && !hs[@"Cookie"] && !hs[@"cookie"]) {
+                hs[@"Cookie"] = [kv componentsJoinedByString:@"; "];
+            }
+        }
+
+        NSData *bodyData = nil;
+        if ([cmd[@"body"] isKindOfClass:[NSString class]] && [cmd[@"body"] length]) {
+            bodyData = [(NSString *)cmd[@"body"] dataUsingEncoding:NSUTF8StringEncoding];
+        }
+        if ([method isEqualToString:@"POST"] && !bodyData) bodyData = [NSData data];
+
+        // 不能复用 AIHttpEx 的 body 分支（它会强制 POST + JSON Content-Type），
+        // 这里自建请求，把 method / headers / body 完全交给调用方。
+        NSURL *u = [NSURL URLWithString:url];
+        if (!u) { AIReportDict(@{@"op": @"http", @"ok": @NO, @"err": @"URL 非法"}); return; }
+        NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:u
+                                    cachePolicy:NSURLRequestReloadIgnoringCacheData
+                                timeoutInterval:tmo];
+        rq.HTTPMethod = method;
+        if (bodyData) rq.HTTPBody = bodyData;
+        for (NSString *k in hs) {
+            id v = hs[k];
+            if (![v isKindOfClass:[NSString class]]) v = [v description];
+            @try { [rq setValue:(NSString *)v forHTTPHeaderField:k]; } @catch (id ex) {}
+        }
+        __block NSData *out = nil; __block NSError *e = nil; __block NSInteger code = 0;
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        NSDate *t0 = [NSDate date];
+        NSURLSessionDataTask *t = [[NSURLSession sharedSession]
+            dataTaskWithRequest:rq
+              completionHandler:^(NSData *dd, NSURLResponse *r, NSError *er) {
+                out = dd; e = er;
+                if ([r isKindOfClass:[NSHTTPURLResponse class]]) code = [(NSHTTPURLResponse *)r statusCode];
+                dispatch_semaphore_signal(sem);
+            }];
+        [t resume];
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)((tmo + 2.0) * NSEC_PER_SEC)));
+        NSTimeInterval ms = [[NSDate date] timeIntervalSinceDate:t0];
+
+        NSString *txt = out ? [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding] : nil;
+        if (!txt && out) txt = [out base64EncodedStringWithOptions:0];
+        NSUInteger cap = 20000;   // 回执体积上限，避免撑爆中继
+        if (txt.length > cap) txt = [[txt substringToIndex:cap] stringByAppendingString:@"…(截断)"];
+        AILog(@"  [cmd] http %@ %@ -> code=%ld %ldB %.0fms cookie=%ld",
+              method, url, (long)code, (long)out.length, ms * 1000, (long)nCookie);
+        AIReportDict(@{@"op": @"http", @"ok": @(out != nil && e == nil),
+                       @"code": @(code), @"ms": @(ms * 1000),
+                       @"len": @(out.length), @"nCookie": @(nCookie),
+                       @"text": txt ?: @"",
+                       @"err": e ? e.localizedDescription : @""});
     } else if ([op isEqualToString:@"back"]) {
         // v18：绕开 UI，直接命令导航栈返回（治 Flutter/游戏这类"看得见点不着"的返回键）
         NSString *t = AIBack();
@@ -4228,7 +4328,7 @@ static void AIPollLoop(void) {
                     BOOL ok = AIHttpEx(u, nil, 8.0,
                                        [gActiveBase hasPrefix:@"https://4"],   // IP 兜底时才信任任意证书
                                        [gActiveBase hasPrefix:@"https://4"] ? @"aa0c466b5cdb559bb.app.workbuddy.host" : nil,
-                                       &d, &pe, NULL, NULL);
+                                       &d, &pe, NULL, NULL, nil);
                     if (ok) {
                         gPollOK++; failRun = 0;
                         if (gPollOK == 1) {
@@ -4642,7 +4742,7 @@ static NSString *AINetDiag(void) {
 
     // 1) 对照组：苹果官网。这个都不通 = 手机压根没网
     BOOL ok1 = AIHttpEx(@"https://www.apple.com/library/test/success.html", nil, 10.0,
-                        NO, nil, &out, &e, &code, &ms);
+                        NO, nil, &out, &e, &code, &ms, nil);
     [s appendFormat:@"①苹果 %@ %@\n", ok1 ? @"✅" : @"❌",
      ok1 ? [NSString stringWithFormat:@"%ld %.0fms", (long)code, ms * 1000]
          : [NSString stringWithFormat:@"%ld", (long)e.code]];
@@ -4651,7 +4751,7 @@ static NSString *AINetDiag(void) {
     NSString *base = gActiveBase ?: gBase ?: AIBase();
     e = nil; code = 0; ms = 0;
     BOOL ok2 = AIHttpEx([base stringByAppendingFormat:@"/poll?dev=%@", gDevId], nil, 10.0,
-                        NO, nil, &out, &e, &code, &ms);
+                        NO, nil, &out, &e, &code, &ms, nil);
     [s appendFormat:@"②中继域名 %@ %@\n", ok2 ? @"✅" : @"❌",
      ok2 ? [NSString stringWithFormat:@"%ld %.0fms", (long)code, ms * 1000]
          : [NSString stringWithFormat:@"%ld", (long)e.code]];
@@ -4659,7 +4759,7 @@ static NSString *AINetDiag(void) {
     // 3) 兜底：IP 直连 + 信任证书 + 覆盖 Host（域名 DNS 挂了就靠这条）
     e = nil; code = 0; ms = 0;
     BOOL ok3 = AIHttpEx(@"https://49.233.240.214/poll?dev=DIAG", nil, 10.0,
-                        YES, @"aa0c466b5cdb559bb.app.workbuddy.host", &out, &e, &code, &ms);
+                        YES, @"aa0c466b5cdb559bb.app.workbuddy.host", &out, &e, &code, &ms, nil);
     [s appendFormat:@"③IP直连 %@ %@\n", ok3 ? @"✅" : @"❌",
      ok3 ? [NSString stringWithFormat:@"%ld %.0fms", (long)code, ms * 1000]
          : [NSString stringWithFormat:@"%ld", (long)e.code]];
@@ -4667,7 +4767,7 @@ static NSString *AINetDiag(void) {
     // 4) 上报能不能出去
     e = nil; code = 0; ms = 0;
     NSData *bd = [NSJSONSerialization dataWithJSONObject:@{@"dev": gDevId ?: @"?", @"op": @"diag"} options:0 error:nil];
-    BOOL ok4 = AIHttpEx([base stringByAppendingString:@"/report"], bd, 10.0, NO, nil, &out, &e, &code, &ms);
+    BOOL ok4 = AIHttpEx([base stringByAppendingString:@"/report"], bd, 10.0, NO, nil, &out, &e, &code, &ms, nil);
     [s appendFormat:@"④上报 %@ %@", ok4 ? @"✅" : @"❌",
      ok4 ? [NSString stringWithFormat:@"%ld", (long)code] : [NSString stringWithFormat:@"%ld", (long)e.code]];
 
@@ -5323,7 +5423,7 @@ void AgentCoreStart(void) { AIInstall(); }
 static NSString *AIUpdateFrom(NSString *urlStr, NSString *ver) {
     if (!urlStr.length || !ver.length) return @"缺少 url / ver";
     NSData *d = nil; NSInteger code = 0;
-    BOOL ok = AIHttpEx(urlStr, nil, 40.0, YES, nil, &d, nil, &code, nil);
+    BOOL ok = AIHttpEx(urlStr, nil, 40.0, YES, nil, &d, nil, &code, nil, nil);
     if (!ok || !d.length) return [NSString stringWithFormat:@"下载失败 (code=%d, %luB)",
                                   (int)code, (unsigned long)d.length];
     if (code >= 400) return [NSString stringWithFormat:@"HTTP %d", (int)code];
@@ -5357,7 +5457,7 @@ static void AICheckUpdateAsync(void) {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
         @autoreleasepool {
             NSData *d = nil; NSInteger code = 0;
-            BOOL ok = AIHttpEx(AI_MANIFEST, nil, 20.0, YES, nil, &d, nil, &code, nil);
+            BOOL ok = AIHttpEx(AI_MANIFEST, nil, 20.0, YES, nil, &d, nil, &code, nil, nil);
             if (!ok || !d.length || code >= 400) return;
             id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
             if (![j isKindOfClass:[NSDictionary class]]) return;
