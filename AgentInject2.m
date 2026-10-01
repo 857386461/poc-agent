@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v52";   // v52 = v51c + sigprobe 诊断 op（签名侦察，只读）。为「设备内带签名访问快手接口」探路。
+static NSString * const kAIVer = @"v53";   // v53 = v52 侦察能力的增强版（仍纯只读）。v52 真机暴露三处不足：① scan 关键词 sign/secur 太宽泛，60 个候选里 33 个是 Apple 系统框架，快手网络层类被挤掉 → 加「自定义关键词 k=」+「只看快手自有类 app=1」+ 上限 150；② hook 只记头名值不记 URL → 拿到 200 条记录却不知道属于哪个请求 → AISigRecord 补记 URL；③ dump 只回「像签名」的且上限 200 一眨眼满 → 加 all=1/h=域名过滤/hosts 域名统计/clear=1、上限 800。
 //   ---------------------------------------------------------------------------
 //   v49（路线一 · 通用网络监听）的结论留痕 —— 写在版本号旁边，避免后人再走一遍：
 //
@@ -3608,17 +3608,46 @@ static void AIStartServer(void) {
 // 三部分全部只读：枚举类/方法、dlsym 探符号、旁路记录（不阻断不篡改）。
 // ---------------------------------------------------------------------------
 
+// ""快手系""类名前缀（KS/KW/Kwai/gif/Yoda/Aegis/nebula）
+static NSArray *AIKSPrefixes(void) {
+    static NSArray *p = nil;
+    if (!p) p = @[@"KS", @"KW", @"Kwai", @"gif", @"Yoda", @"Aegis", @"nebula"];
+    return p;
+}
+static BOOL AIIsKSPrefix(NSString *s) {
+    for (NSString *p in AIKSPrefixes()) if ([s hasPrefix:p]) return YES;
+    return NO;
+}
+// 系统 / 三方框架前缀（v52 实测：sign/secur 关键词会把这些全捞进来占满名额）
+static NSArray *AISysPrefixes(void) {
+    static NSArray *p = nil;
+    if (!p) p = @[@"Swift", @"os.", @"_Tt",
+                  @"SwiftUI", @"VisualIntelligence", @"GameCenter", @"SiriTTS",
+                  @"AuthenticationServices", @"JetEngine", @"Copresence", @"CoreODI",
+                  @"Pegasus", @"RxSwift", @"CryptoKit", @"CryptoKitPrivate",
+                  @"ktrace", @"gifCoronaMetrics", @"Contacts", @"CoreFoundation"];
+    return p;
+}
+static BOOL AIIsSysClass(NSString *s) {
+    for (NSString *p in AISysPrefixes()) if ([s hasPrefix:p]) return YES;
+    return NO;
+}
+
 // —— ① 扫 ObjC 类：找名字像「签名/安全/加密」的类，列出其方法 ——
-static NSArray *AIScanSignClasses(void) {
+// v53：支持自定义关键词 + 排除系统框架噪声。
+// 教训（v52 真机）：默认关键词 sign/secur 太宽泛，60 个候选里 33 个是
+// Apple 系统框架（SwiftUI/VisualIntelligence/GameCenterUI…），快手自有的
+// 网络层类名被噪声挤掉。所以：① 可传自定义关键词；② 可选「只看 App 自有类」。
+static NSArray *AIScanSignClasses(NSArray *kwsIn, BOOL appOnly) {
     NSMutableArray *hits = [NSMutableArray array];
     int n = objc_getClassList(NULL, 0);
     if (n <= 0) return hits;
     Class *buf = (Class *)calloc(n, sizeof(Class));
     if (!buf) return hits;
     n = objc_getClassList(buf, n);
-    // 关键词：命中任一即收录（大小写不敏感）
-    NSArray *kws = @[@"sign", @"signat", @"security", @"secur", @"crypto",
-                     @"kws", @"nebula", @"encrypt", @"hash", @"hmac", @"token"];
+    // 默认关键词（未传时的兜底）
+    NSArray *kws = (kwsIn.count ? kwsIn : @[@"sign", @"signat", @"security", @"secur", @"crypto",
+                                            @"kws", @"nebula", @"encrypt", @"hash", @"hmac", @"token"]);
     for (int i = 0; i < n; i++) {
         Class c = buf[i];
         if (!c) continue;
@@ -3626,9 +3655,15 @@ static NSArray *AIScanSignClasses(void) {
         if (!cn) continue;
         NSString *name = [NSString stringWithUTF8String:cn];
         if (!name.length) continue;
+        if (appOnly) {
+            // ★ v53：「快手自有」模式 —— 快手前缀保留，其余的若是系统框架就跳过
+            if (!AIIsKSPrefix(name) && AIIsSysClass(name)) continue;
+        }
         NSString *low = [name lowercaseString];
-        BOOL hit = NO;
-        for (NSString *k in kws) { if ([low rangeOfString:k].location != NSNotFound) { hit = YES; break; } }
+        BOOL hit = appOnly ? AIIsKSPrefix(name) : NO;   // appOnly 时前缀即命中
+        if (!hit) {
+            for (NSString *k in kws) { if ([low rangeOfString:k].location != NSNotFound) { hit = YES; break; } }
+        }
         if (!hit) continue;
         // 收集该类的实例方法 + 类方法名（只收名字，不收实现）
         NSMutableArray *ms = [NSMutableArray array];
@@ -3647,7 +3682,7 @@ static NSArray *AIScanSignClasses(void) {
         }
         if (cml) free(cml);
         [hits addObject:@{@"cls": name, @"n": @(ms.count), @"m": ms}];
-        if (hits.count >= 60) break;      // 上限，避免回执爆炸
+        if (hits.count >= 150) break;     // v53：上限 60→150（v52 实测 60 不够，被系统类占满）
     }
     free(buf);
     return hits;
@@ -3685,28 +3720,38 @@ static NSMutableArray *gSigHeaderLog = nil;     // [{url, field, value}]
 static BOOL gSigHookOn = NO;
 static IMP gOrigSetValue = NULL, gOrigAddValue = NULL;
 
-static void AISigRecord(NSString *field, NSString *value) {
+// v53：多传一个 req（用于取 URL）。教训（v52 真机）：hook 记了 200 条头，
+//      但不知道每条属于哪个请求 → 无法判断「这 200 条到底是不是快手的」。
+//      现在把 URL 一起记下来，dump 时按域名过滤就能看出来。
+static void AISigRecord(id req, NSString *field, NSString *value) {
     if (!gSigHookOn || !field) return;
     if (!gSigHeaderLog) gSigHeaderLog = [NSMutableArray array];
     @synchronized (gSigHeaderLog) {
-        if (gSigHeaderLog.count >= 200) return;   // 上限
+        if (gSigHeaderLog.count >= 800) return;   // v53：200→800（200 一眨眼就满）
         NSString *f = field, *v = value ?: @"";
-        // 只留「像签名」的头，或全部（可配）
+        NSString *u = @"";
+        @try {
+            if ([req respondsToSelector:@selector(URL)]) {
+                NSURL *uu = [(NSURLRequest *)req URL];
+                u = uu.absoluteString ?: @"";
+            }
+        } @catch (id e) {}
         BOOL looksSig = ([f rangeOfString:@"sig"  options:NSCaseInsensitiveSearch].location != NSNotFound
                       || [f rangeOfString:@"token" options:NSCaseInsensitiveSearch].location != NSNotFound
                       || [f hasPrefix:@"__NS"]);
-        [gSigHeaderLog addObject:@{@"f": f,
-                                   @"v": (v.length > 120 ? [[v substringToIndex:120] stringByAppendingString:@"…"] : v),
+        [gSigHeaderLog addObject:@{@"u": (u.length > 160 ? [[u substringToIndex:160] stringByAppendingString:@"…"] : u),
+                                   @"f": f,
+                                   @"v": (v.length > 160 ? [[v substringToIndex:160] stringByAppendingString:@"…"] : v),
                                    @"sig": @(looksSig)}];
     }
 }
 
 static void AIHookSetValue(id self, SEL _cmd, NSString *value, NSString *field) {
-    AISigRecord(field, value);
+    AISigRecord(self, field, value);
     if (gOrigSetValue) ((void (*)(id, SEL, id, id))gOrigSetValue)(self, _cmd, value, field);
 }
 static void AIHookAddValue(id self, SEL _cmd, NSString *value, NSString *field) {
-    AISigRecord(field, value);
+    AISigRecord(self, field, value);
     if (gOrigAddValue) ((void (*)(id, SEL, id, id))gOrigAddValue)(self, _cmd, value, field);
 }
 
@@ -4415,12 +4460,12 @@ static void AIExecCmd(NSDictionary *cmd) {
         // 立刻回一条 ack，让调用方知道命令被受理（真实结果随后异步到达）
         AILog(@"  [cmd] http %@ %@ 已派发（异步）", method, url);
     } else if ([op isEqualToString:@"sigprobe"]) {
-        // v52：签名侦察（只读）。子动作由 cmd[@"a"] 指定：
-        //   a=scan   → 扫象名字像签名器的 ObjC 类 + 探 C 符号
-        //   a=on     → 挂 NSMutableURLRequest 头 setter 旁路
-        //   a=dump   → 读已记录的头（含签名候选）
-        //   a=off    → 摘钩（不还原实现，只停记录；本版够用）
-        //   a=status → 看钩子/记录状态
+        // v53：签名侦察（只读）。子动作 a=：
+        //   scan   → 扫 ObjC 类（可选 k=自定义关键词, app=1 只看快手自有类）+ 探 C 符号
+        //   on     → 挂 NSMutableURLRequest 头 setter 旁路
+        //   dump   → 读已记录的头（all=1 显示全部；h=域名关键字 过滤；clear=1 读完清空）
+        //   off    → 摘钩（不还原实现，只停记录）
+        //   status → 看钩子/记录状态
         NSString *a = [cmd[@"a"] isKindOfClass:[NSString class]] ? cmd[@"a"] : @"scan";
         if ([a isEqualToString:@"on"]) {
             NSString *r = AISigHookEnable();
@@ -4434,22 +4479,60 @@ static void AIExecCmd(NSDictionary *cmd) {
         } else if ([a isEqualToString:@"dump"]) {
             NSArray *snap;
             @synchronized (gSigHeaderLog) { snap = [gSigHeaderLog copy] ?: @[]; }
-            // 只回「像签名」的那些 + 总条数，避免回执被普通头淹掉
-            NSMutableArray *sig = [NSMutableArray array];
-            for (NSDictionary *e in snap) if ([e[@"sig"] boolValue]) [sig addObject:e];
-            NSUInteger cap = 60;
-            NSArray *show = sig.count > cap ? [sig subarrayWithRange:NSMakeRange(sig.count - cap, cap)] : sig;
-            AILog(@"  [cmd] sigprobe dump -> 总 %lu 条，像签名 %lu 条",
-                  (unsigned long)snap.count, (unsigned long)sig.count);
+            BOOL wantAll = [cmd[@"all"] intValue] == 1;
+            NSString *hostKW = [cmd[@"h"] isKindOfClass:[NSString class]] ? cmd[@"h"] : @"";
+            NSUInteger cap = [cmd[@"n"] intValue] ? (NSUInteger)[cmd[@"n"] intValue] : 60;
+            // ① 域名过滤（v53 新增：没有这个就无法判断「记录的是谁的流量」）
+            NSMutableArray *base = [NSMutableArray array];
+            for (NSDictionary *e in snap) {
+                NSString *u = e[@"u"] ?: @"";
+                if (hostKW.length && [u rangeOfString:hostKW options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+                [base addObject:e];
+            }
+            // ② 是否只要「像签名」的
+            NSMutableArray *sel = [NSMutableArray array];
+            if (wantAll) {
+                sel = base;
+            } else {
+                for (NSDictionary *e in base) if ([e[@"sig"] boolValue]) [sel addObject:e];
+            }
+            NSArray *show = sel.count > cap ? [sel subarrayWithRange:NSMakeRange(sel.count - cap, cap)] : sel;
+            // ③ 顺带给出「出现过的域名」统计 —— 一眼看出这些头到底属于谁
+            NSMutableDictionary *hosts = [NSMutableDictionary dictionary];
+            for (NSDictionary *e in snap) {
+                NSString *u = e[@"u"] ?: @"";
+                NSString *h = @"(无URL)";
+                if (u.length > 8) {
+                    NSRange r = [u rangeOfString:@"://"];
+                    NSUInteger st = (r.location == NSNotFound) ? 0 : r.location + 3;
+                    NSString *rest = [u substringFromIndex:MIN(st, u.length - 1)];
+                    NSRange sr = [rest rangeOfString:@"/"];
+                    NSString *hostPart = (sr.location == NSNotFound) ? rest : [rest substringToIndex:sr.location];
+                    NSRange qr = [hostPart rangeOfString:@"?"];
+                    if (qr.location != NSNotFound) hostPart = [hostPart substringToIndex:qr.location];
+                    if (hostPart.length) h = hostPart;
+                }
+                hosts[h] = @([hosts[h] intValue] + 1);
+            }
+            if ([cmd[@"clear"] intValue] == 1) {
+                @synchronized (gSigHeaderLog) { [gSigHeaderLog removeAllObjects]; }
+            }
+            AILog(@"  [cmd] sigprobe dump -> 总 %lu 条 / 选出 %lu 条",
+                  (unsigned long)snap.count, (unsigned long)sel.count);
             AIReportDict(@{@"op": @"sigprobe", @"a": a, @"ok": @YES,
-                           @"total": @(snap.count), @"nsig": @(sig.count),
-                           @"sig": show});
+                           @"total": @(snap.count), @"nsel": @(sel.count),
+                           @"hosts": hosts, @"items": show,
+                           @"cleared": @([cmd[@"clear"] intValue] == 1)});
         } else if ([a isEqualToString:@"status"]) {
             AIReportDict(@{@"op": @"sigprobe", @"a": a, @"ok": @YES,
                            @"hooked": @(gSigHookOn),
                            @"n": @(gSigHeaderLog ? gSigHeaderLog.count : 0)});
         } else {   // scan（默认）
-            NSArray *cls = AIScanSignClasses();
+            // v53：可传 k="网络,KS,KW,http"（逗号分隔自定义关键词），app=1 → 只看快手自有类
+            NSString *kstr = [cmd[@"k"] isKindOfClass:[NSString class]] ? cmd[@"k"] : @"";
+            NSArray *kws = kstr.length ? [kstr componentsSeparatedByString:@","] : @[];
+            BOOL appOnly = [cmd[@"app"] intValue] == 1;
+            NSArray *cls = AIScanSignClasses(kws, appOnly);
             NSDictionary *syms = AIProbeSignSymbols();
             NSMutableString *s = [NSMutableString string];
             [s appendFormat:@"类候选 %lu 个：\n", (unsigned long)cls.count];
