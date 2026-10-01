@@ -4258,7 +4258,8 @@ static void AIExecCmd(NSDictionary *cmd) {
         NSMutableURLRequest *rqC = [rq copy];
         [NSThread detachNewThreadWithBlock:^{
             @autoreleasepool {
-                NSData *out = nil; NSError *e = nil; NSInteger code = 0;
+                // ★ 必须 __block：这三者要被内层 completionHandler block 写入
+                __block NSData *out = nil; __block NSError *e = nil; __block NSInteger code = 0;
                 dispatch_semaphore_t sem = dispatch_semaphore_create(0);
                 NSDate *t0 = [NSDate date];
                 NSURLSessionDataTask *t = [[NSURLSession sharedSession]
