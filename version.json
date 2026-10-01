@@ -1,10 +1,10 @@
 {
  "ver": "51",
- "tag": "inject2-87",
- "url": "https://github.com/857386461/poc-agent/releases/download/inject2-87/AgentInject2.dylib",
+ "tag": "inject2-88",
+ "url": "https://github.com/857386461/poc-agent/releases/download/inject2-88/AgentInject2.dylib",
  "asset_size": 557648,
- "local": "AgentInject2-v51.dylib",
- "md5": "88c4ed2c705e5781f822f89853986fdc",
+ "local": "AgentInject2-v51b.dylib",
+ "md5": "ecc9cb6c945f2012d52a0370ac2dfb81",
  "prev": {
   "ver": "40",
   "tag": "inject2-66",
@@ -12,8 +12,8 @@
   "md5": "606e28cd01a07a1b92d758adf9f89e0d",
   "note": "v40 = v39 + G30 根治：AIReportDict 回执 POST 与轮询同待遇（gActiveBase 为 IP 兜底 https://4 时同样 trustAny+Host 覆盖回域名），根除「飞行模式→切 IP→回执 -1202 证书无效→上行单边全灭→看门狗盲区→死锁到杀 App」链；另补 status ops 清单串 ocr vfind（v39 遗留）。判据：run66 he"
  },
- "note": "v51 = v50 + 通用 HTTP 原语。① AIHttpEx 尾部新增 NSDictionary *headers 参数（自定义请求头，8 个旧调用点传 nil 保持原行为，完全向后兼容）；② 新增 http op：{op:'http',url,method,headers,body,tmo,cookieJar}，cookieJar=1 自动附本进程 Cookie 且只发与目标域相关的。回执 {ok,code,ms,len,nCookie,text,err}，text 上限 20000 字符。为什么进插件：沙箱脚本发请求要手抄 Cookie/设备指纹、抄错就废、过期就失效，而设备内发请求 Cookie 就在 NSHTTPCookieStorage 里、指纹天然真实——这是「通用能力」与「App 专属胶水」的分界线（会话主拍板「写进插件内」）。",
+ "note": "v51b = v51 修正版（★ 关键：v51 首版漏改 ops 列表，导致设备不认 http op）。改动：① http op 全量落地（与 tap/scroll 平级，含 cookieJar 自动带本进程 Cookie、method/headers/body 全交给调用方）；② AIHttpEx 尾部加 NSDictionary *headers 参数，8 个旧调用点传 nil 向后兼容；③ ★ 修正 status 的 ops 列表补上 'http' —— 原先漏加，设备端 status 回显无 http，且实测发 http 命令被静默丢弃（lastOp 不更新、无回执）。判据：run88 全 step success；产物 md5 ecc9cb6c945f2012d52a0370ac2dfb81；strings 验证 ops 串含 'probe http'（旧版为 'probe' 后直接 back）。",
  "min": "30",
- "verify": "判版本用 ks.py status / wayfind.alive() 主动取实时回执（中继缓存会滞后，G16）。判 v51 生效：发 {op:'probe'} 之外的 http 探测，或看 status 返回 ver=v51。",
+ "verify": "判 v51b 生效：① status 回执 ops 串应含 'http'；② 发 {op:'http',url:'https://www.baidu.com'} 应 5~10s 内回执，含 code=200。★ 检索法教训：不要用 strings 搜带空格/中文的字符串常量（编译器会合并/重排），判分支有无要认 ops 串和实测回执，不能只看 strings。",
  "redline": "改 C 函数签名时 前向声明/定义/调用点 三处一起改（G12 类）。http op 不得进 kTouchOps（只读类，不该点亮罩层）。★★ CI 判据纠正（G73）：run.conclusion==failure ≠ 编译失败，必须查 jobs 的 step 级 conclusion 与 inject2log-N 的 ERROR LINES 是否为空。上一轮 buildctl.py 的提示「改 C 函数签名时三处一起改」是脚本猜测，不是编译器输出 —— 差点误修。"
 }
