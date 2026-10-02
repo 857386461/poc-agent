@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v54";   // v54 = v53 侦察「记录保真度」修复（仍纯只读）。v53 真机暴露：① URL/value 截断 160 太狠，__NS_sig3 / kuaishou.api_st / __NSWJ 全被切掉，抄回来的头不全 → 提到 600 并显式标 ⟨TRUNC⟩；② 我们自己的中继流量占了 800 名额里的一大块（实测 315 条中 78 条）→ 在 AISigRecord 入口直接丢弃 workbuddy.host；③ 不记 method/body → POST 接口无从复刻 → 补录 m/b。
+static NSString * const kAIVer = @"v55";   // v55 = 侦察「记录结构」重构 + 重放验证通道（仍纯只读，且 replay 有读写白名单闸门）。v54 真机暴露的三件事：① 600 还是不够 —— 快手业务 URL 实测接近 2000 字符（51 个查询参数）、body 也常 >600，截完根本没法原样重放（clock/r 重放实测 result=40 缺鉴权）；② 记录是「一个头一条」摊平的，449 条里同一个请求的头被拆成 8~13 条碎片，得靠脚本按 URL 反聚合，而 URL 又被截了 → 反聚合都对不齐；③ 沙箱转发完整 URL 要来回传 2000 字符，易错且占中继带宽。修法：① 单字段上限 600→4000（dump 可用 maxlen= 调）；② 改成**按请求对象聚合**：以 req 指针为 key 存 NSMapTable，value 里强引用 req 保活防地址复用，一次 dump 直接拿到「完整请求快照」（url+method+body+全套头）；③ 新增 a=replay：在设备内原地重建请求重放，但**必须过只读白名单**（含 report/claim/divide/register/complete 一律拒绝）。
 //   ---------------------------------------------------------------------------
 //   v49（路线一 · 通用网络监听）的结论留痕 —— 写在版本号旁边，避免后人再走一遍：
 //
@@ -3730,27 +3730,60 @@ static NSDictionary *AIProbeSignSymbols(void) {
 }
 
 // —— ③ 旁路：hook NSMutableURLRequest 的 header setter，只记录不改 ——
-static NSMutableArray *gSigHeaderLog = nil;     // [{url, field, value}]
+//
+//  ★ v55 结构重构（v54 真机逼出来的）：
+//    原来 gSigHeaderLog 是「一个头一条记录」的摊平数组 —— 同一个请求的 8~13 个头
+//    被拆成 8~13 条碎片，沙箱侧只能按 URL 反聚合；而 URL 又被截到 600 →
+//    同一请求的不同头记录里 URL 字符串还可能不一致（快手先设头后 setURL 加参数），
+//    反聚合根本对不齐。改成 **以 req 指针为 key 的槽位**：
+//      · key 用 OpaqueMemory（纯指针比较，不走 isEqual 深比较，快且不误合并）
+//      · value 里强引用 req 本身 → 对象保活 → 地址不会被新对象复用（G87）
+//      · 一次 dump 直接拿到 {url, method, body, 全套头} 的完整请求快照
+static NSMapTable *gSigReqs = nil;              // (void*)req -> NSMutableDictionary 槽位
+static NSMutableArray *gSigOrder = nil;         // 槽位数组（强引用 slot，保证 dump 顺序 = 发生顺序）
+static NSObject *gSigLock = nil;                // 专用锁（不能拿 gSigReqs 当锁：它会被重建）
 static BOOL gSigHookOn = NO;
 static IMP gOrigSetValue = NULL, gOrigAddValue = NULL;
 
-// v53：多传一个 req（用于取 URL）。教训（v52 真机）：hook 记了 200 条头，
-//      但不知道每条属于哪个请求 → 无法判断「这 200 条到底是不是快手的」。
-//      现在把 URL 一起记下来，dump 时按域名过滤就能看出来。
-// 截断上限（v54：160→600。教训：真机 URL 带几十个查询参数、Cookie 几百字符，
-//                160 会把 __NS_sig3 / kuaishou.api_st / __NSWJ 全部切掉，抄不全 = 白抓）
-#define AISIG_TRUNC 600
+// 截断上限（v53:160 → v54:600 → v55:4000）
+//   600 仍然不够：快手业务 URL 实测接近 2000 字符（51 个查询参数）、
+//   body 常见 >600（xinhui 搜索那条 608 就是被截后的长度）。
+//   「抄不全 = 不能原样重放」—— v54 重放 clock/r 拿到的就是 result=40 缺鉴权。
+#define AISIG_TRUNC 4000
+#define AISIG_MAXREQ 600          // 最多记 600 个请求对象（每个含全套头，内存可控）
 
-static NSString *AITrunc(NSString *s) {
+static NSString *AITruncN(NSString *s, NSUInteger n) {
     if (!s) return @"";
-    return (s.length > AISIG_TRUNC) ? [[s substringToIndex:AISIG_TRUNC] stringByAppendingString:@"…⟨TRUNC⟩"] : s;
+    if (n == 0) n = AISIG_TRUNC;
+    return (s.length > n) ? [[s substringToIndex:n] stringByAppendingString:@"…⟨TRUNC⟩"] : s;
+}
+static NSString *AITrunc(NSString *s) { return AITruncN(s, AISIG_TRUNC); }
+
+static NSMutableDictionary *AISigSlotFor(id req, NSString *url) {
+    // 必须在 gSigReqs 的锁内调用
+    if (!gSigReqs) {
+        gSigReqs = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsOpaqueMemory
+                                        valueOptions:NSPointerFunctionsStrongMemory];
+    }
+    if (!gSigOrder) gSigOrder = [NSMutableArray array];
+    NSMutableDictionary *slot = [gSigReqs objectForKey:(__bridge void *)req];
+    if (!slot) {
+        if (gSigOrder.count >= AISIG_MAXREQ) return nil;
+        slot = [NSMutableDictionary dictionary];
+        slot[@"h"] = [NSMutableDictionary dictionary];   // 头
+        slot[@"k"] = [NSString stringWithFormat:@"%p", (void *)req];
+        slot[@"req"] = req;                              // ★ 强引用保活：防地址复用（G87）
+        slot[@"t"] = @((long long)[[NSDate date] timeIntervalSince1970]);
+        [gSigReqs setObject:slot forKey:(__bridge void *)req];
+        [gSigOrder addObject:slot];                      // 存 slot 本体，dump 直接按序取
+    }
+    return slot;
 }
 
 static void AISigRecord(id req, NSString *field, NSString *value) {
     if (!gSigHookOn || !field) return;
-    if (!gSigHeaderLog) gSigHeaderLog = [NSMutableArray array];
-    // ★ v54：先把 URL 取出来，若是咱们自己的中继流量就直接丢 —— 否则 800 个名额
-    //   几百条就被自己占满（v53 实测：315 条里 78 条是中继），快手真流量只能捡剩的。
+    // ★ v54：先把 URL 取出来，若是咱们自己的中继流量就直接丢 —— 否则名额
+    //   一大半被自己占满（v53 实测：315 条里 78 条是中继），快手真流量只能捡剩的。
     NSString *u0 = @"";
     @try {
         if ([req respondsToSelector:@selector(URL)]) {
@@ -3759,29 +3792,71 @@ static void AISigRecord(id req, NSString *field, NSString *value) {
         }
     } @catch (id e) {}
     if ([u0 rangeOfString:@"workbuddy.host"].location != NSNotFound) return;   // 中继：丢弃
-    @synchronized (gSigHeaderLog) {
-        if (gSigHeaderLog.count >= 800) return;
-        NSString *f = field, *v = value ?: @"";
-        NSString *u = u0; NSString *m = @""; NSString *bd = @"";
+
+    if (!gSigLock) gSigLock = [NSObject new];
+    @synchronized (gSigLock) {
+        NSMutableDictionary *slot = AISigSlotFor(req, u0);
+        if (!slot) return;
+        // ★ v55：我们自己 replay 发出的请求带 X-AI-Replay 头 → 反手把它从记录里剔掉，
+        //   否则重放一次就污染一条，多试几次名额全是我们自己。
+        if ([field caseInsensitiveCompare:@"X-AI-Replay"] == NSOrderedSame) {
+            [gSigReqs removeObjectForKey:(__bridge void *)req];
+            [gSigOrder removeObjectIdenticalTo:slot];
+            return;
+        }
+        if (u0.length) slot[@"u"] = u0;                       // ★ 存原始完整 URL，dump 时才截
         @try {
-            if ([req respondsToSelector:@selector(HTTPMethod)]) m = [(NSURLRequest *)req HTTPMethod] ?: @"";
-            // v54：把 body 也记下来（POST 接口全靠它）。只取前若干字节，避免回执爆炸。
+            if ([req respondsToSelector:@selector(HTTPMethod)]) {
+                NSString *mm = [(NSURLRequest *)req HTTPMethod];
+                if (mm.length) slot[@"m"] = mm;
+            }
             if ([req respondsToSelector:@selector(HTTPBody)]) {
                 NSData *d = [(NSURLRequest *)req HTTPBody];
                 if (d.length) {
                     NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-                    bd = s ?: [NSString stringWithFormat:@"<非UTF8 %lu字节>", (unsigned long)d.length];
+                    slot[@"b"] = s ?: [NSString stringWithFormat:@"<非UTF8 %lu字节>", (unsigned long)d.length];
                 }
             }
+            if ([req respondsToSelector:@selector(allHTTPHeaderFields)]) {
+                NSDictionary *ah = [(NSURLRequest *)req allHTTPHeaderFields];
+                if (ah.count) slot[@"ah"] = ah;               // 兜底：万一漏了某个头
+            }
         } @catch (id e) {}
-        BOOL looksSig = ([f rangeOfString:@"sig"  options:NSCaseInsensitiveSearch].location != NSNotFound
-                      || [f rangeOfString:@"token" options:NSCaseInsensitiveSearch].location != NSNotFound
-                      || [f hasPrefix:@"__NS"]);
-        [gSigHeaderLog addObject:@{@"u": AITrunc(u), @"f": f, @"v": AITrunc(v),
-                                   @"m": m, @"b": AITrunc(bd),
-                                   @"sig": @(looksSig)}];
+        NSMutableDictionary *h = slot[@"h"];
+        h[field] = value ?: @"";
     }
 }
+
+// dump 用：把槽位整理成可 JSON 化的字典（此时才截断，截断长度由调用方定）
+static NSArray *AISigSnapshot(NSUInteger maxlen) {
+    NSMutableArray *out = [NSMutableArray array];
+    if (!gSigOrder) return out;
+    if (!gSigLock) gSigLock = [NSObject new];
+    @synchronized (gSigLock) {
+        for (NSMutableDictionary *slot in gSigOrder) {
+            NSMutableDictionary *h = [NSMutableDictionary dictionary];
+            NSDictionary *src = slot[@"h"];
+            NSMutableDictionary *merged = [NSMutableDictionary dictionary];
+            if ([slot[@"ah"] isKindOfClass:[NSDictionary class]]) [merged addEntriesFromDictionary:slot[@"ah"]];
+            [merged addEntriesFromDictionary:src];      // hook 记的优先
+            for (NSString *f in merged) h[f] = AITruncN([merged[f] description], maxlen);
+            [out addObject:@{@"k": slot[@"k"] ?: @"",
+                             @"u": AITruncN(slot[@"u"], maxlen),
+                             @"m": slot[@"m"] ?: @"",
+                             @"b": AITruncN(slot[@"b"], maxlen),
+                             @"t": slot[@"t"] ?: @0,
+                             @"n": @(h.count),
+                             @"h": h}];
+        }
+    }
+    return out;
+}
+
+static void AISigClear(void) {
+    if (gSigReqs) [gSigReqs removeAllObjects];   // 释放对 req 的强引用，内存回落
+    [gSigOrder removeAllObjects];
+}
+static NSUInteger AISigCount(void) { return gSigOrder ? gSigOrder.count : 0; }
 
 static void AIHookSetValue(id self, SEL _cmd, NSString *value, NSString *field) {
     AISigRecord(self, field, value);
@@ -4498,9 +4573,13 @@ static void AIExecCmd(NSDictionary *cmd) {
         AILog(@"  [cmd] http %@ %@ 已派发（异步）", method, url);
     } else if ([op isEqualToString:@"sigprobe"]) {
         // v53：签名侦察（只读）。子动作 a=：
+        // v55 子动作一览（a=）：
         //   scan   → 扫 ObjC 类（可选 k=自定义关键词, app=1 只看快手自有类）+ 探 C 符号
         //   on     → 挂 NSMutableURLRequest 头 setter 旁路
-        //   dump   → 读已记录的头（all=1 显示全部；h=域名关键字 过滤；clear=1 读完清空）
+        //   dump   → 读已记录的**请求快照**（all=1 全出；h=域名；path=路径；i=下标；
+        //            n=条数；maxlen=截断长度；clear=1 读完清空）
+        //   replay → i=下标 取一条，dry=1（默认）只回显完整原文，dry=0 才真发
+        //            ★ 真发要过两道红线：写语义关键词黑名单 + 只读接口白名单
         //   off    → 摘钩（不还原实现，只停记录）
         //   status → 看钩子/记录状态
         NSString *a = [cmd[@"a"] isKindOfClass:[NSString class]] ? cmd[@"a"] : @"scan";
@@ -4512,29 +4591,56 @@ static void AIExecCmd(NSDictionary *cmd) {
         } else if ([a isEqualToString:@"off"]) {
             gSigHookOn = NO;
             AILog(@"  [cmd] sigprobe off");
-            AIReportDict(@{@"op": @"sigprobe", @"a": a, @"ok": @YES, @"n": @(gSigHeaderLog.count)});
-        } else if ([a isEqualToString:@"dump"]) {
-            NSArray *snap;
-            @synchronized (gSigHeaderLog) { snap = [gSigHeaderLog copy] ?: @[]; }
-            BOOL wantAll = [cmd[@"all"] intValue] == 1;
+            AIReportDict(@{@"op": @"sigprobe", @"a": a, @"ok": @YES, @"n": @(AISigCount())});
+        } else if ([a isEqualToString:@"dump"] || [a isEqualToString:@"replay"]) {
+            // ★ v55：dump 出的不再是一条条头碎片，而是 **一个请求一份完整快照**
+            //   {k(槽位号), u(完整URL), m(方法), b(完整body), n(头数), h(全套头)}
+            //   参数：all=1 全出（默认只出「像签名/业务」的）；h=域名关键字；path=路径关键字；
+            //        n=条数（默认 20，注意回执体积）；maxlen=单字段截断长度（默认 4000，0=不截）；
+            //        clear=1 读完清空；i=槽位下标 → 只出这一条（配合 maxlen=0 拿全量原文）
+            NSUInteger maxlen = [cmd[@"maxlen"] respondsToSelector:@selector(intValue)]
+                              ? (NSUInteger)[cmd[@"maxlen"] intValue] : AISIG_TRUNC;
+            if ([cmd[@"maxlen"] intValue] == 0 && [cmd[@"maxlen"] isKindOfClass:[NSString class]]
+                && [(NSString *)cmd[@"maxlen"] isEqualToString:@"0"]) maxlen = 4000;
+            if (![cmd objectForKey:@"maxlen"]) maxlen = AISIG_TRUNC;
+            NSArray *snap = AISigSnapshot(maxlen);
             NSString *hostKW = [cmd[@"h"] isKindOfClass:[NSString class]] ? cmd[@"h"] : @"";
-            NSUInteger cap = [cmd[@"n"] intValue] ? (NSUInteger)[cmd[@"n"] intValue] : 60;
-            // ① 域名过滤（v53 新增：没有这个就无法判断「记录的是谁的流量」）
+            NSString *pathKW = [cmd[@"path"] isKindOfClass:[NSString class]] ? cmd[@"path"] : @"";
+            NSUInteger cap = [cmd[@"n"] intValue] ? (NSUInteger)[cmd[@"n"] intValue] : 20;
+            NSInteger wantI  = [cmd[@"i"] respondsToSelector:@selector(intValue)] ? [cmd[@"i"] intValue] : -1;
+
+            // ① 过滤：域名 / 路径 / 指定下标
             NSMutableArray *base = [NSMutableArray array];
             for (NSDictionary *e in snap) {
                 NSString *u = e[@"u"] ?: @"";
                 if (hostKW.length && [u rangeOfString:hostKW options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+                if (pathKW.length && [u rangeOfString:pathKW options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
                 [base addObject:e];
             }
-            // ② 是否只要「像签名」的
+            if (wantI >= 0) {
+                base = (wantI < (NSInteger)snap.count) ? [NSMutableArray arrayWithObject:snap[wantI]] : [NSMutableArray array];
+            }
+            // ② 是否只要「像签名」的槽（URL 含 sig/token，或头里有 sig/token/__NS 字段）
             NSMutableArray *sel = [NSMutableArray array];
-            if (wantAll) {
-                sel = base;
-            } else {
-                for (NSDictionary *e in base) if ([e[@"sig"] boolValue]) [sel addObject:e];
+            BOOL wantAll = [cmd[@"all"] intValue] == 1 || wantI >= 0;
+            for (NSDictionary *e in snap) {
+                if (![base containsObject:e]) continue;
+                if (wantAll) { [sel addObject:e]; continue; }
+                NSString *u = e[@"u"] ?: @"";
+                BOOL hit = ([u rangeOfString:@"sig"   options:NSCaseInsensitiveSearch].location != NSNotFound
+                         || [u rangeOfString:@"token" options:NSCaseInsensitiveSearch].location != NSNotFound);
+                if (!hit) {
+                    NSDictionary *h = e[@"h"];
+                    for (NSString *f in h) {
+                        if ([f rangeOfString:@"sig"   options:NSCaseInsensitiveSearch].location != NSNotFound
+                         || [f rangeOfString:@"token" options:NSCaseInsensitiveSearch].location != NSNotFound
+                         || [f hasPrefix:@"__NS"]) { hit = YES; break; }
+                    }
+                }
+                if (hit) [sel addObject:e];
             }
             NSArray *show = sel.count > cap ? [sel subarrayWithRange:NSMakeRange(sel.count - cap, cap)] : sel;
-            // ③ 顺带给出「出现过的域名」统计 —— 一眼看出这些头到底属于谁
+            // ③ 「出现过的域名」统计 —— 一眼看出这些请求到底属于谁
             NSMutableDictionary *hosts = [NSMutableDictionary dictionary];
             for (NSDictionary *e in snap) {
                 NSString *u = e[@"u"] ?: @"";
@@ -4551,10 +4657,96 @@ static void AIExecCmd(NSDictionary *cmd) {
                 }
                 hosts[h] = @([hosts[h] intValue] + 1);
             }
-            if ([cmd[@"clear"] intValue] == 1) {
-                @synchronized (gSigHeaderLog) { [gSigHeaderLog removeAllObjects]; }
+            if ([cmd[@"clear"] intValue] == 1) { AISigClear(); }
+
+            // ★ replay：把抄到的请求在设备内原样重放（默认 dry=1，只回显不真发）
+            //   红线闸门：dry=0 真发时必须过「只读白名单」，含写语义关键词一律拒绝。
+            if ([a isEqualToString:@"replay"]) {
+                NSInteger idx = wantI;
+                if (idx < 0) idx = (NSInteger)snap.count - 1;      // 默认最后一条
+                if (idx < 0 || idx >= (NSInteger)snap.count) {
+                    AIReportDict(@{@"op": @"sigprobe", @"a": a, @"ok": @NO,
+                                   @"err": [NSString stringWithFormat:@"下标越界 i=%ld / 共 %lu",
+                                            (long)idx, (unsigned long)snap.count]});
+                    return;
+                }
+                NSDictionary *e = snap[idx];
+                NSString *u = e[@"u"] ?: @"";
+                NSString *m = [e[@"m"] length] ? e[@"m"] : @"GET";
+                NSString *b = e[@"b"] ?: @"";
+                NSDictionary *h = e[@"h"] ?: @{};
+                BOOL dry = ![cmd[@"dry"] respondsToSelector:@selector(intValue)] || [cmd[@"dry"] intValue] != 0;
+                if (dry) {
+                    // 只回显完整原文（maxlen 已按调用方指定，默认 4000）
+                    AIReportDict(@{@"op": @"sigprobe", @"a": a, @"ok": @YES, @"dry": @YES,
+                                   @"i": @(idx), @"u": u, @"m": m, @"b": b, @"h": h});
+                    return;
+                }
+                // —— 红线闸门：默认拒绝，只有命中只读白名单才放行 ——
+                NSArray *deny = @[@"report", @"claim", @"divide", @"register", @"complete",
+                                  @"watch", @"draw", @"lottery", @"award", @"withdraw",
+                                  @"exchange", @"submit", @"signin", @"sign_in", @"receive"];
+                NSString *low = u.lowercaseString;
+                for (NSString *w in deny) {
+                    if ([low rangeOfString:w].location != NSNotFound) {
+                        AILog(@"  [cmd] sigprobe replay 被红线拒绝：URL 含『%@』", w);
+                        AIReportDict(@{@"op": @"sigprobe", @"a": a, @"ok": @NO, @"dry": @NO,
+                                       @"err": [NSString stringWithFormat:@"红线拒绝：URL 含写语义关键词『%@』，本 op 只放只读接口", w],
+                                       @"u": u});
+                        return;
+                    }
+                }
+                NSArray *allow = @[@"/xinhui/", @"/clock/r", @"treasurebox", @"basicinfo",
+                                   @"taskpanel", @"search/get", @"/nebula/task/", @"/rest/zt/gp/up/wz"];
+                BOOL ok2 = NO;
+                for (NSString *w in allow) if ([low rangeOfString:w].location != NSNotFound) { ok2 = YES; break; }
+                if (!ok2) {
+                    AIReportDict(@{@"op": @"sigprobe", @"a": a, @"ok": @NO, @"dry": @NO,
+                                   @"err": @"不在只读白名单内，拒绝真发（可先用 dry=1 看原文，再用 http op 自行判断）",
+                                   @"u": u});
+                    return;
+                }
+                // —— 真发（异步，绝不占死轮询线程：G58）——
+                NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:u]
+                                            cachePolicy:NSURLRequestReloadIgnoringCacheData
+                                        timeoutInterval:15.0];
+                rq.HTTPMethod = m;
+                if (b.length) rq.HTTPBody = [b dataUsingEncoding:NSUTF8StringEncoding];
+                for (NSString *f in h) { @try { [rq setValue:[h[f] description] forHTTPHeaderField:f]; } @catch (id ex) {} }
+                [rq setValue:@"1" forHTTPHeaderField:@"X-AI-Replay"];   // 自我标记，避免污染记录
+                __block NSString *bu = u, *bm = m;
+                NSMutableURLRequest *rqC = [rq copy];
+                [NSThread detachNewThreadWithBlock:^{
+                    @autoreleasepool {
+                        __block NSData *out = nil; __block NSError *er = nil; __block NSInteger code = 0;
+                        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                        NSDate *t0 = [NSDate date];
+                        NSURLSessionDataTask *t = [[NSURLSession sharedSession]
+                            dataTaskWithRequest:rqC
+                              completionHandler:^(NSData *dd, NSURLResponse *r, NSError *e2) {
+                                out = dd; er = e2;
+                                if ([r isKindOfClass:[NSHTTPURLResponse class]]) code = [(NSHTTPURLResponse *)r statusCode];
+                                dispatch_semaphore_signal(sem);
+                            }];
+                        [t resume];
+                        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(17.0 * NSEC_PER_SEC)));
+                        NSTimeInterval ms = [[NSDate date] timeIntervalSinceDate:t0];
+                        NSString *txt = out ? [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding] : nil;
+                        if (!txt && out) txt = [out base64EncodedStringWithOptions:0];
+                        if (txt.length > 8000) txt = [[txt substringToIndex:8000] stringByAppendingString:@"…(截断)"];
+                        AILog(@"  [cmd] sigprobe replay %@ %@ -> code=%ld %ldB", bm, bu, (long)code, (long)out.length);
+                        AIReportDict(@{@"op": @"sigprobe", @"a": @"replay", @"ok": @(out != nil && er == nil),
+                                       @"dry": @NO, @"code": @(code), @"ms": @(ms * 1000),
+                                       @"len": @(out.length), @"text": txt ?: @"",
+                                       @"u": bu, @"m": bm,
+                                       @"err": er ? er.localizedDescription : @""});
+                    }
+                }];
+                AILog(@"  [cmd] sigprobe replay %@ %@ 已派发（异步）", m, u);
+                return;
             }
-            AILog(@"  [cmd] sigprobe dump -> 总 %lu 条 / 选出 %lu 条",
+
+            AILog(@"  [cmd] sigprobe dump -> 总 %lu 个请求 / 选出 %lu 个",
                   (unsigned long)snap.count, (unsigned long)sel.count);
             AIReportDict(@{@"op": @"sigprobe", @"a": a, @"ok": @YES,
                            @"total": @(snap.count), @"nsel": @(sel.count),
@@ -4562,8 +4754,7 @@ static void AIExecCmd(NSDictionary *cmd) {
                            @"cleared": @([cmd[@"clear"] intValue] == 1)});
         } else if ([a isEqualToString:@"status"]) {
             AIReportDict(@{@"op": @"sigprobe", @"a": a, @"ok": @YES,
-                           @"hooked": @(gSigHookOn),
-                           @"n": @(gSigHeaderLog ? gSigHeaderLog.count : 0)});
+                           @"hooked": @(gSigHookOn), @"n": @(AISigCount())});
         } else {   // scan（默认）
             // v53：可传 k="网络,KS,KW,http"（逗号分隔自定义关键词），app=1 → 只看快手自有类
             NSString *kstr = [cmd[@"k"] isKindOfClass:[NSString class]] ? cmd[@"k"] : @"";
