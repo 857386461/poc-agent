@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v58";   // v58 = 「call 探测闸」：给 `call` 加 probe=1（只读方法签名，回 want/argTypes/retType）+ 把参数个数判据从「多了才拒」改成「必须恰好相等」。★ 为什么必须有 probe：`call` 用 NSInvocation 按 `getArgumentTypeAtIndex:` 逐槽设参，args 少于 want 时后面几槽是**未初始化内存**，invoke 会拿垃圾指针发消息 → 崩溃/未定义；以前只拦「参数过多」，等于给「参数过少」开了后门。有了 probe，调用方先拿到「这方法要几个参数、每槽什么类型」，再精确构造 args，才能安全地调 KSMWPassportSecurityTools +sig3OnURLPath:method:requestParams:(@, @, @) 这类签名函数。▼ v57 前情：路线 A 落地，新增通用 `call` op（NSInvocation 调 ObjC 类方法，只类方法、参数限 NSString/NSNumber/NSArray/NSDictionary/NSNull、返回值只回可 JSON 化类型、全程 @try + 耗时记账）。★ v56 的 mm=1（按方法名扫）真机挖出签名函数 —— 且 v58 上机复扫又挖出**最关键的统一入口**：KSMWPassportSecurityTools +sig3OnURLPath:method:requestParams:（路径+方法+参数 → sig3）、+signOrSig3OnURLPath:method:requestParams:sigText:sigType:、+checkOnSig3UrlPathWhiteList:，以及 KSLASecurityHandler +customSig3WithPath:parameters:（__NS_sig3）、KSExtensionNetwork +_sig3WithPath:sig:did:、KWAppSignatureBuilder +createTokenSigWithSig:salt:（__NStokensig）、KSSafeModeSignatureDataEncryptor createTokenSigWithSig:clientSalt:、KSGPolicyParser +handleSig3Policy:。这些类**类名里根本没有 sig**（KSLASecurityHandler 只有 Security），只有按方法名才扫得到 —— 彻底印证 v56 的判断。▼ v55/v56 前情：已把「抄+原样重放」跑通（clock/r result=1；签名绑 URL 参数+body、不绑 X-REQUESTID；T+12min 仍有效），并确认想改参数调用必须先拿到签名算法。
+static NSString * const kAIVer = @"v59";   // v59 = 「输出参数支持」：给 `call` 加**可变容器包装**语法 —— 参数写成 {"$mstr":"初值"} / {"$marr":[...]} / {"$mdict":{...}} 即自动构造 NSMutableString/Array/Dictionary，调用后把容器的**最终内容**回传到 out[]。★ 为什么必须有：真机实测调 KSMWPassportSecurityTools +sig3OnURLPath:method:requestParams:sig3PlainText: 时，第 4 个参数 sig3PlainText: 报 `Attempt to mutate immutable object with setString:` —— 它是**输出参数**（函数把算出的明文 setString: 写回给你），传不可变 NSString 必炸。这是 Cocoa 惯用法：形如 `xxxPlainText:` / `result:` 的参数是 by-reference 输出，必须传**可变**容器。有了 out[]，就能把这类函数「算出来的中间明文」捞出来，这是反推签名算法最关键的原料。▼ v58 前情：给 `call` 加 probe=1（只读方法签名，回 want/argTypes/retType）+ 参数个数判据 `>` 改 `!=`（少一个就是拿未初始化内存当参数 → UB）。▼ v57 前情：路线 A 落地，新增通用 `call` op。★ v56 的 mm=1（按方法名扫）真机挖出签名函数 —— v58 上机复扫又挖出**最关键的统一入口**：KSMWPassportSecurityTools +sig3OnURLPath:method:requestParams:（路径+方法+参数 → 64hex）、+sig3OnURLPath:method:requestParams:sig3PlainText:（多一个**输出**明文参数）、+checkOnSig3UrlPathWhiteList:，以及 KSLASecurityHandler +customSig3WithPath:parameters:（前 6 hex 与前者相同 → 共享 sig3 前缀逻辑）、KSExtensionNetwork +_sig3WithPath:sig:did:、KWAppSignatureBuilder +createTokenSigWithSig:salt:（__NStokensig）、KSGPolicyParser +handleSig3Policy:。这些类**类名里根本没有 sig**，只有按方法名才扫得到。▼ v55/v56 前情：已把「抄+原样重放」跑通（clock/r result=1；签名绑 URL 参数+body、不绑 X-REQUESTID；T+12min 仍有效）。
 //   ---------------------------------------------------------------------------
 //   v49（路线一 · 通用网络监听）的结论留痕 —— 写在版本号旁边，避免后人再走一遍：
 //
@@ -4673,12 +4673,35 @@ static void AIExecCmd(NSDictionary *cmd) {
         NSDate *t0 = [NSDate date];
         id outVal = nil;
         NSString *errMsg = @"";
+        // ★ v59：输出参数（by-reference）支持。Cocoa 惯用法：形如 `xxxPlainText:` 的参数
+        //   是**输出**——函数会把算出来的明文 `setString:` 写回你传进去的对象，
+        //   所以必须传**可变**容器（NSMutableString/NSMutableArray/NSMutableDictionary）。
+        //   传不可变 NSString 会炸：`Attempt to mutate immutable object with setString:`（真机实测）。
+        //   语法：参数写成 {"$mstr":"初值"} / {"$marr":[...]} / {"$mdict":{...}} 即自动构造可变容器，
+        //   调用后我们把容器的**最终内容**一并回传（out[]），供调用方读输出。
+        NSMutableArray *outBoxIdx = [NSMutableArray array];       // 记录哪些槽是输出容器
+        NSMutableArray *outBoxObj = [NSMutableArray array];
         @try {
             NSInvocation *inv = [NSInvocation invocationWithMethodSignature:ms];
             inv.selector = target;
             for (NSUInteger i = 0; i < args.count; i++) {
                 id a = args[i];
                 if (a == [NSNull null]) a = nil;
+                // ★ v59：可变容器包装（输出参数）
+                if ([a isKindOfClass:[NSDictionary class]] && [a count] == 1) {
+                    id mk = [(NSDictionary *)a allKeys][0];
+                    id mv = [(NSDictionary *)a objectForKey:mk];
+                    if ([mk isEqualToString:@"$mstr"]) {
+                        id mo = [[NSMutableString alloc] initWithString:([mv isKindOfClass:[NSString class]] ? mv : @"")];
+                        if (mo) { a = mo; [outBoxIdx addObject:@(i)]; [outBoxObj addObject:mo]; }
+                    } else if ([mk isEqualToString:@"$marr"]) {
+                        id mo = [[NSMutableArray alloc] initWithArray:([mv isKindOfClass:[NSArray class]] ? mv : @[])];
+                        if (mo) { a = mo; [outBoxIdx addObject:@(i)]; [outBoxObj addObject:mo]; }
+                    } else if ([mk isEqualToString:@"$mdict"]) {
+                        id mo = [[NSMutableDictionary alloc] initWithDictionary:([mv isKindOfClass:[NSDictionary class]] ? mv : @{})];
+                        if (mo) { a = mo; [outBoxIdx addObject:@(i)]; [outBoxObj addObject:mo]; }
+                    }
+                }
                 const char *t = [ms getArgumentTypeAtIndex:i + 2];
                 if (t && (t[0] == 'i' || t[0] == 'l' || t[0] == 'q' || t[0] == 'I' || t[0] == 'L' || t[0] == 'Q')) {
                     long long v = [a respondsToSelector:@selector(longLongValue)] ? [a longLongValue] : 0;
@@ -4732,9 +4755,26 @@ static void AIExecCmd(NSDictionary *cmd) {
         else { jsonVal = @"<nil>"; clsOf = @"nil"; }
         if ([jsonVal isKindOfClass:[NSString class]] && [(NSString *)jsonVal length] > 8000)
             jsonVal = [[(NSString *)jsonVal substringToIndex:8000] stringByAppendingString:@"…(截断)"];
+        // ★ v59：读回输出参数容器的**最终内容**（函数调完后的值 = 它算出来的明文）
+        NSMutableArray *outs = [NSMutableArray array];
+        for (NSUInteger j = 0; j < outBoxObj.count; j++) {
+            id o = outBoxObj[j];
+            id v = nil;
+            @try {
+                if ([o isKindOfClass:[NSString class]])       v = [o copy];   // NSMutableString 调完已变
+                else if ([o isKindOfClass:[NSArray class]])   v = [o copy];
+                else if ([o isKindOfClass:[NSDictionary class]]) v = [o copy];
+            } @catch (id e) {}
+            // 统一成可 JSON 化
+            if (!v) v = @"";
+            else if (![v isKindOfClass:[NSString class]] && ![v isKindOfClass:[NSNumber class]] &&
+                     ![v isKindOfClass:[NSArray class]] && ![v isKindOfClass:[NSDictionary class]])
+                v = [v description] ?: @"";
+            [outs addObject:@{@"i": outBoxIdx[j], @"v": v}];
+        }
         AILog(@"  [cmd] call %@ +%@ -> %@ %.1fms", cn, sn, clsOf, ms2 * 1000);
         AIReportDict(@{@"op": @"call", @"ok": @(errMsg.length == 0), @"cls": cn, @"sel": sn,
-                       @"ret": jsonVal ?: @"", @"retCls": clsOf,
+                       @"ret": jsonVal ?: @"", @"retCls": clsOf, @"out": outs,
                        @"ms": @(ms2 * 1000), @"err": errMsg});
     } else if ([op isEqualToString:@"sigprobe"]) {
         // v53：签名侦察（只读）。子动作 a=：
