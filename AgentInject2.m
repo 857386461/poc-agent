@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v55";   // v55 = 侦察「记录结构」重构 + 重放验证通道（仍纯只读，且 replay 有读写白名单闸门）。v54 真机暴露的三件事：① 600 还是不够 —— 快手业务 URL 实测接近 2000 字符（51 个查询参数）、body 也常 >600，截完根本没法原样重放（clock/r 重放实测 result=40 缺鉴权）；② 记录是「一个头一条」摊平的，449 条里同一个请求的头被拆成 8~13 条碎片，得靠脚本按 URL 反聚合，而 URL 又被截了 → 反聚合都对不齐；③ 沙箱转发完整 URL 要来回传 2000 字符，易错且占中继带宽。修法：① 单字段上限 600→4000（dump 可用 maxlen= 调）；② 改成**按请求对象聚合**：以 req 指针为 key 存 NSMapTable，value 里强引用 req 保活防地址复用，一次 dump 直接拿到「完整请求快照」（url+method+body+全套头）；③ 新增 a=replay：在设备内原地重建请求重放，但**必须过只读白名单**（含 report/claim/divide/register/complete 一律拒绝）。
+static NSString * const kAIVer = @"v56";   // v56 = 签名函数定位（mm=1 按方法名扫）+ 凭据导出（cred）。背景：v55 真机已把「抄 + 原样重放」跑通（clock/r 重放实测 result=1，且查明签名绑定 URL 参数 + body、但不绑 X-REQUESTID；改任一业务参数即 result=50）→ 想主动改参数调用必须先找到签名函数。而 v55 的 scan 有两个硬伤：① appOnly 时「KS 前缀即命中」→ 150 个类全是 KSXxxProxy 噪音，关键词被架空；② 只按**类名**匹配 → 签名函数几乎不可能在类名里带 sign（它多半在 KSNetworkManager 这类名字里），只扫类名永远找不到。v56 修法：关键词命中改为必要条件；新增 mm=1 按**方法名**扫（只扫快手自有前缀类，避免几万个系统类拖死）；新增 a=cred 一次性导出会话固定凭据（Cookie/UA/qr-xx-kas/kaw + URL 里的设备参数）。v54 真机暴露的三件事：① 600 还是不够 —— 快手业务 URL 实测接近 2000 字符（51 个查询参数）、body 也常 >600，截完根本没法原样重放（clock/r 重放实测 result=40 缺鉴权）；② 记录是「一个头一条」摊平的，449 条里同一个请求的头被拆成 8~13 条碎片，得靠脚本按 URL 反聚合，而 URL 又被截了 → 反聚合都对不齐；③ 沙箱转发完整 URL 要来回传 2000 字符，易错且占中继带宽。修法：① 单字段上限 600→4000（dump 可用 maxlen= 调）；② 改成**按请求对象聚合**：以 req 指针为 key 存 NSMapTable，value 里强引用 req 保活防地址复用，一次 dump 直接拿到「完整请求快照」（url+method+body+全套头）；③ 新增 a=replay：在设备内原地重建请求重放，但**必须过只读白名单**（含 report/claim/divide/register/complete 一律拒绝）。
 //   ---------------------------------------------------------------------------
 //   v49（路线一 · 通用网络监听）的结论留痕 —— 写在版本号旁边，避免后人再走一遍：
 //
@@ -3652,7 +3652,14 @@ static BOOL AIIsSysClass(NSString *s) {
 // 教训（v52 真机）：默认关键词 sign/secur 太宽泛，60 个候选里 33 个是
 // Apple 系统框架（SwiftUI/VisualIntelligence/GameCenterUI…），快手自有的
 // 网络层类名被噪声挤掉。所以：① 可传自定义关键词；② 可选「只看 App 自有类」。
-static NSArray *AIScanSignClasses(NSArray *kwsIn, BOOL appOnly) {
+static NSArray *AIScanSignClasses(NSArray *kwsIn, BOOL appOnly, BOOL methodMode) {
+    // ★ v56：新增 methodMode（按**方法名**命中）。
+    //   这是被 v55 真机逼出来的：之前只按**类名**匹配关键词，结果
+    //   ① appOnly 时"KS 前缀即命中" → 150 个全是 KSXxxProxy/KSXxxProcessor 噪音，关键词被架空；
+    //   ② 更要命的是：签名函数几乎不可能在类名里带 sign —— 它多半藏在
+    //      KSNetworkManager / KWRequestSerializer 这种**类名不含 sig** 的类里。
+    //      只扫类名 = 永远找不到。必须按方法名扫。
+    //   methodMode 下只扫快手自有前缀的类（系统类几万个，全扫会卡死轮询线程）。
     NSMutableArray *hits = [NSMutableArray array];
     int n = objc_getClassList(NULL, 0);
     if (n <= 0) return hits;
@@ -3674,11 +3681,11 @@ static NSArray *AIScanSignClasses(NSArray *kwsIn, BOOL appOnly) {
             if (!AIIsKSPrefix(name) && AIIsSysClass(name)) continue;
         }
         NSString *low = [name lowercaseString];
-        BOOL hit = appOnly ? AIIsKSPrefix(name) : NO;   // appOnly 时前缀即命中
-        if (!hit) {
-            for (NSString *k in kws) { if ([low rangeOfString:k].location != NSNotFound) { hit = YES; break; } }
-        }
-        if (!hit) continue;
+        // ★ v56 修正：关键词命中是**必要条件**，前缀不再直接算命中。
+        //   （v55 实测：KS 前缀即命中 → 150 个类全是噪音，关键词形同虚设）
+        BOOL clsHit = NO;
+        for (NSString *k in kws) { if ([low rangeOfString:k].location != NSNotFound) { clsHit = YES; break; } }
+        if (methodMode && !AIIsKSPrefix(name)) continue;    // 方法模式：只看快手自有类
         // 收集该类的实例方法 + 类方法名（只收名字，不收实现）
         NSMutableArray *ms = [NSMutableArray array];
         unsigned int mc = 0;
@@ -3695,7 +3702,17 @@ static NSArray *AIScanSignClasses(NSArray *kwsIn, BOOL appOnly) {
             if (sn) [ms addObject:[NSString stringWithFormat:@"+%@", [NSString stringWithUTF8String:sn]]];
         }
         if (cml) free(cml);
-        [hits addObject:@{@"cls": name, @"n": @(ms.count), @"m": ms}];
+        // 方法名命中判定
+        NSMutableArray *mHit = [NSMutableArray array];
+        for (NSString *mn in ms) {
+            NSString *ml2 = [mn lowercaseString];
+            for (NSString *k in kws) { if ([ml2 rangeOfString:k].location != NSNotFound) { [mHit addObject:mn]; break; } }
+        }
+        BOOL hit = clsHit || (methodMode && mHit.count > 0);
+        if (!hit) continue;
+        NSArray *outM = methodMode ? mHit : ms;
+        [hits addObject:@{@"cls": name, @"n": @(outM.count), @"m": outM,
+                          @"by": (clsHit ? @"类" : @"方法")}];
         if (hits.count >= 150) break;     // v53：上限 60→150（v52 实测 60 不够，被系统类占满）
     }
     free(buf);
@@ -4752,6 +4769,53 @@ static void AIExecCmd(NSDictionary *cmd) {
                            @"total": @(snap.count), @"nsel": @(sel.count),
                            @"hosts": hosts, @"items": show,
                            @"cleared": @([cmd[@"clear"] intValue] == 1)});
+        } else if ([a isEqualToString:@"cred"]) {
+            // ★ v56：导出「会话固定凭据」—— 只提取，不发任何请求。
+            //   价值：G86 实测 kas/kaw/qr-xx-kv/Cookie 都是会话固定的，
+            //   抄一次就能在沙箱侧复用；只有签名和 X-REQUESTID 是每请求的。
+            //   把固定的一次性捞出来存档，省得每次都从 2000 字符的 URL 里人肉挑。
+            NSArray *snap = AISigSnapshot(4000);
+            NSMutableDictionary *out = [NSMutableDictionary dictionary];
+            out[@"ok"] = @NO;
+            for (NSDictionary *e in snap) {
+                NSDictionary *h = e[@"h"] ?: @{};
+                NSString *ck = h[@"Cookie"] ?: h[@"cookie"];
+                if (![ck isKindOfClass:[NSString class]] || !ck.length) continue;
+                out[@"cookie"] = ck;
+                out[@"ua"]       = [h[@"User-Agent"] isKindOfClass:[NSString class]] ? h[@"User-Agent"] : @"";
+                out[@"qrx"]      = [h[@"qr-xx-kv"] isKindOfClass:[NSString class]] ? h[@"qr-xx-kv"] : @"";
+                out[@"kas"]      = [h[@"kas"] isKindOfClass:[NSString class]] ? h[@"kas"] : @"";
+                out[@"kaw"]      = [h[@"kaw"] isKindOfClass:[NSString class]] ? h[@"kaw"] : @"";
+                out[@"accept"]   = [h[@"Accept"] isKindOfClass:[NSString class]] ? h[@"Accept"] : @"";
+                out[@"acceptLang"] = [h[@"Accept-Language"] isKindOfClass:[NSString class]] ? h[@"Accept-Language"] : @"";
+                out[@"from"]     = e[@"u"] ?: @"";
+                out[@"ok"]       = @YES;
+                break;
+            }
+            // 顺手把 URL 里的设备级参数也拆出来（这些通常是会话/设备固定的）
+            NSString *u = out[@"from"];
+            if ([u isKindOfClass:[NSString class]] && u.length) {
+                NSRange q = [u rangeOfString:@"?"];
+                if (q.location != NSNotFound && q.location + 1 < u.length) {
+                    NSString *qs = [u substringFromIndex:q.location + 1];
+                    NSMutableDictionary *qd = [NSMutableDictionary dictionary];
+                    for (NSString *kv in [qs componentsSeparatedByString:@"&"]) {
+                        NSRange eq = [kv rangeOfString:@"="];
+                        if (eq.location == NSNotFound) continue;
+                        NSString *k2 = [kv substringToIndex:eq.location];
+                        NSString *v2 = [kv substringFromIndex:eq.location + 1];
+                        if (k2.length) qd[k2] = v2;
+                    }
+                    out[@"q"] = qd;
+                }
+            }
+            AILog(@"  [cmd] sigprobe cred -> ok=%@", out[@"ok"]);
+            AIReportDict(@{@"op": @"sigprobe", @"a": a, @"ok": out[@"ok"],
+                           @"cookie": out[@"cookie"] ?: @"", @"ua": out[@"ua"] ?: @"",
+                           @"qrx": out[@"qrx"] ?: @"", @"kas": out[@"kas"] ?: @"",
+                           @"kaw": out[@"kaw"] ?: @"", @"accept": out[@"accept"] ?: @"",
+                           @"acceptLang": out[@"acceptLang"] ?: @"",
+                           @"q": out[@"q"] ?: @{}, @"from": out[@"from"] ?: @""});
         } else if ([a isEqualToString:@"status"]) {
             AIReportDict(@{@"op": @"sigprobe", @"a": a, @"ok": @YES,
                            @"hooked": @(gSigHookOn), @"n": @(AISigCount())});
@@ -4760,14 +4824,15 @@ static void AIExecCmd(NSDictionary *cmd) {
             NSString *kstr = [cmd[@"k"] isKindOfClass:[NSString class]] ? cmd[@"k"] : @"";
             NSArray *kws = kstr.length ? [kstr componentsSeparatedByString:@","] : @[];
             BOOL appOnly = [cmd[@"app"] intValue] == 1;
-            NSArray *cls = AIScanSignClasses(kws, appOnly);
+            BOOL methodMode = [cmd[@"mm"] intValue] == 1;   // v56：按方法名扫（找签名函数的关键）
+            NSArray *cls = AIScanSignClasses(kws, appOnly, methodMode);
             NSDictionary *syms = AIProbeSignSymbols();
             NSMutableString *s = [NSMutableString string];
-            [s appendFormat:@"类候选 %lu 个：\n", (unsigned long)cls.count];
+            [s appendFormat:@"候选 %lu 个（%@）\n", (unsigned long)cls.count, methodMode ? @"按方法名" : @"按类名"];
             for (NSDictionary *c in cls) {
-                [s appendFormat:@"  %@  (%@ 方法)\n", c[@"cls"], c[@"n"]];
+                [s appendFormat:@"  %@  [%@] (%@ 方法)\n", c[@"cls"], c[@"by"] ?: @"?", c[@"n"]];
                 NSArray *ms = c[@"m"];
-                NSUInteger shown = MIN(ms.count, (NSUInteger)12);
+                NSUInteger shown = methodMode ? MIN(ms.count, (NSUInteger)30) : MIN(ms.count, (NSUInteger)12);
                 for (NSUInteger i = 0; i < shown; i++) [s appendFormat:@"      %@\n", ms[i]];
                 if (ms.count > shown) [s appendFormat:@"      …另 %lu 个\n", (unsigned long)(ms.count - shown)];
             }
