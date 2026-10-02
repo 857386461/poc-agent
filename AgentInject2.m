@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v57";   // v57 = 路线 A 落地：通用 ObjC 类方法调用 op `call` + 两处实测修复。★ 重大突破：v56 的 mm=1（按方法名扫）真机直接挖出签名函数 —— KSLASecurityHandler +customSig3WithPath:parameters:（__NS_sig3）、KSExtensionNetwork +_sig3WithPath:sig:did:、KWAppSignatureBuilder +createTokenSigWithSig:salt:（__NStokensig）、KSSafeModeSignatureDataEncryptor createTokenSigWithSig:clientSalt:、KSGPolicyParser +handleSig3Policy:。这些类**类名里根本没有 sig**（KSLASecurityHandler 只有 Security），只有按方法名才扫得到 —— 彻底印证 v56 的判断。有了「调谁」就需要「能调」→ 新增通用 `call` op（NSInvocation 调类方法，参数限 NSString/NSNumber/NSArray/NSDictionary/NSNull，返回值只回可 JSON 化类型，全程 @try）。★ 另修两处 v56 实测缺陷：① cred 原本「取最后一条」，结果 Cookie 只有 region_ticket（缺 __NSWJ）、URL 参数只有 2 个 —— 因为最后一条恰好是埋点请求；改成**逐字段取最长 + URL 参数取并集**；② mm=1 时关键词 "sign" 误命中每个类都有的 `methodSignatureForSelector:`，150 个名额瞬间占满、真目标排后面扫不到 —— 加 AINoiseMethods 排除表。▼ v55/v56 前情：已把「抄+原样重放」跑通（clock/r result=1；签名绑 URL 参数+body、不绑 X-REQUESTID；T+12min 仍有效），并确认想改参数调用必须先拿到签名算法。
+static NSString * const kAIVer = @"v58";   // v58 = 「call 探测闸」：给 `call` 加 probe=1（只读方法签名，回 want/argTypes/retType）+ 把参数个数判据从「多了才拒」改成「必须恰好相等」。★ 为什么必须有 probe：`call` 用 NSInvocation 按 `getArgumentTypeAtIndex:` 逐槽设参，args 少于 want 时后面几槽是**未初始化内存**，invoke 会拿垃圾指针发消息 → 崩溃/未定义；以前只拦「参数过多」，等于给「参数过少」开了后门。有了 probe，调用方先拿到「这方法要几个参数、每槽什么类型」，再精确构造 args，才能安全地调 KSMWPassportSecurityTools +sig3OnURLPath:method:requestParams:(@, @, @) 这类签名函数。▼ v57 前情：路线 A 落地，新增通用 `call` op（NSInvocation 调 ObjC 类方法，只类方法、参数限 NSString/NSNumber/NSArray/NSDictionary/NSNull、返回值只回可 JSON 化类型、全程 @try + 耗时记账）。★ v56 的 mm=1（按方法名扫）真机挖出签名函数 —— 且 v58 上机复扫又挖出**最关键的统一入口**：KSMWPassportSecurityTools +sig3OnURLPath:method:requestParams:（路径+方法+参数 → sig3）、+signOrSig3OnURLPath:method:requestParams:sigText:sigType:、+checkOnSig3UrlPathWhiteList:，以及 KSLASecurityHandler +customSig3WithPath:parameters:（__NS_sig3）、KSExtensionNetwork +_sig3WithPath:sig:did:、KWAppSignatureBuilder +createTokenSigWithSig:salt:（__NStokensig）、KSSafeModeSignatureDataEncryptor createTokenSigWithSig:clientSalt:、KSGPolicyParser +handleSig3Policy:。这些类**类名里根本没有 sig**（KSLASecurityHandler 只有 Security），只有按方法名才扫得到 —— 彻底印证 v56 的判断。▼ v55/v56 前情：已把「抄+原样重放」跑通（clock/r result=1；签名绑 URL 参数+body、不绑 X-REQUESTID；T+12min 仍有效），并确认想改参数调用必须先拿到签名算法。
 //   ---------------------------------------------------------------------------
 //   v49（路线一 · 通用网络监听）的结论留痕 —— 写在版本号旁边，避免后人再走一遍：
 //
@@ -4648,9 +4648,26 @@ static void AIExecCmd(NSDictionary *cmd) {
         @try { ms = [c methodSignatureForSelector:target]; } @catch (id e) {}
         if (!ms) { AIReportDict(@{@"op": @"call", @"ok": @NO, @"err": @"取不到方法签名"}); return; }
         NSUInteger want = [ms numberOfArguments] - 2;      // 减去 self / _cmd
-        if (args.count > want) {
+        // ★ v58 probe：只查签名不调用 —— 这是**只读**操作（只读 methodSignatureForSelector）。
+        //   为什么必须有：`getArgumentTypeAtIndex:` 要按声明个数逐个设参，
+        //   args 少于 want 时后面几个槽是**未初始化内存**，invoke 会按垃圾指针发消息 → 崩溃/未定义。
+        //   所以调用方必须先 probe 拿到 want 与各槽类型，再精确构造 args。
+        if ([cmd[@"probe"] respondsToSelector:@selector(boolValue)] && [cmd[@"probe"] boolValue]) {
+            NSMutableArray *argTypes = [NSMutableArray array];
+            for (NSUInteger i = 2; i < [ms numberOfArguments]; i++) {
+                const char *t = [ms getArgumentTypeAtIndex:i];
+                [argTypes addObject:(t ? [NSString stringWithUTF8String:t] : @"?")];
+            }
+            const char *rt = [ms methodReturnType];
+            AIReportDict(@{@"op": @"call", @"probe": @YES, @"ok": @YES, @"cls": cn, @"sel": sn,
+                           @"want": @(want), @"argTypes": argTypes,
+                           @"retType": (rt ? [NSString stringWithUTF8String:rt] : @"?")});
+            return;
+        }
+        // ★ v58：个数必须**恰好相等**才调 —— 少一个就是拿未初始化内存当参数，多一个已拒绝。
+        if (args.count != want) {
             AIReportDict(@{@"op": @"call", @"ok": @NO,
-                           @"err": [NSString stringWithFormat:@"参数过多：给了 %lu 个 / 方法要 %lu 个",
+                           @"err": [NSString stringWithFormat:@"参数个数不符：给了 %lu 个 / 方法要 %lu 个（先 probe=1 查签名）",
                                     (unsigned long)args.count, (unsigned long)want]}); return;
         }
         NSDate *t0 = [NSDate date];
