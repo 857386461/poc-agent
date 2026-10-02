@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v56";   // v56 = 签名函数定位（mm=1 按方法名扫）+ 凭据导出（cred）。背景：v55 真机已把「抄 + 原样重放」跑通（clock/r 重放实测 result=1，且查明签名绑定 URL 参数 + body、但不绑 X-REQUESTID；改任一业务参数即 result=50）→ 想主动改参数调用必须先找到签名函数。而 v55 的 scan 有两个硬伤：① appOnly 时「KS 前缀即命中」→ 150 个类全是 KSXxxProxy 噪音，关键词被架空；② 只按**类名**匹配 → 签名函数几乎不可能在类名里带 sign（它多半在 KSNetworkManager 这类名字里），只扫类名永远找不到。v56 修法：关键词命中改为必要条件；新增 mm=1 按**方法名**扫（只扫快手自有前缀类，避免几万个系统类拖死）；新增 a=cred 一次性导出会话固定凭据（Cookie/UA/qr-xx-kas/kaw + URL 里的设备参数）。v54 真机暴露的三件事：① 600 还是不够 —— 快手业务 URL 实测接近 2000 字符（51 个查询参数）、body 也常 >600，截完根本没法原样重放（clock/r 重放实测 result=40 缺鉴权）；② 记录是「一个头一条」摊平的，449 条里同一个请求的头被拆成 8~13 条碎片，得靠脚本按 URL 反聚合，而 URL 又被截了 → 反聚合都对不齐；③ 沙箱转发完整 URL 要来回传 2000 字符，易错且占中继带宽。修法：① 单字段上限 600→4000（dump 可用 maxlen= 调）；② 改成**按请求对象聚合**：以 req 指针为 key 存 NSMapTable，value 里强引用 req 保活防地址复用，一次 dump 直接拿到「完整请求快照」（url+method+body+全套头）；③ 新增 a=replay：在设备内原地重建请求重放，但**必须过只读白名单**（含 report/claim/divide/register/complete 一律拒绝）。
+static NSString * const kAIVer = @"v57";   // v57 = 路线 A 落地：通用 ObjC 类方法调用 op `call` + 两处实测修复。★ 重大突破：v56 的 mm=1（按方法名扫）真机直接挖出签名函数 —— KSLASecurityHandler +customSig3WithPath:parameters:（__NS_sig3）、KSExtensionNetwork +_sig3WithPath:sig:did:、KWAppSignatureBuilder +createTokenSigWithSig:salt:（__NStokensig）、KSSafeModeSignatureDataEncryptor createTokenSigWithSig:clientSalt:、KSGPolicyParser +handleSig3Policy:。这些类**类名里根本没有 sig**（KSLASecurityHandler 只有 Security），只有按方法名才扫得到 —— 彻底印证 v56 的判断。有了「调谁」就需要「能调」→ 新增通用 `call` op（NSInvocation 调类方法，参数限 NSString/NSNumber/NSArray/NSDictionary/NSNull，返回值只回可 JSON 化类型，全程 @try）。★ 另修两处 v56 实测缺陷：① cred 原本「取最后一条」，结果 Cookie 只有 region_ticket（缺 __NSWJ）、URL 参数只有 2 个 —— 因为最后一条恰好是埋点请求；改成**逐字段取最长 + URL 参数取并集**；② mm=1 时关键词 "sign" 误命中每个类都有的 `methodSignatureForSelector:`，150 个名额瞬间占满、真目标排后面扫不到 —— 加 AINoiseMethods 排除表。▼ v55/v56 前情：已把「抄+原样重放」跑通（clock/r result=1；签名绑 URL 参数+body、不绑 X-REQUESTID；T+12min 仍有效），并确认想改参数调用必须先拿到签名算法。
 //   ---------------------------------------------------------------------------
 //   v49（路线一 · 通用网络监听）的结论留痕 —— 写在版本号旁边，避免后人再走一遍：
 //
@@ -3652,6 +3652,29 @@ static BOOL AIIsSysClass(NSString *s) {
 // 教训（v52 真机）：默认关键词 sign/secur 太宽泛，60 个候选里 33 个是
 // Apple 系统框架（SwiftUI/VisualIntelligence/GameCenterUI…），快手自有的
 // 网络层类名被噪声挤掉。所以：① 可传自定义关键词；② 可选「只看 App 自有类」。
+// ★ v57：NSObject/NSProxy 的固有方法 —— 关键词 "sign" 会误命中
+//   `methodSignatureForSelector:`（v56 实测：每个类都有一条，150 个名额瞬间被它占满，
+//   真正的 KSLASecurityHandler 排在后面根本没机会被扫到）。必须白名单之外先排掉。
+static NSArray *AINoiseMethods(void) {
+    static NSArray *a = nil;
+    if (!a) a = @[@"methodSignatureForSelector:", @"instanceMethodSignatureForSelector:",
+                  @"methodSignatureForSelectorOpt:", @"methodSignatureCache",
+                  @"setMethodSignatureCache:", @"methodForSelector:",
+                  @"forwardInvocation:", @"forwardingTargetForSelector:",
+                  @"doesNotRecognizeSelector:", @"respondsToSelector:",
+                  @"conformsToProtocol:", @"isKindOfClass:", @"isMemberOfClass:",
+                  @"performSelector:", @"performSelector:withObject:",
+                  @"performSelector:withObject:withObject:",
+                  @"description", @"debugDescription", @"hash", @"class", @"superclass",
+                  @"isEqual:", @"retain", @"release", @"autorelease", @"retainCount",
+                  @"copy", @"mutableCopy", @"dealloc", @"zone"];
+    return a;
+}
+static BOOL AIIsNoiseMethod(NSString *m) {
+    for (NSString *n in AINoiseMethods()) if ([m isEqualToString:n]) return YES;
+    return NO;
+}
+
 static NSArray *AIScanSignClasses(NSArray *kwsIn, BOOL appOnly, BOOL methodMode) {
     // ★ v56：新增 methodMode（按**方法名**命中）。
     //   这是被 v55 真机逼出来的：之前只按**类名**匹配关键词，结果
@@ -3705,7 +3728,9 @@ static NSArray *AIScanSignClasses(NSArray *kwsIn, BOOL appOnly, BOOL methodMode)
         // 方法名命中判定
         NSMutableArray *mHit = [NSMutableArray array];
         for (NSString *mn in ms) {
-            NSString *ml2 = [mn lowercaseString];
+            NSString *raw = [mn hasPrefix:@"+"] ? [mn substringFromIndex:1] : mn;
+            if (AIIsNoiseMethod(raw)) continue;                  // ★ v57：排掉固有方法
+            NSString *ml2 = [raw lowercaseString];
             for (NSString *k in kws) { if ([ml2 rangeOfString:k].location != NSNotFound) { [mHit addObject:mn]; break; } }
         }
         BOOL hit = clsHit || (methodMode && mHit.count > 0);
@@ -4342,7 +4367,7 @@ static void AIExecCmd(NSDictionary *cmd) {
                        @"ops": @"wait pick picktxt tapui tap scroll swipe rows tree toast probe http sigprobe "
                                @"back nav find rntap dismiss uioff uion gdtap wintap schemes open "
                                @"shot wins win gtap chain text dump update core ball overlay "
-                               @"status log hud task macro diag ocr vfind recapknow copysteps flag",
+                               @"status log hud task macro diag ocr vfind recapknow copysteps call",
                        @"proc": gProcName, @"bundle": gBundleId, @"pid": @(getpid()),
                        @"tap": @(gBestTap), @"shot": @(gBestShot),
                        @"mon": @(gMonHits), @"se": @(gSendEventHits),
@@ -4588,6 +4613,112 @@ static void AIExecCmd(NSDictionary *cmd) {
         }];
         // 立刻回一条 ack，让调用方知道命令被受理（真实结果随后异步到达）
         AILog(@"  [cmd] http %@ %@ 已派发（异步）", method, url);
+    } else if ([op isEqualToString:@"call"]) {
+        // v57：通用 ObjC **类方法**调用（NSInvocation）。
+        //
+        //  为什么做成通用能力而不是"快手签名专用"：
+        //    调任意类方法 = App 无关的通用原语（跟 tap/scroll/find 平级）。
+        //    真正 App 专属的是"调哪个类的哪个方法"，那部分留在脚本里。
+        //
+        //  安全边界（刻意收紧，别搞成万能后门）：
+        //    ① 只支持**类方法**（+）—— 实例方法要拿到对象实例，语义太宽，暂不开；
+        //    ② 参数只接受 NSString/NSNumber/NSArray/NSDictionary/NSNull，
+        //       且个数超过签名声明直接拒绝（避免越界写）；
+        //    ③ 返回值只回可 JSON 化的类型，NSData 转 base64，其余回 description；
+        //    ④ 全程 @try，异常不炸主线程；耗时记账，调用者自己判断是否超时。
+        //
+        //  ★ 红线：本 op 本身不做任何读写语义判断 —— 调什么由调用方负责。
+        //    调用方必须自己确认目标方法是**纯函数/只读**（例如算签名），
+        //    不得调用任何会改业务状态、下单、扣款、上报的方法。
+        NSString *cn = [cmd[@"cls"] isKindOfClass:[NSString class]] ? cmd[@"cls"] : @"";
+        NSString *sn = [cmd[@"sel"] isKindOfClass:[NSString class]] ? cmd[@"sel"] : @"";
+        NSArray *args = [cmd[@"args"] isKindOfClass:[NSArray class]] ? cmd[@"args"] : @[];
+        if (!cn.length || !sn.length) {
+            AIReportDict(@{@"op": @"call", @"ok": @NO, @"err": @"缺 cls 或 sel"}); return;
+        }
+        Class c = NSClassFromString(cn);
+        if (!c) { AIReportDict(@{@"op": @"call", @"ok": @NO,
+                                 @"err": [NSString stringWithFormat:@"找不到类 %@", cn]}); return; }
+        SEL target = NSSelectorFromString(sn);
+        if (![c respondsToSelector:target]) {
+            AIReportDict(@{@"op": @"call", @"ok": @NO,
+                           @"err": [NSString stringWithFormat:@"%@ 不响应该类方法 %@", cn, sn]}); return;
+        }
+        NSMethodSignature *ms = nil;
+        @try { ms = [c methodSignatureForSelector:target]; } @catch (id e) {}
+        if (!ms) { AIReportDict(@{@"op": @"call", @"ok": @NO, @"err": @"取不到方法签名"}); return; }
+        NSUInteger want = [ms numberOfArguments] - 2;      // 减去 self / _cmd
+        if (args.count > want) {
+            AIReportDict(@{@"op": @"call", @"ok": @NO,
+                           @"err": [NSString stringWithFormat:@"参数过多：给了 %lu 个 / 方法要 %lu 个",
+                                    (unsigned long)args.count, (unsigned long)want]}); return;
+        }
+        NSDate *t0 = [NSDate date];
+        id outVal = nil;
+        NSString *errMsg = @"";
+        @try {
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:ms];
+            inv.selector = target;
+            for (NSUInteger i = 0; i < args.count; i++) {
+                id a = args[i];
+                if (a == [NSNull null]) a = nil;
+                const char *t = [ms getArgumentTypeAtIndex:i + 2];
+                if (t && (t[0] == 'i' || t[0] == 'l' || t[0] == 'q' || t[0] == 'I' || t[0] == 'L' || t[0] == 'Q')) {
+                    long long v = [a respondsToSelector:@selector(longLongValue)] ? [a longLongValue] : 0;
+                    if (t[0] == 'i') { int vi = (int)v; [inv setArgument:&vi atIndex:i + 2]; }
+                    else if (t[0] == 'I') { unsigned int vi = (unsigned int)v; [inv setArgument:&vi atIndex:i + 2]; }
+                    else if (t[0] == 'l') { long vi = (long)v; [inv setArgument:&vi atIndex:i + 2]; }
+                    else if (t[0] == 'L') { unsigned long vi = (unsigned long)v; [inv setArgument:&vi atIndex:i + 2]; }
+                    else if (t[0] == 'q') { long long vi = v; [inv setArgument:&vi atIndex:i + 2]; }
+                    else { unsigned long long vi = (unsigned long long)v; [inv setArgument:&vi atIndex:i + 2]; }
+                } else if (t && (t[0] == 'f' || t[0] == 'd')) {
+                    double v = [a respondsToSelector:@selector(doubleValue)] ? [a doubleValue] : 0.0;
+                    if (t[0] == 'f') { float vf = (float)v; [inv setArgument:&vf atIndex:i + 2]; }
+                    else { [inv setArgument:&v atIndex:i + 2]; }
+                } else if (t && t[0] == 'B') {
+                    BOOL v = [a respondsToSelector:@selector(boolValue)] ? [a boolValue] : NO;
+                    [inv setArgument:&v atIndex:i + 2];
+                } else {
+                    [inv setArgument:&a atIndex:i + 2];
+                }
+            }
+            [inv invokeWithTarget:c];
+            const char *rt = [ms methodReturnType];
+            if (rt && (rt[0] == '@' || rt[0] == '#')) {
+                __unsafe_unretained id rv = nil;
+                [inv getReturnValue:&rv];
+                outVal = rv;
+            } else if (rt && rt[0] == 'v') {
+                outVal = @"<void>";
+            } else {
+                // 标量返回值
+                if (rt && strcmp(rt, "d") == 0) { double d = 0; [inv getReturnValue:&d]; outVal = @(d); }
+                else if (rt && strcmp(rt, "B") == 0) { BOOL b = NO; [inv getReturnValue:&b]; outVal = @(b); }
+                else { long long n = 0; [inv getReturnValue:&n]; outVal = @(n); }
+            }
+        } @catch (NSException *ex) {
+            errMsg = [NSString stringWithFormat:@"异常 %@: %@", ex.name, ex.reason];
+        } @catch (id e) {
+            errMsg = @"未知异常";
+        }
+        NSTimeInterval ms2 = [[NSDate date] timeIntervalSinceDate:t0];
+        // 把返回值整理成可 JSON 化的东西
+        id jsonVal = nil; NSString *clsOf = @"";
+        if ([outVal isKindOfClass:[NSString class]])        { jsonVal = outVal; clsOf = @"NSString"; }
+        else if ([outVal isKindOfClass:[NSNumber class]])   { jsonVal = outVal; clsOf = @"NSNumber"; }
+        else if ([outVal isKindOfClass:[NSDictionary class]]){ jsonVal = outVal; clsOf = @"NSDictionary"; }
+        else if ([outVal isKindOfClass:[NSArray class]])    { jsonVal = outVal; clsOf = @"NSArray"; }
+        else if ([outVal isKindOfClass:[NSData class]])     {
+            jsonVal = [(NSData *)outVal base64EncodedStringWithOptions:0]; clsOf = @"NSData(base64)";
+        }
+        else if (outVal) { jsonVal = [outVal description] ?: @""; clsOf = NSStringFromClass([outVal class]); }
+        else { jsonVal = @"<nil>"; clsOf = @"nil"; }
+        if ([jsonVal isKindOfClass:[NSString class]] && [(NSString *)jsonVal length] > 8000)
+            jsonVal = [[(NSString *)jsonVal substringToIndex:8000] stringByAppendingString:@"…(截断)"];
+        AILog(@"  [cmd] call %@ +%@ -> %@ %.1fms", cn, sn, clsOf, ms2 * 1000);
+        AIReportDict(@{@"op": @"call", @"ok": @(errMsg.length == 0), @"cls": cn, @"sel": sn,
+                       @"ret": jsonVal ?: @"", @"retCls": clsOf,
+                       @"ms": @(ms2 * 1000), @"err": errMsg});
     } else if ([op isEqualToString:@"sigprobe"]) {
         // v53：签名侦察（只读）。子动作 a=：
         // v55 子动作一览（a=）：
@@ -4774,42 +4905,59 @@ static void AIExecCmd(NSDictionary *cmd) {
             //   价值：G86 实测 kas/kaw/qr-xx-kv/Cookie 都是会话固定的，
             //   抄一次就能在沙箱侧复用；只有签名和 X-REQUESTID 是每请求的。
             //   把固定的一次性捞出来存档，省得每次都从 2000 字符的 URL 里人肉挑。
+            // ★ v57 修：改成**逐字段取最长 / URL 参数取并集**，不再"取最后一条"。
+            //   实测教训：取最后一条拿到的 Cookie 只有 region_ticket（没有 __NSWJ）、
+            //   URL 参数只有 2 个电池字段 —— 因为最后一条恰好是埋点请求，凭据比业务请求少。
+            //   "抄凭据"要的是**最全**的那份，不是**最新**的那份。
             NSArray *snap = AISigSnapshot(4000);
-            NSMutableDictionary *out = [NSMutableDictionary dictionary];
-            out[@"ok"] = @NO;
+            NSMutableDictionary *best = [NSMutableDictionary dictionary];
+            NSString *bestUrl = @"";
+            NSMutableDictionary *qmerge = [NSMutableDictionary dictionary];
+            NSDictionary *fmap = @{@"Cookie": @"cookie", @"cookie": @"cookie",
+                                   @"User-Agent": @"ua", @"qr-xx-kv": @"qrx",
+                                   @"kas": @"kas", @"kaw": @"kaw",
+                                   @"Accept": @"accept", @"Accept-Language": @"acceptLang",
+                                   @"Content-Type": @"ctype", @"ks-arg-cprs": @"kscprs"};
+            NSUInteger nUsed = 0;
             for (NSDictionary *e in snap) {
                 NSDictionary *h = e[@"h"] ?: @{};
-                NSString *ck = h[@"Cookie"] ?: h[@"cookie"];
-                if (![ck isKindOfClass:[NSString class]] || !ck.length) continue;
-                out[@"cookie"] = ck;
-                out[@"ua"]       = [h[@"User-Agent"] isKindOfClass:[NSString class]] ? h[@"User-Agent"] : @"";
-                out[@"qrx"]      = [h[@"qr-xx-kv"] isKindOfClass:[NSString class]] ? h[@"qr-xx-kv"] : @"";
-                out[@"kas"]      = [h[@"kas"] isKindOfClass:[NSString class]] ? h[@"kas"] : @"";
-                out[@"kaw"]      = [h[@"kaw"] isKindOfClass:[NSString class]] ? h[@"kaw"] : @"";
-                out[@"accept"]   = [h[@"Accept"] isKindOfClass:[NSString class]] ? h[@"Accept"] : @"";
-                out[@"acceptLang"] = [h[@"Accept-Language"] isKindOfClass:[NSString class]] ? h[@"Accept-Language"] : @"";
-                out[@"from"]     = e[@"u"] ?: @"";
-                out[@"ok"]       = @YES;
-                break;
-            }
-            // 顺手把 URL 里的设备级参数也拆出来（这些通常是会话/设备固定的）
-            NSString *u = out[@"from"];
-            if ([u isKindOfClass:[NSString class]] && u.length) {
+                BOOL used = NO;
+                for (NSString *f in h) {
+                    NSString *key = fmap[f];
+                    if (!key) continue;
+                    NSString *v = h[f];
+                    if (![v isKindOfClass:[NSString class]] || !v.length) continue;
+                    NSString *cur = best[key];
+                    if (!cur || v.length > cur.length) { best[key] = v; used = YES; }
+                }
+                NSString *u = ([e[@"u"] isKindOfClass:[NSString class]]) ? e[@"u"] : @"";
+                if (u.length > bestUrl.length) bestUrl = u;
                 NSRange q = [u rangeOfString:@"?"];
                 if (q.location != NSNotFound && q.location + 1 < u.length) {
                     NSString *qs = [u substringFromIndex:q.location + 1];
-                    NSMutableDictionary *qd = [NSMutableDictionary dictionary];
                     for (NSString *kv in [qs componentsSeparatedByString:@"&"]) {
                         NSRange eq = [kv rangeOfString:@"="];
                         if (eq.location == NSNotFound) continue;
                         NSString *k2 = [kv substringToIndex:eq.location];
                         NSString *v2 = [kv substringFromIndex:eq.location + 1];
-                        if (k2.length) qd[k2] = v2;
+                        if (k2.length && !qmerge[k2]) qmerge[k2] = v2;   // 先到为准
                     }
-                    out[@"q"] = qd;
+                    used = YES;
                 }
+                if (used) nUsed++;
             }
-            AILog(@"  [cmd] sigprobe cred -> ok=%@", out[@"ok"]);
+            NSMutableDictionary *out = [NSMutableDictionary dictionary];
+            for (NSString *k in best) out[k] = best[k];
+            for (NSString *k in @[@"cookie", @"ua", @"qrx", @"kas", @"kaw", @"accept", @"acceptLang", @"ctype", @"kscprs"])
+                if (!out[k]) out[k] = @"";
+            out[@"ok"] = @(best.count > 0 || qmerge.count > 0);
+            out[@"q"] = qmerge;
+            out[@"nq"] = @(qmerge.count);
+            out[@"from"] = bestUrl;
+            out[@"nReqUsed"] = @(nUsed);
+            AILog(@"  [cmd] sigprobe cred -> ok=%@ cookie=%lub 参数%lu个（用了%lu个请求）",
+                  out[@"ok"], (unsigned long)[out[@"cookie"] length],
+                  (unsigned long)qmerge.count, (unsigned long)nUsed);
             AIReportDict(@{@"op": @"sigprobe", @"a": a, @"ok": out[@"ok"],
                            @"cookie": out[@"cookie"] ?: @"", @"ua": out[@"ua"] ?: @"",
                            @"qrx": out[@"qrx"] ?: @"", @"kas": out[@"kas"] ?: @"",
