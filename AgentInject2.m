@@ -3766,7 +3766,7 @@ static NSMutableDictionary *AISigSlotFor(id req, NSString *url) {
                                         valueOptions:NSPointerFunctionsStrongMemory];
     }
     if (!gSigOrder) gSigOrder = [NSMutableArray array];
-    NSMutableDictionary *slot = [gSigReqs objectForKey:(__bridge void *)req];
+    NSMutableDictionary *slot = [gSigReqs objectForKey:(id)req];
     if (!slot) {
         if (gSigOrder.count >= AISIG_MAXREQ) return nil;
         slot = [NSMutableDictionary dictionary];
@@ -3774,7 +3774,7 @@ static NSMutableDictionary *AISigSlotFor(id req, NSString *url) {
         slot[@"k"] = [NSString stringWithFormat:@"%p", (void *)req];
         slot[@"req"] = req;                              // ★ 强引用保活：防地址复用（G87）
         slot[@"t"] = @((long long)[[NSDate date] timeIntervalSince1970]);
-        [gSigReqs setObject:slot forKey:(__bridge void *)req];
+        [gSigReqs setObject:slot forKey:(id)req];
         [gSigOrder addObject:slot];                      // 存 slot 本体，dump 直接按序取
     }
     return slot;
@@ -3800,7 +3800,7 @@ static void AISigRecord(id req, NSString *field, NSString *value) {
         // ★ v55：我们自己 replay 发出的请求带 X-AI-Replay 头 → 反手把它从记录里剔掉，
         //   否则重放一次就污染一条，多试几次名额全是我们自己。
         if ([field caseInsensitiveCompare:@"X-AI-Replay"] == NSOrderedSame) {
-            [gSigReqs removeObjectForKey:(__bridge void *)req];
+            [gSigReqs removeObjectForKey:(id)req];
             [gSigOrder removeObjectIdenticalTo:slot];
             return;
         }
