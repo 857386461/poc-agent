@@ -4838,6 +4838,8 @@ static void AIExecCmd(NSDictionary *cmd) {
             errMsg = @"未知异常";
         }
         NSTimeInterval ms2 = [[NSDate date] timeIntervalSinceDate:t0];
+        // 把返回值整理成可 JSON 化的东西（★ v61：声明提到 pick 之前，两个分支共用）
+        id jsonVal = nil; NSString *clsOf = @"";
         // ★ v61：**设备侧就地抽取**（pick）—— 在回传前把大返回值砍成小结果。
         //   为什么：`NSHTTPCookieStorage.cookies` 返回 744 个对象，description 数百 KB，
         //   一旦塞进回执 JSON，POST 就超限丢包，调用方只看到"无回执"（见 v61 头部注释）。
@@ -4923,8 +4925,7 @@ static void AIExecCmd(NSDictionary *cmd) {
             // 纯计数（其实上面已覆盖，这里保留语义）
             jsonVal = @( [(NSArray *)outVal count] ); clsOf = @"NSArray(count)";
         } else {
-        // 把返回值整理成可 JSON 化的东西
-        id jsonVal = nil; NSString *clsOf = @"";
+        // 把返回值整理成可 JSON 化的东西（jsonVal/clsOf 已在上方声明）
         if ([outVal isKindOfClass:[NSString class]])        { jsonVal = outVal; clsOf = @"NSString"; }
         else if ([outVal isKindOfClass:[NSNumber class]])   { jsonVal = outVal; clsOf = @"NSNumber"; }
         else if ([outVal isKindOfClass:[NSDictionary class]]){ jsonVal = outVal; clsOf = @"NSDictionary"; }
