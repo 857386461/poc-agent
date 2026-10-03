@@ -109,7 +109,14 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v60";   // v60 = 「只读单例实例方法」。给 `call` 加 inst: 参数 —— 传白名单内的单例方法名
+static NSString * const kAIVer = @"v61";   // v61 = 「call 设备侧就地抽取」。给 `call` 加 pick: 参数 —— 在**设备内**从大返回值里
+   //       挑出要的子集再回传，解决「返回值太大撑爆回执」。★ 为什么必须：v60 的 inst 白名单已能取到
+   //       单例实例，但 `NSHTTPCookieStorage.cookies` 返回 **744 个 Cookie**，description 展开数百 KB，
+   //       AIReportDict 的 POST 超限直接丢包 → 调用方看到的是**彻底无回执**（不是报错！），极易误判成
+   //       "设备掉线/op 不存在"。实测：probe/processName/count 都正常，唯独 cookies 无回执 → 定位到体积。
+   //       ★ 做法：pick 支持 dict 取字段 / array 取下标+字段投影 + 截断，全在设备侧完成，回执只带结果。
+   //       ★ 安全边界：只读、只做取值/投影/截断，不改任何状态；pick 是与 call 同级的**只读后处理**。
+   //       ▼ v60 前情：只读单例实例方法（inst: 白名单）。v60 = 给 `call` 加 inst: 参数 —— 传白名单内的单例方法名
    //       （如 inst=sharedHTTPCookieStorage），插件先取到**实例**，再按真实签名调**实例方法**。
    //       ★ 为什么必须有：`NSHTTPCookieStorage.sharedHTTPCookieStorage.cookies` 是最典型的
    //       「单例 + 实例方法」，但 v57 的 call 只认类方法（+），够不着。实证：设备 http op
@@ -4749,7 +4756,8 @@ static void AIExecCmd(NSDictionary *cmd) {
                            @"cls": cn, @"sel": sn, @"inst": instName,
                            @"mode": (isInstMode ? @"instance" : @"class"),
                            @"want": @(want), @"argTypes": argTypes,
-                           @"retType": (rt ? [NSString stringWithUTF8String:rt] : @"?")});
+                           @"retType": (rt ? [NSString stringWithUTF8String:rt] : @"?"),
+                           @"hint": @"返回值大时加 pick={\"fields\":[...],\"n\":N,\"maxLen\":M} 设备侧抽取（v61）"});
             return;
         }
         // ★ v58：个数必须**恰好相等**才调 —— 少一个就是拿未初始化内存当参数，多一个已拒绝。
@@ -4830,6 +4838,91 @@ static void AIExecCmd(NSDictionary *cmd) {
             errMsg = @"未知异常";
         }
         NSTimeInterval ms2 = [[NSDate date] timeIntervalSinceDate:t0];
+        // ★ v61：**设备侧就地抽取**（pick）—— 在回传前把大返回值砍成小结果。
+        //   为什么：`NSHTTPCookieStorage.cookies` 返回 744 个对象，description 数百 KB，
+        //   一旦塞进回执 JSON，POST 就超限丢包，调用方只看到"无回执"（见 v61 头部注释）。
+        //   语法（pick 是一个 dict）：
+        //     {"onlyArray":1}                  → 只回元素个数 + 类型，不回内容（探规模）
+        //     {"n":10}                         → 数组只取前 10 个
+        //     {"fields":["name","value"]}      → 每个元素是 dict 时，只投影这几个 key
+        //     {"key":"name"}                   → 按该字段去重（配合 fields 用）
+        //     {"maxLen":200}                   → 每个字符串值截断到 200 字符
+        //     {"keys":["a","b"]}               → 返回值是 dict 时，只取这几个 key
+        //   ★ 只读：只做取值/投影/截断，不改动任何对象状态。
+        NSDictionary *pick = [cmd[@"pick"] isKindOfClass:[NSDictionary class]] ? cmd[@"pick"] : nil;
+        NSUInteger pickN = pick[@"n"] ? [pick[@"n"] unsignedIntegerValue] : 0;   // 0 = 不限
+        NSUInteger pickMaxLen = pick[@"maxLen"] ? [pick[@"maxLen"] unsignedIntegerValue] : 0;
+        NSArray *pickFields = [pick[@"fields"] isKindOfClass:[NSArray class]] ? pick[@"fields"] : nil;
+        NSArray *pickKeys = [pick[@"keys"] isKindOfClass:[NSArray class]] ? pick[@"keys"] : nil;
+        NSString *pickKey = [pick[@"key"] isKindOfClass:[NSString class]] ? pick[@"key"] : nil;
+        // 小工具：把任意值安全转成"短"字符串
+        NSString * (^pickShrink)(id) = ^NSString *(id v) {
+            NSString *s = nil;
+            if ([v isKindOfClass:[NSString class]]) s = v;
+            else if ([v isKindOfClass:[NSNumber class]]) s = [v stringValue];
+            else if (v) s = [v description];
+            else s = @"";
+            s = s ?: @"";
+            if (pickMaxLen > 0 && s.length > pickMaxLen)
+                s = [[s substringToIndex:pickMaxLen] stringByAppendingString:@"…"];
+            return s;
+        };
+        if (pick && [outVal isKindOfClass:[NSArray class]]) {
+            NSArray *arr = (NSArray *)outVal;
+            NSUInteger lim = (pickN > 0 && pickN < arr.count) ? pickN : arr.count;
+            NSMutableArray *rows = [NSMutableArray arrayWithCapacity:lim];
+            for (NSUInteger j = 0; j < lim; j++) {
+                id el = arr[j];
+                @try {
+                    if (pickFields && pickFields.count) {
+                        // 元素是 dict → 只投影指定字段（这是 Cookie 场景的主力用法）
+                        if ([el isKindOfClass:[NSDictionary class]]) {
+                            NSMutableDictionary *one = [NSMutableDictionary dictionary];
+                            for (id fk in pickFields) {
+                                if (![fk isKindOfClass:[NSString class]]) continue;
+                                id fv = [(NSDictionary *)el objectForKey:fk];
+                                if (fv) one[fk] = pickShrink(fv);
+                            }
+                            [rows addObject:one];
+                        } else {
+                            // 元素是对象 → 用 KVC 取字段（NSHTTPCookie 的 name/value 走这条）
+                            NSMutableDictionary *one = [NSMutableDictionary dictionary];
+                            for (id fk in pickFields) {
+                                if (![fk isKindOfClass:[NSString class]]) continue;
+                                id fv = nil;
+                                @try { fv = [el valueForKey:fk]; } @catch (id e) { fv = nil; }
+                                if (fv) one[fk] = pickShrink(fv);
+                            }
+                            [rows addObject:one];
+                        }
+                    } else if (pickKey) {
+                        // 只要某字段的值
+                        id fv = nil;
+                        @try { fv = [el isKindOfClass:[NSDictionary class]] ? [(NSDictionary *)el objectForKey:pickKey]
+                                                                          : [el valueForKey:pickKey]; } @catch (id e) {}
+                        [rows addObject:pickShrink(fv)];
+                    } else {
+                        [rows addObject:pickShrink(el)];
+                    }
+                } @catch (id e) { [rows addObject:@"<err>"]; }
+            }
+            jsonVal = rows; clsOf = @"NSArray(picked)";
+        } else if (pick && [outVal isKindOfClass:[NSDictionary class]]) {
+            NSMutableDictionary *one = [NSMutableDictionary dictionary];
+            if (pickKeys && pickKeys.count) {
+                for (id k in pickKeys)
+                    if ([k isKindOfClass:[NSString class]] && [(NSDictionary *)outVal objectForKey:k])
+                        one[k] = pickShrink([(NSDictionary *)outVal objectForKey:k]);
+            } else {
+                [(NSDictionary *)outVal enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+                    one[[k description]] = pickShrink(v);
+                }];
+            }
+            jsonVal = one; clsOf = @"NSDictionary(picked)";
+        } else if (pick && pick[@"onlyArray"] && [outVal isKindOfClass:[NSArray class]]) {
+            // 纯计数（其实上面已覆盖，这里保留语义）
+            jsonVal = @( [(NSArray *)outVal count] ); clsOf = @"NSArray(count)";
+        } else {
         // 把返回值整理成可 JSON 化的东西
         id jsonVal = nil; NSString *clsOf = @"";
         if ([outVal isKindOfClass:[NSString class]])        { jsonVal = outVal; clsOf = @"NSString"; }
@@ -4841,6 +4934,8 @@ static void AIExecCmd(NSDictionary *cmd) {
         }
         else if (outVal) { jsonVal = [outVal description] ?: @""; clsOf = NSStringFromClass([outVal class]); }
         else { jsonVal = @"<nil>"; clsOf = @"nil"; }
+        }
+        // v61：pick 已把体积压过，这层 8000 截断只对未 pick 的原样回传生效
         if ([jsonVal isKindOfClass:[NSString class]] && [(NSString *)jsonVal length] > 8000)
             jsonVal = [[(NSString *)jsonVal substringToIndex:8000] stringByAppendingString:@"…(截断)"];
         // ★ v59：读回输出参数容器的**最终内容**（函数调完后的值 = 它算出来的明文）
@@ -4860,10 +4955,12 @@ static void AIExecCmd(NSDictionary *cmd) {
                 v = [v description] ?: @"";
             [outs addObject:@{@"i": outBoxIdx[j], @"v": v}];
         }
-        AILog(@"  [cmd] call %@ %@%@ -> %@ %.1fms", cn, instName, sn, clsOf, ms2 * 1000);
+        AILog(@"  [cmd] call %@ %@%@ -> %@ %.1fms%@", cn, instName, sn, clsOf, ms2 * 1000,
+              pick ? @" (picked)" : @"");
         AIReportDict(@{@"op": @"call", @"ok": @(errMsg.length == 0), @"cls": cn, @"sel": sn,
                        @"inst": instName, @"mode": (isInstMode ? @"instance" : @"class"),
                        @"ret": jsonVal ?: @"", @"retCls": clsOf, @"out": outs,
+                       @"pick": pick ? @YES : @NO,
                        @"ms": @(ms2 * 1000), @"err": errMsg});
     } else if ([op isEqualToString:@"sigprobe"]) {
         // v53：签名侦察（只读）。子动作 a=：
