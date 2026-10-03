@@ -109,7 +109,16 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v59";   // v59 = 「输出参数支持」：给 `call` 加**可变容器包装**语法 —— 参数写成 {"$mstr":"初值"} / {"$marr":[...]} / {"$mdict":{...}} 即自动构造 NSMutableString/Array/Dictionary，调用后把容器的**最终内容**回传到 out[]。★ 为什么必须有：真机实测调 KSMWPassportSecurityTools +sig3OnURLPath:method:requestParams:sig3PlainText: 时，第 4 个参数 sig3PlainText: 报 `Attempt to mutate immutable object with setString:` —— 它是**输出参数**（函数把算出的明文 setString: 写回给你），传不可变 NSString 必炸。这是 Cocoa 惯用法：形如 `xxxPlainText:` / `result:` 的参数是 by-reference 输出，必须传**可变**容器。有了 out[]，就能把这类函数「算出来的中间明文」捞出来，这是反推签名算法最关键的原料。▼ v58 前情：给 `call` 加 probe=1（只读方法签名，回 want/argTypes/retType）+ 参数个数判据 `>` 改 `!=`（少一个就是拿未初始化内存当参数 → UB）。▼ v57 前情：路线 A 落地，新增通用 `call` op。★ v56 的 mm=1（按方法名扫）真机挖出签名函数 —— v58 上机复扫又挖出**最关键的统一入口**：KSMWPassportSecurityTools +sig3OnURLPath:method:requestParams:（路径+方法+参数 → 64hex）、+sig3OnURLPath:method:requestParams:sig3PlainText:（多一个**输出**明文参数）、+checkOnSig3UrlPathWhiteList:，以及 KSLASecurityHandler +customSig3WithPath:parameters:（前 6 hex 与前者相同 → 共享 sig3 前缀逻辑）、KSExtensionNetwork +_sig3WithPath:sig:did:、KWAppSignatureBuilder +createTokenSigWithSig:salt:（__NStokensig）、KSGPolicyParser +handleSig3Policy:。这些类**类名里根本没有 sig**，只有按方法名才扫得到。▼ v55/v56 前情：已把「抄+原样重放」跑通（clock/r result=1；签名绑 URL 参数+body、不绑 X-REQUESTID；T+12min 仍有效）。
+static NSString * const kAIVer = @"v60";   // v60 = 「只读单例实例方法」。给 `call` 加 inst: 参数 —— 传白名单内的单例方法名
+   //       （如 inst=sharedHTTPCookieStorage），插件先取到**实例**，再按真实签名调**实例方法**。
+   //       ★ 为什么必须有：`NSHTTPCookieStorage.sharedHTTPCookieStorage.cookies` 是最典型的
+   //       「单例 + 实例方法」，但 v57 的 call 只认类方法（+），够不着。实证：设备 http op
+   //       发出的请求回执 `nCookie: 0`（一个 Cookie 都没带）→ 服务端 result:40「服务器繁忙」
+   //       （实为认不出身份）。要从进程里读真实 Cookie/鉴权头，就必须能调实例方法。
+   //       ★ 安全边界：只认**白名单单例**（NSHTTPCookieStorage/NSUserDefaults/NSFileManager/
+   //       NSNotificationCenter/NSURLCache/NSProcessInfo），全部是只读容器或只读偏好，
+   //       不含任何业务对象；白名单外的 inst 一律拒绝；单例方法必须无参。
+   // v59 = 「输出参数支持」：给 `call` 加**可变容器包装**语法 —— 参数写成 {"$mstr":"初值"} / {"$marr":[...]} / {"$mdict":{...}} 即自动构造 NSMutableString/Array/Dictionary，调用后把容器的**最终内容**回传到 out[]。★ 为什么必须有：真机实测调 KSMWPassportSecurityTools +sig3OnURLPath:method:requestParams:sig3PlainText: 时，第 4 个参数 sig3PlainText: 报 `Attempt to mutate immutable object with setString:` —— 它是**输出参数**（函数把算出的明文 setString: 写回给你），传不可变 NSString 必炸。这是 Cocoa 惯用法：形如 `xxxPlainText:` / `result:` 的参数是 by-reference 输出，必须传**可变**容器。有了 out[]，就能把这类函数「算出来的中间明文」捞出来，这是反推签名算法最关键的原料。▼ v58 前情：给 `call` 加 probe=1（只读方法签名，回 want/argTypes/retType）+ 参数个数判据 `>` 改 `!=`（少一个就是拿未初始化内存当参数 → UB）。▼ v57 前情：路线 A 落地，新增通用 `call` op。★ v56 的 mm=1（按方法名扫）真机挖出签名函数 —— v58 上机复扫又挖出**最关键的统一入口**：KSMWPassportSecurityTools +sig3OnURLPath:method:requestParams:（路径+方法+参数 → 64hex）、+sig3OnURLPath:method:requestParams:sig3PlainText:（多一个**输出**明文参数）、+checkOnSig3UrlPathWhiteList:，以及 KSLASecurityHandler +customSig3WithPath:parameters:（前 6 hex 与前者相同 → 共享 sig3 前缀逻辑）、KSExtensionNetwork +_sig3WithPath:sig:did:、KWAppSignatureBuilder +createTokenSigWithSig:salt:（__NStokensig）、KSGPolicyParser +handleSig3Policy:。这些类**类名里根本没有 sig**，只有按方法名才扫得到。▼ v55/v56 前情：已把「抄+原样重放」跑通（clock/r result=1；签名绑 URL 参数+body、不绑 X-REQUESTID；T+12min 仍有效）。
 //   ---------------------------------------------------------------------------
 //   v49（路线一 · 通用网络监听）的结论留痕 —— 写在版本号旁边，避免后人再走一遍：
 //
@@ -4633,19 +4642,96 @@ static void AIExecCmd(NSDictionary *cmd) {
         NSString *cn = [cmd[@"cls"] isKindOfClass:[NSString class]] ? cmd[@"cls"] : @"";
         NSString *sn = [cmd[@"sel"] isKindOfClass:[NSString class]] ? cmd[@"sel"] : @"";
         NSArray *args = [cmd[@"args"] isKindOfClass:[NSArray class]] ? cmd[@"args"] : @[];
-        if (!cn.length || !sn.length) {
+        if (!sn.length || (!cn.length && !cmd[@"inst"])) {
             AIReportDict(@{@"op": @"call", @"ok": @NO, @"err": @"缺 cls 或 sel"}); return;
         }
+        // ★ v60：**只读单例白名单** —— 解决「单例 + 实例方法」这类最常见的只读形态。
+        //
+        //  为什么必须开这个口子：`NSHTTPCookieStorage.sharedHTTPCookieStorage.cookies` 是最典型的
+        //  「取单例 → 调实例方法」，但 v57 的 call 只认类方法（+），够不着实例方法。
+        //  实证：设备 http op 发出的请求 `nCookie: 0`（一个 Cookie 都没带）→ 服务端 result:40
+        //  「服务器繁忙」（其实是认不出身份）。要拿到真实鉴权头，就必须能从进程里读 Cookie。
+        //
+        //  ★ 安全边界（刻意收得极窄，绝不是万能后门）：
+        //    ① **只认白名单里的单例**，且单例方法必须无参、返回对象；白名单外的 inst 一律拒绝；
+        //    ② 白名单内全是**只读容器/只读偏好**（Cookie 存储、UserDefaults），不含任何业务对象；
+        //    ③ 仍然只走 NSInvocation 按真实签名设参（G94 个数必须恰好相等）；
+        //    ④ 本 op 仍不做读写语义判断 —— 调用方负责只调只读方法。
+        id targetObj = nil;      // 实际被 invoke 的对象（类对象 或 白名单单例）
+        NSString *instName = @"";
+        BOOL isInstMode = NO;
+        if ([cmd[@"inst"] isKindOfClass:[NSString class]] && [(NSString *)cmd[@"inst"] length]) {
+            isInstMode = YES;
+            NSString *iw = cmd[@"inst"];
+            // 白名单：单例方法名 → 该单例所属类（用于校验，避免任意类调任意方法）
+            NSDictionary *instWhite = @{
+                @"NSHTTPCookieStorage":     @[@"sharedHTTPCookieStorage"],
+                @"NSUserDefaults":          @[@"standardUserDefaults"],
+                @"NSFileManager":           @[@"defaultManager"],
+                @"NSNotificationCenter":    @[@"defaultCenter"],
+                @"NSURLCache":              @[@"sharedURLCache"],
+                @"NSProcessInfo":           @[@"processInfo"],
+            };
+            NSString *wantCls = cn.length ? cn : nil;
+            if (!wantCls) {
+                AIReportDict(@{@"op": @"call", @"ok": @NO,
+                               @"err": @"inst 模式必须同时给 cls（用于白名单校验）"}); return;
+            }
+            NSArray *allowed = instWhite[wantCls];
+            if (!allowed || ![allowed containsObject:iw]) {
+                AIReportDict(@{@"op": @"call", @"ok": @NO,
+                               @"err": [NSString stringWithFormat:@"inst 白名单外：%@.%@（只读单例白名单见 v60 注释）",
+                                        wantCls, iw]}); return;
+            }
+            Class wc = NSClassFromString(wantCls);
+            SEL ws = NSSelectorFromString(iw);
+            if (!wc || ![wc respondsToSelector:ws]) {
+                AIReportDict(@{@"op": @"call", @"ok": @NO,
+                               @"err": [NSString stringWithFormat:@"%@ 不响应 %@", wantCls, iw]}); return;
+            }
+            @try {
+                NSMethodSignature *wms = [wc methodSignatureForSelector:ws];
+                if ([wms numberOfArguments] != 2) {   // 单例方法必须无参
+                    AIReportDict(@{@"op": @"call", @"ok": @NO,
+                                   @"err": @"白名单单例方法必须无参"}); return;
+                }
+                NSInvocation *winv = [NSInvocation invocationWithMethodSignature:wms];
+                winv.selector = ws;
+                [winv invokeWithTarget:wc];
+                __unsafe_unretained id got = nil;
+                [winv getReturnValue:&got];
+                targetObj = got;
+                instName = [NSString stringWithFormat:@"%@.%@", wantCls, iw];
+            } @catch (NSException *ex) {
+                AIReportDict(@{@"op": @"call", @"ok": @NO,
+                               @"err": [NSString stringWithFormat:@"取单例异常 %@", ex.reason]}); return;
+            } @catch (id e) {
+                AIReportDict(@{@"op": @"call", @"ok": @NO, @"err": @"取单例未知异常"}); return;
+            }
+            if (!targetObj) {
+                AIReportDict(@{@"op": @"call", @"ok": @NO,
+                               @"err": [NSString stringWithFormat:@"单例 %@ 返回 nil", instName]}); return;
+            }
+        }
         Class c = NSClassFromString(cn);
-        if (!c) { AIReportDict(@{@"op": @"call", @"ok": @NO,
-                                 @"err": [NSString stringWithFormat:@"找不到类 %@", cn]}); return; }
+        if (!isInstMode) {
+            if (!c) { AIReportDict(@{@"op": @"call", @"ok": @NO,
+                                     @"err": [NSString stringWithFormat:@"找不到类 %@", cn]}); return; }
+            targetObj = c;
+        }
+        id invTarget = targetObj;
+        if (!invTarget) {
+            AIReportDict(@{@"op": @"call", @"ok": @NO, @"err": @"目标对象为空"}); return;
+        }
         SEL target = NSSelectorFromString(sn);
-        if (![c respondsToSelector:target]) {
+        if (![invTarget respondsToSelector:target]) {
             AIReportDict(@{@"op": @"call", @"ok": @NO,
-                           @"err": [NSString stringWithFormat:@"%@ 不响应该类方法 %@", cn, sn]}); return;
+                           @"err": [NSString stringWithFormat:@"%@ 不响应%@ %@",
+                                    (instName.length ? instName : cn),
+                                    (isInstMode ? @"实例方法" : @"该类方法"), sn]}); return;
         }
         NSMethodSignature *ms = nil;
-        @try { ms = [c methodSignatureForSelector:target]; } @catch (id e) {}
+        @try { ms = [invTarget methodSignatureForSelector:target]; } @catch (id e) {}
         if (!ms) { AIReportDict(@{@"op": @"call", @"ok": @NO, @"err": @"取不到方法签名"}); return; }
         NSUInteger want = [ms numberOfArguments] - 2;      // 减去 self / _cmd
         // ★ v58 probe：只查签名不调用 —— 这是**只读**操作（只读 methodSignatureForSelector）。
@@ -4659,7 +4745,9 @@ static void AIExecCmd(NSDictionary *cmd) {
                 [argTypes addObject:(t ? [NSString stringWithUTF8String:t] : @"?")];
             }
             const char *rt = [ms methodReturnType];
-            AIReportDict(@{@"op": @"call", @"probe": @YES, @"ok": @YES, @"cls": cn, @"sel": sn,
+            AIReportDict(@{@"op": @"call", @"probe": @YES, @"ok": @YES,
+                           @"cls": cn, @"sel": sn, @"inst": instName,
+                           @"mode": (isInstMode ? @"instance" : @"class"),
                            @"want": @(want), @"argTypes": argTypes,
                            @"retType": (rt ? [NSString stringWithUTF8String:rt] : @"?")});
             return;
@@ -4722,7 +4810,7 @@ static void AIExecCmd(NSDictionary *cmd) {
                     [inv setArgument:&a atIndex:i + 2];
                 }
             }
-            [inv invokeWithTarget:c];
+            [inv invokeWithTarget:invTarget];
             const char *rt = [ms methodReturnType];
             if (rt && (rt[0] == '@' || rt[0] == '#')) {
                 __unsafe_unretained id rv = nil;
@@ -4772,8 +4860,9 @@ static void AIExecCmd(NSDictionary *cmd) {
                 v = [v description] ?: @"";
             [outs addObject:@{@"i": outBoxIdx[j], @"v": v}];
         }
-        AILog(@"  [cmd] call %@ +%@ -> %@ %.1fms", cn, sn, clsOf, ms2 * 1000);
+        AILog(@"  [cmd] call %@ %@%@ -> %@ %.1fms", cn, instName, sn, clsOf, ms2 * 1000);
         AIReportDict(@{@"op": @"call", @"ok": @(errMsg.length == 0), @"cls": cn, @"sel": sn,
+                       @"inst": instName, @"mode": (isInstMode ? @"instance" : @"class"),
                        @"ret": jsonVal ?: @"", @"retCls": clsOf, @"out": outs,
                        @"ms": @(ms2 * 1000), @"err": errMsg});
     } else if ([op isEqualToString:@"sigprobe"]) {
