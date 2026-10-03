@@ -109,7 +109,18 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v61";   // v61 = 「call 设备侧就地抽取」。给 `call` 加 pick: 参数 —— 在**设备内**从大返回值里
+static NSString * const kAIVer = @"v62";   // v62 = 「KSN1-1 能力层加固 + 设备侧签名自给自足」。三件事：
+   //       ① `http` op 加 `maxlen`：回执体积上限从硬编码 20000 改为可由 `cmd.maxlen` 覆盖（0 = 不截断）。
+   //          为什么必须：`/homepage/tasks` 回执 20005B，正好被 20000 砍掉最后一个字符 → json 解析报
+   //          `Unterminated string`，看起来像「接口坏了」，实为回执被截。★ 截断必须**显式**且**可关**。
+   //       ② `call` op 加 `maxlen`：单个字符串返回上限从硬编码 8000 改为可覆盖（0 = 不截断）。
+   //          为什么必须：`_methodDescription`（一次性 dump 某类全部方法名+地址）长 8005 字符，
+   //          被砍在 8005-5 处；且中继层单条回执 ~4000 上限（G105），双重截断下 json 必坏。
+   //       ③ body 参与签名：确认 `http` op 的 `cmd[@"body"]` → HTTPBody 通路**早已完整**，
+   //          写接口签名所需原料（URL 参 + body 参）在设备侧**取得到**，无需再改 dylib。属脚本层组装。
+   //       ★ 安全边界：① ② 都只是「回执截断阈值」这一个数字可配，**不新增任何动作能力**，
+   //         不放开任何白名单；`maxlen` 只影响「给你看多少」，不影响「能做什么」。零风险。
+   //       ▼ v61 前情：v61 = 「call 设备侧就地抽取」。给 `call` 加 pick: 参数 —— 在**设备内**从大返回值里
    //       挑出要的子集再回传，解决「返回值太大撑爆回执」。★ 为什么必须：v60 的 inst 白名单已能取到
    //       单例实例，但 `NSHTTPCookieStorage.cookies` 返回 **744 个 Cookie**，description 展开数百 KB，
    //       AIReportDict 的 POST 超限直接丢包 → 调用方看到的是**彻底无回执**（不是报错！），极易误判成
@@ -4588,6 +4599,22 @@ static void AIExecCmd(NSDictionary *cmd) {
             if (![v isKindOfClass:[NSString class]]) v = [v description];
             @try { [rq setValue:(NSString *)v forHTTPHeaderField:k]; } @catch (id ex) {}
         }
+        // ★ v62：回执体积上限可调（**KSN1-1**）。
+        //
+        //  为什么必须加：`http` op 原来把回执硬编码在 20000 字符，
+        //  实测 `/homepage/tasks` 响应 **20005 B** → 正好被砍在边界，
+        //  拿到的 JSON 尾部不完整（`json.loads` 报 Unterminated string）。
+        //  「写接口」的响应往往比读接口更大（签到/宝箱领取带上完整账户快照），
+        //  所以这个口子必须先开。
+        //
+        //  取值语义：`maxlen` 缺省 20000（保持原行为）；<=0 表示不截断（调用方自负体积）。
+        //  注意：这条是**回执**上限，不是请求上限；调大只影响回传，不影响请求本身。
+        NSUInteger cap = 20000;   // 回执体积上限，避免撑爆中继（v62：可由 cmd.maxlen 覆盖）
+        if (cmd[@"maxlen"] != nil) {
+            NSInteger ml = [cmd[@"maxlen"] integerValue];
+            cap = (ml <= 0) ? 0 : (NSUInteger)ml;   // 0 = 不截断
+        }
+        __block NSUInteger bcap = cap;
         // ★ v51c：不能在轮询线程上 dispatch_semaphore_wait 死等 ——
         // v51b 实测：一进这个分支，轮询线程被占死，之后连 status/probe 都不再消费，
         // 整条通道瘫掉（lastOp 冻住、beat 还在跳）。改用「异步 + 独立线程」：
@@ -4616,8 +4643,10 @@ static void AIExecCmd(NSDictionary *cmd) {
                 NSTimeInterval ms = [[NSDate date] timeIntervalSinceDate:t0];
                 NSString *txt = out ? [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding] : nil;
                 if (!txt && out) txt = [out base64EncodedStringWithOptions:0];
-                NSUInteger cap = 20000;   // 回执体积上限，避免撑爆中继
-                if (txt.length > cap) txt = [[txt substringToIndex:cap] stringByAppendingString:@"…(截断)"];
+                // ★ v62：截断上限由外层 cap/maxlen 决定（0 = 不截断）。KSN1-1
+                if (bcap > 0 && txt.length > bcap) {
+                    txt = [[txt substringToIndex:bcap] stringByAppendingString:@"…(截断)"];
+                }
                 AILog(@"  [cmd] http %@ %@ -> code=%ld %ldB %.0fms cookie=%ld",
                       bm, bu, (long)code, (long)out.length, ms * 1000, (long)bnCookie);
                 AIReportDict(@{@"op": @"http", @"ok": @(out != nil && e == nil),
@@ -4936,9 +4965,21 @@ static void AIExecCmd(NSDictionary *cmd) {
         else if (outVal) { jsonVal = [outVal description] ?: @""; clsOf = NSStringFromClass([outVal class]); }
         else { jsonVal = @"<nil>"; clsOf = @"nil"; }
         }
-        // v61：pick 已把体积压过，这层 8000 截断只对未 pick 的原样回传生效
-        if ([jsonVal isKindOfClass:[NSString class]] && [(NSString *)jsonVal length] > 8000)
-            jsonVal = [[(NSString *)jsonVal substringToIndex:8000] stringByAppendingString:@"…(截断)"];
+        // ★ v62：call 的单串返回上限可调（**KSN1-1**）。
+        //
+        //  为什么要加：原来硬编码 8000，`_methodDescription` 实测 8005 字符
+        //  → 正好被砍（且中继层还有 ~4000 的第二道坎，见 G105）。
+        //  挖方法列表/读大字符串时，需要一个能放宽的口子。
+        //
+        //  取值：`maxlen` 缺省 8000（保持原行为）；<=0 表示不截断。
+        NSUInteger strCap = 8000;
+        if (cmd[@"maxlen"] != nil) {
+            NSInteger ml = [cmd[@"maxlen"] integerValue];
+            strCap = (ml <= 0) ? 0 : (NSUInteger)ml;
+        }
+        if (strCap > 0 && [jsonVal isKindOfClass:[NSString class]]
+            && [(NSString *)jsonVal length] > strCap)
+            jsonVal = [[(NSString *)jsonVal substringToIndex:strCap] stringByAppendingString:@"…(截断)"];
         // ★ v59：读回输出参数容器的**最终内容**（函数调完后的值 = 它算出来的明文）
         NSMutableArray *outs = [NSMutableArray array];
         for (NSUInteger j = 0; j < outBoxObj.count; j++) {
