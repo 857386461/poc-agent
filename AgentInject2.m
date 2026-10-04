@@ -109,7 +109,21 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v62";   // v62 = 「KSN1-1 能力层加固 + 设备侧签名自给自足」。三件事：
+static NSString * const kAIVer = @"v63";   // v63 = 「罩子进度条改为视频停留时间进度」（2026-10-04 会话，用户需求）：
+   //       ① `task` op 新增 `pct`（0~100 显式进度）：脚本每秒发 `task{pct:已看/需看×100}`，
+   //          罩子进度条**直接用这个值**填充，不再是「第几步/共几步」。未传 pct 时
+   //          回落老的 idx/total 算法 —— **老调用方/老设备行为完全不变**。
+   //          为什么：用户原话「防护罩上的进度条现在是动作进度，能不能改成视频停留时间进度，
+   //          这样我就能看到本次视频需要多久切换」。
+   //       ② `task` op 的 `ev` **不再进 L3 步骤列表**：脚本改用它传「剩余 12s」这种
+   //          每秒刷新的实时文案，若仍 AIStepAdd 会把步骤列表刷满（原设计是给一次性证据用的）。
+   //       ③ `AIGuardSync` 在「罩已显示」时也重绘（新增 `AIGuardRenderIfContentChanged`，
+   //          按 pct/idx/state 变化节流）：否则罩子已显示就不再 render，进度条推不动。
+   //       ④ 罩子 meta 文案：有 pct 时显示「本视频进度 N%%」，否则仍是「共 N 步 · 当前第 M 步」。
+   //       ★ 副作用（正面）：脚本每秒上报 = 每秒 AIOpMark() = 续住 8s 余晖，
+   //         于是「看视频期间罩子全程亮」—— 这正是「AI 正在操作手机」的如实呈现；
+   //         视频看完停止上报，8s 后罩子自动落。**没有改 guardAuto、没有 pin。**
+   //       ▼ v62 前情：v62 = 「KSN1-1 能力层加固 + 设备侧签名自给自足」。三件事：
    //       ① `http` op 加 `maxlen`：回执体积上限从硬编码 20000 改为可由 `cmd.maxlen` 覆盖（0 = 不截断）。
    //          为什么必须：`/homepage/tasks` 回执 20005B，正好被 20000 砍掉最后一个字符 → json 解析报
    //          `Unterminated string`，看起来像「接口坏了」，实为回执被截。★ 截断必须**显式**且**可关**。
@@ -224,6 +238,11 @@ static NSString *gTaskStep = nil;        // 当前动作，如「上滑切下一
 static int      gTaskIdx   = 0;          // 第几步（1-based）
 static int      gTaskTotal = 0;          // 共几步；0 = 无任务（悬浮球回落显示版本/心跳）
 static int      gTaskOk    = -1;         // -1 执行中 / 1 最近一步成功 / 0 最近一步失败
+// v45（2026-10-04）：显式进度百分比。脚本用 task{pct:0..100} 直接指定进度条填充，
+//   用于把罩子进度条从「第几步/共几步」变成「本视频已看/需看时长」。
+//   gTaskPctSet=NO 时回落老的 idx/total 算法（旧调用方/旧脚本行为不变）。
+static int      gTaskPct    = 0;
+static BOOL     gTaskPctSet = NO;
 static BOOL      gFloatForce    = NO;    // 交互操作要立刻重绘，跳过节流
 static CFTimeInterval gFloatLast = 0;
 // v48 · G55：拖动起步阈值状态。
@@ -277,6 +296,7 @@ static UIWindow *AIHostWindow(void);
 static void AISetOverlayVisible(BOOL vis);   // 盖屏按钮在它的定义之前就要用
 static void AIGuardSync(void);               // v32：罩层状态自愈（tick 每秒收敛一次）
 static void AIGuardRender(void);             // v32：guardVerify(4392) 在定义(4411)之前要用
+static void AIGuardRenderIfContentChanged(void);   // v45：AIGuardSync(6283) 在定义(6289)之前要用
 static void AIFloatSync(void);               // v33：悬浮球自愈（tick 每秒收敛一次）
 static void AIOpMark(void);                  // v34：操作类命令点亮罩层（AIExecCmd 在定义之前要用）
 static void AIOpIdleCheck(void);             // v34：操作停下 8s 后罩层自动落下
@@ -4447,10 +4467,17 @@ static void AIExecCmd(NSDictionary *cmd) {
             NSString *state = stt ?: ((total > 0) ? @"exec" : @"idle");
             if (cmd[@"guard"]) gGuardMode = [cmd[@"guard"] isEqualToString:@"verify"] ? @"verify" : @"privacy";
             if (cmd[@"pin"])   gGuardPinned = [cmd[@"pin"] boolValue];
-            // 结果侧证据进 L3 步骤列表（有 ev 才记，避免把列表刷满）
-            if ([evv isKindOfClass:[NSString class]] && [evv length])
-                AIStepAdd(state, step.length ? step : (brief.length ? brief : @"步骤"),
-                          (total > 0 ? [NSString stringWithFormat:@"%d/%d", idx, total] : @""), evv);
+            // ★ v45（2026-10-04 用户需求）：显式进度百分比。
+            //   需求原话：「防护罩上的进度条现在是动作进度，能不能改成视频停留时间进度，
+            //             这样我就能看到本次视频需要多久切换」。
+            //   脚本每秒发一条 task{pct: 已看/需看×100}，罩子进度条直接用它，
+            //   不再用 idx/total 那套「第几步/共几步」。传 -1 = 未指定，回落 idx/total。
+            int pctIn = cmd[@"pct"] ? [cmd[@"pct"] intValue] : -1;
+            if (pctIn >= 0 && pctIn <= 100) { gTaskPct = pctIn; gTaskPctSet = YES; }
+            else if (total <= 0)            { gTaskPctSet = NO; }   // 任务清空 → 撤下显式进度
+            // evv 不再进 L3 步骤列表：v45 脚本用它传「剩余 12s」这种每秒刷新的实时文案，
+            //   若仍 AIStepAdd 会把步骤列表刷满（原来它要求「有 ev 才记」是给一次性证据用的）。
+            (void)evv;
             AITaskSet(name, idx, total, state, ok, brief);
             gTaskStep = step;              // v37：主线程写（原轮询线程裸写，G25 竞态点）
             if (ok >= 0 && total > 0) {
@@ -6156,19 +6183,30 @@ static void AIGuardRender(void) {
 
             // ---- v42：进度条（原型 .g-meta + .g-bar）----
             // 旧实现只有标题+副标题，看不出「跑到第几步、还剩多少」。
+            // v45：进度条改为**显式进度优先** —— 脚本每秒发 task{pct}，
+            //   于是条子显示的是「本视频已看时长 / 需看时长」，而非「第几步/共几步」。
+            //   没传 pct（老调用方）→ 回落 idx/total，行为完全不变。
             UILabel *meta = [[UILabel alloc] initWithFrame:CGRectMake(20, cy + 100, f.size.width - 40, 16)];
             meta.textAlignment = NSTextAlignmentCenter;
             meta.font = [UIFont systemFontOfSize:11];
             meta.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.85];   // v45：.72→.85 回原型 .g-meta{opacity:.85}
-            meta.text = (gTaskTotal > 0)
-                ? [NSString stringWithFormat:@"共 %d 步 · 当前第 %d 步", gTaskTotal, gTaskIdx]
-                : @"无任务执行中";
+            if (gTaskTotal > 0) {
+                meta.text = gTaskPctSet
+                    ? [NSString stringWithFormat:@"本视频进度 %d%%", gTaskPct]
+                    : [NSString stringWithFormat:@"共 %d 步 · 当前第 %d 步", gTaskTotal, gTaskIdx];
+            } else {
+                meta.text = @"无任务执行中";
+            }
             [host addSubview:meta];
             CGFloat barW = 196, barH = 6;
             UIView *barBg = [[UIView alloc] initWithFrame:CGRectMake((f.size.width - barW) / 2.0, cy + 122, barW, barH)];
             barBg.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.18];
             barBg.layer.cornerRadius = barH / 2.0; barBg.clipsToBounds = YES;
-            CGFloat prog = (gTaskTotal > 0) ? MIN(1.0, (CGFloat)gTaskIdx / (CGFloat)gTaskTotal) : 0;
+            CGFloat prog = 0;
+            if (gTaskTotal > 0) {
+                prog = gTaskPctSet ? (gTaskPct / 100.0)
+                                   : MIN(1.0, (CGFloat)gTaskIdx / (CGFloat)gTaskTotal);
+            }
             UIView *fill = [[UIView alloc] initWithFrame:CGRectMake(0, 0, barW * prog, barH)];
             fill.backgroundColor = AIColorFor(stG);      // 进度条与状态同色
             fill.layer.cornerRadius = barH / 2.0;
@@ -6253,6 +6291,28 @@ static void AIGuardSync(void) {
     }
     if (!gOverlayWindow || !gOverlayWindow.rootViewController) { AIGuardRender(); return; }
     if (gOverlayWindow.hidden) { gOverlayWindow.hidden = NO; [gOverlayWindow makeKeyAndVisible]; }
+    // ★ v45：罩子已经显示时也要**重绘**，否则内容（进度条 pct、剩余 Ns 文案）不会更新。
+    //   原来这里什么都不做（"罩已显示就不重画"），于是脚本每秒推进度条，屏上纹丝不动。
+    //   重绘是 AIGuardRender() 内部做的事（它会 removeFromSuperview 后重建），
+    //   由下面这个 helper 控制调用频率，避免每秒 60 帧的无谓重建。
+    AIGuardRenderIfContentChanged();
+}
+
+// v45：内容变化节流重绘。
+//   脚本每秒发一次 task{pct}，若每次都整层重建会闪；这里记录「上次用的 pct/步/结果」，
+//   只有真的变了才重绘。1Hz 的进度刷新完全够用，且不会有肉眼可见的闪烁。
+static void AIGuardRenderIfContentChanged(void) {
+    static int  lastPct   = -999;
+    static int  lastIdx   = -999;
+    static int  lastState = -999;   // 用 gTaskState 的 hash 代表
+    static BOOL lastPctSet = NO;
+    int  curPct   = gTaskPctSet ? gTaskPct : -1;
+    int  curIdx   = gTaskIdx;
+    int  curState = (int)[gTaskState hash];
+    if (curPct == lastPct && curIdx == lastIdx && curState == lastState
+        && lastPctSet == gTaskPctSet) return;
+    lastPct = curPct; lastIdx = curIdx; lastState = curState; lastPctSet = gTaskPctSet;
+    AIGuardRender();
 }
 
 static void AISetOverlayVisible(BOOL vis) {
@@ -6803,7 +6863,12 @@ static NSDictionary *AIUiDict(void) {
     //           float.edge / float.reduce（吸边、减弱动效）
     int okCnt = 0;
     for (NSDictionary *d in gSteps) if ([d[@"s"] isEqualToString:@"ok"]) okCnt++;
-    int pct = (gTaskTotal > 0) ? (int)((gTaskIdx * 100.0) / gTaskTotal + 0.5) : 0;
+    // v45：显式进度优先（脚本 task{pct} 指定），否则回落 idx/total。
+    int pct = 0;
+    if (gTaskTotal > 0) {
+        pct = gTaskPctSet ? gTaskPct
+                          : (int)((gTaskIdx * 100.0) / gTaskTotal + 0.5);
+    }
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
     // recaptext 回显「卡面上真正看到的一段话」，供脚本断言。
     // v42 修：gTaskResult 现在只存纯原因，所以这里必须把卡自己的标题拼回来才等价于屏上所见
