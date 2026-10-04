@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v64";   // v64 = v63 + 修「本视频进度」两条实测 bug（① pct 计算被 gTaskTotal>0 挡住 → 恒 0；② 脚本 step=10,total=0 命中 AITaskSet 的「清任务」分支 → 状态变 idle、pct 被撤。修法：pct 独立于 total；脚本改传 idx>=1,total=1，进度交给显式 pct）。v63 = 「罩子进度条改为视频停留时间进度」（2026-10-04 会话，用户需求）：
+static NSString * const kAIVer = @"v65";   // v65 = 「回退进度条到 v42/v48 原版（用户拍板）」：v63/v64 的「本视频进度 N%」不被接受 → 恢复「共 N 步 · 当前第 M 步」+ idx/total 填充；脚本改为按时间切段推 idx（保留平滑推进动效，不改 UI）。显式 pct 通道保留但不再使用。v64 = v63 + 修「本视频进度」两条实测 bug（① pct 计算被 gTaskTotal>0 挡住 → 恒 0；② 脚本 step=10,total=0 命中 AITaskSet 的「清任务」分支 → 状态变 idle、pct 被撤。修法：pct 独立于 total；脚本改传 idx>=1,total=1，进度交给显式 pct）。v63 = 「罩子进度条改为视频停留时间进度」（2026-10-04 会话，用户需求）：
    //       ① `task` op 新增 `pct`（0~100 显式进度）：脚本每秒发 `task{pct:已看/需看×100}`，
    //          罩子进度条**直接用这个值**填充，不再是「第几步/共几步」。未传 pct 时
    //          回落老的 idx/total 算法 —— **老调用方/老设备行为完全不变**。
@@ -6188,32 +6188,24 @@ static void AIGuardRender(void) {
 
             // ---- v42：进度条（原型 .g-meta + .g-bar）----
             // 旧实现只有标题+副标题，看不出「跑到第几步、还剩多少」。
-            // v45：进度条改为**显式进度优先** —— 脚本每秒发 task{pct}，
-            //   于是条子显示的是「本视频已看时长 / 需看时长」，而非「第几步/共几步」。
-            //   没传 pct（老调用方）→ 回落 idx/total，行为完全不变。
+            // ★ v65（2026-10-04 用户拍板）：**回退到 v42/v48 原版进度条**。
+            //   用户原话：「改回63之前那版进度条吧，就是原来的进度条那款」。
+            //   v63/v64 的「本视频进度 N%%」不被接受 → 恢复「共 N 步 · 当前第 M 步」+ idx/total 填充。
+            //   ⚠ 显式 pct 通道（gTaskPct/gTaskPctSet）**保留在源码里但不再被这里使用** ——
+            //     回执 ui.guard.pct 仍会随 idx/total 走（与 v42 行为一致），脚本不必回退。
             UILabel *meta = [[UILabel alloc] initWithFrame:CGRectMake(20, cy + 100, f.size.width - 40, 16)];
             meta.textAlignment = NSTextAlignmentCenter;
             meta.font = [UIFont systemFontOfSize:11];
             meta.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.85];   // v45：.72→.85 回原型 .g-meta{opacity:.85}
-            // v45：显式 pct 优先，且**独立于 gTaskTotal**（脚本报进度时 total=0）。
-            if (gTaskPctSet) {
-                meta.text = [NSString stringWithFormat:@"本视频进度 %d%%", gTaskPct];
-            } else if (gTaskTotal > 0) {
-                meta.text = [NSString stringWithFormat:@"共 %d 步 · 当前第 %d 步", gTaskTotal, gTaskIdx];
-            } else {
-                meta.text = @"无任务执行中";
-            }
+            meta.text = (gTaskTotal > 0)
+                ? [NSString stringWithFormat:@"共 %d 步 · 当前第 %d 步", gTaskTotal, gTaskIdx]
+                : @"无任务执行中";
             [host addSubview:meta];
             CGFloat barW = 196, barH = 6;
             UIView *barBg = [[UIView alloc] initWithFrame:CGRectMake((f.size.width - barW) / 2.0, cy + 122, barW, barH)];
             barBg.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.18];
             barBg.layer.cornerRadius = barH / 2.0; barBg.clipsToBounds = YES;
-            CGFloat prog = 0;
-            if (gTaskPctSet) {
-                prog = gTaskPct / 100.0;
-            } else if (gTaskTotal > 0) {
-                prog = MIN(1.0, (CGFloat)gTaskIdx / (CGFloat)gTaskTotal);
-            }
+            CGFloat prog = (gTaskTotal > 0) ? MIN(1.0, (CGFloat)gTaskIdx / (CGFloat)gTaskTotal) : 0;
             UIView *fill = [[UIView alloc] initWithFrame:CGRectMake(0, 0, barW * prog, barH)];
             fill.backgroundColor = AIColorFor(stG);      // 进度条与状态同色
             fill.layer.cornerRadius = barH / 2.0;
@@ -6870,16 +6862,10 @@ static NSDictionary *AIUiDict(void) {
     //           float.edge / float.reduce（吸边、减弱动效）
     int okCnt = 0;
     for (NSDictionary *d in gSteps) if ([d[@"s"] isEqualToString:@"ok"]) okCnt++;
-    // v45：显式进度优先（脚本 task{pct} 指定），否则回落 idx/total。
-    //   ★ 注意：显式 pct 必须**独立于 gTaskTotal** —— 脚本报进度时 total 传 0
-    //     （"本视频进度"跟"共几步"无关），若把它放在 gTaskTotal>0 里面，
-    //     回执 pct 恒为 0、屏上进度条也永远不动。这是 v63 首版实测踩到的坑。
-    int pct = 0;
-    if (gTaskPctSet) {
-        pct = gTaskPct;
-    } else if (gTaskTotal > 0) {
-        pct = (int)((gTaskIdx * 100.0) / gTaskTotal + 0.5);
-    }
+    // ★ v65：回退到 v42 原算法（纯 idx/total）。
+    //   v45 的显式 pct（gTaskPct/gTaskPctSet）保留在源码里但不再参与，
+    //   保证「回执 pct」与「屏上进度条」口径一致，不会一个走显式一个走 idx/total。
+    int pct = (gTaskTotal > 0) ? (int)((gTaskIdx * 100.0) / gTaskTotal + 0.5) : 0;
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
     // recaptext 回显「卡面上真正看到的一段话」，供脚本断言。
     // v42 修：gTaskResult 现在只存纯原因，所以这里必须把卡自己的标题拼回来才等价于屏上所见
