@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v63";   // v63 = 「罩子进度条改为视频停留时间进度」（2026-10-04 会话，用户需求）：
+static NSString * const kAIVer = @"v64";   // v64 = v63 + 修「本视频进度」两条实测 bug（① pct 计算被 gTaskTotal>0 挡住 → 恒 0；② 脚本 step=10,total=0 命中 AITaskSet 的「清任务」分支 → 状态变 idle、pct 被撤。修法：pct 独立于 total；脚本改传 idx>=1,total=1，进度交给显式 pct）。v63 = 「罩子进度条改为视频停留时间进度」（2026-10-04 会话，用户需求）：
    //       ① `task` op 新增 `pct`（0~100 显式进度）：脚本每秒发 `task{pct:已看/需看×100}`，
    //          罩子进度条**直接用这个值**填充，不再是「第几步/共几步」。未传 pct 时
    //          回落老的 idx/total 算法 —— **老调用方/老设备行为完全不变**。
@@ -4474,7 +4474,12 @@ static void AIExecCmd(NSDictionary *cmd) {
             //   不再用 idx/total 那套「第几步/共几步」。传 -1 = 未指定，回落 idx/total。
             int pctIn = cmd[@"pct"] ? [cmd[@"pct"] intValue] : -1;
             if (pctIn >= 0 && pctIn <= 100) { gTaskPct = pctIn; gTaskPctSet = YES; }
-            else if (total <= 0)            { gTaskPctSet = NO; }   // 任务清空 → 撤下显式进度
+            else if (total <= 0 && ![state isEqualToString:@"exec"]) {
+                // v45：任务**真正结束**（清空且非执行态）才撤显式进度。
+                //   ⚠ 不能只看 total<=0 —— 脚本报进度时正好 total=0，
+                //     那样每帧都会把自己刚设的 pct 撤掉（v63 首版实测踩到）。
+                gTaskPctSet = NO;
+            }
             // evv 不再进 L3 步骤列表：v45 脚本用它传「剩余 12s」这种每秒刷新的实时文案，
             //   若仍 AIStepAdd 会把步骤列表刷满（原来它要求「有 ev 才记」是给一次性证据用的）。
             (void)evv;
@@ -6190,10 +6195,11 @@ static void AIGuardRender(void) {
             meta.textAlignment = NSTextAlignmentCenter;
             meta.font = [UIFont systemFontOfSize:11];
             meta.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.85];   // v45：.72→.85 回原型 .g-meta{opacity:.85}
-            if (gTaskTotal > 0) {
-                meta.text = gTaskPctSet
-                    ? [NSString stringWithFormat:@"本视频进度 %d%%", gTaskPct]
-                    : [NSString stringWithFormat:@"共 %d 步 · 当前第 %d 步", gTaskTotal, gTaskIdx];
+            // v45：显式 pct 优先，且**独立于 gTaskTotal**（脚本报进度时 total=0）。
+            if (gTaskPctSet) {
+                meta.text = [NSString stringWithFormat:@"本视频进度 %d%%", gTaskPct];
+            } else if (gTaskTotal > 0) {
+                meta.text = [NSString stringWithFormat:@"共 %d 步 · 当前第 %d 步", gTaskTotal, gTaskIdx];
             } else {
                 meta.text = @"无任务执行中";
             }
@@ -6203,9 +6209,10 @@ static void AIGuardRender(void) {
             barBg.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.18];
             barBg.layer.cornerRadius = barH / 2.0; barBg.clipsToBounds = YES;
             CGFloat prog = 0;
-            if (gTaskTotal > 0) {
-                prog = gTaskPctSet ? (gTaskPct / 100.0)
-                                   : MIN(1.0, (CGFloat)gTaskIdx / (CGFloat)gTaskTotal);
+            if (gTaskPctSet) {
+                prog = gTaskPct / 100.0;
+            } else if (gTaskTotal > 0) {
+                prog = MIN(1.0, (CGFloat)gTaskIdx / (CGFloat)gTaskTotal);
             }
             UIView *fill = [[UIView alloc] initWithFrame:CGRectMake(0, 0, barW * prog, barH)];
             fill.backgroundColor = AIColorFor(stG);      // 进度条与状态同色
@@ -6864,10 +6871,14 @@ static NSDictionary *AIUiDict(void) {
     int okCnt = 0;
     for (NSDictionary *d in gSteps) if ([d[@"s"] isEqualToString:@"ok"]) okCnt++;
     // v45：显式进度优先（脚本 task{pct} 指定），否则回落 idx/total。
+    //   ★ 注意：显式 pct 必须**独立于 gTaskTotal** —— 脚本报进度时 total 传 0
+    //     （"本视频进度"跟"共几步"无关），若把它放在 gTaskTotal>0 里面，
+    //     回执 pct 恒为 0、屏上进度条也永远不动。这是 v63 首版实测踩到的坑。
     int pct = 0;
-    if (gTaskTotal > 0) {
-        pct = gTaskPctSet ? gTaskPct
-                          : (int)((gTaskIdx * 100.0) / gTaskTotal + 0.5);
+    if (gTaskPctSet) {
+        pct = gTaskPct;
+    } else if (gTaskTotal > 0) {
+        pct = (int)((gTaskIdx * 100.0) / gTaskTotal + 0.5);
     }
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
     // recaptext 回显「卡面上真正看到的一段话」，供脚本断言。
