@@ -2348,12 +2348,20 @@ static NSString *AIAutorunScroll(void) {
 }
 
 // 点一下（主线程内）
+// ★ v66 修（侧边栏灾难）：原实现只调 AITapUIControlAt —— 它在**自绘控件**上必然失败。
+//   快手侧边栏整屏是 TKView（自绘），probe 显示「沿父链 12 层内无 UIControl」，
+//   于是「点 (29,69) 关侧边栏」永远点不动 → 每轮检测到侧边栏→点→无效→再检测，死循环。
+//   修法：与 vfind/picktxt 同套路，UIControl 优先、**失败降级到手势** AIGestureTapAt。
 static BOOL AIAutorunTap(double x, double y) {
     __block BOOL ok = NO;
     AIMainSync(^{
         @try {
             NSString *desc = nil;
             ok = AITapUIControlAt(CGPointMake(x, y), &desc);
+            if (!ok) {
+                NSDictionary *g = AIGestureTapAt(CGPointMake(x, y));
+                ok = [g[@"ok"] boolValue];
+            }
         } @catch (NSException *e) {}
     });
     return ok;
@@ -2423,9 +2431,35 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
                 }
             }
             if (siderHits >= 3) {
-                AILog(@"[autorun] 侧边栏开着（命中 %d）→ 点 (29,69) 回 feed", siderHits);
-                AIAutorunTap(29, 69);
-                [NSThread sleepForTimeInterval:1.5];
+                // ★ v66 修：原实现只点 (29,69) 一次就 continue，从不复验。
+                //   侧边栏是**自绘抽屉**（TKView），ks_brush 的成熟做法是**多候选逐个试**：
+                //   ① (29,69) toggle  ② 外侧空白 (350,420)/(350,700)  ③ 首页 tab
+                //   且**每步都用结果侧（siderHits）复验**，不再信 ok=true。
+                AILog(@"[autorun] 侧边栏开着（命中 %d）→ 逐个试关闭", siderHits);
+                static double pts[4][2] = {{29,69}, {350,420}, {350,700}, {39,786}};
+                BOOL closed = NO;
+                for (int k = 0; k < 4 && !closed; k++) {
+                    AIAutorunTap(pts[k][0], pts[k][1]);
+                    [NSThread sleepForTimeInterval:1.6];
+                    NSString *t2 = AIAutorunReadText();
+                    if (!t2.length) break;
+                    NSMutableDictionary *fp2 = [NSMutableDictionary dictionary];
+                    NSMutableArray *vis2 = [NSMutableArray array];
+                    NSString *a2 = nil;
+                    double sh2 = AIAutorunShift(t2);
+                    AIAutorunParse(t2, sh2, fp2, &a2, vis2);
+                    int h2 = 0;
+                    for (NSString *w in skw) {
+                        for (NSString *l in vis2) { if ([l containsString:w]) { h2++; break; } }
+                    }
+                    AILog(@"[autorun]   候选%d (%.0f,%.0f) → 侧边栏命中 %d",
+                          k + 1, pts[k][0], pts[k][1], h2);
+                    if (h2 < 3) closed = YES;
+                }
+                if (!closed) {
+                    AILog(@"[autorun] ⚠️ 侧边栏 4 个候选都没关掉，退出养号（避免死循环）");
+                    gAutorunStop = 1;
+                }
                 continue;
             }
 
@@ -2445,10 +2479,14 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
                 lostStreak++;
                 AILog(@"[autorun] #%ld 落空（连 %d）", idx, lostStreak);
                 if (lostStreak >= 3) {
-                    AIAutorunTap(29, 69);            // 侧边栏按钮
-                    [NSThread sleepForTimeInterval:1.2];
+                    // ★ v66 修（「老是打开侧边栏」的直接原因）：原代码这里点 (29,69)
+                    //   当「回家路」，但 (29,69) 在 feed 页就是 KSCubeTopBarNavigationButton
+                    //   —— **打开侧边栏的按钮**（tapui 实测 desc 印证）。
+                    //   语义完全用反了：本想回家，实际把侧边栏捅开。
+                    //   改为只用底部「首页 tab」，它是唯一安全的回家通道。
+                    AILog(@"[autorun] 连落空 3 次 → 点首页 tab 回家（不再点 (29,69)：那是侧边栏开关）");
                     AIAutorunTap(39, 786);           // 首页 tab
-                    [NSThread sleepForTimeInterval:1.2];
+                    [NSThread sleepForTimeInterval:1.5];
                     lostStreak = 0;
                 }
                 AIAutorunScroll();
