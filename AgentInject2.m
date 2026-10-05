@@ -55,6 +55,21 @@
 static NSMutableString *gLog = nil;
 static NSLock          *gLogLock = nil;
 
+// ★ v66 修：日志环形裁剪（抽成公共函数，写日志时与 log op 时都能调）。
+//   一次贪心裁到 12 万字符以内 —— 否则每次只裁 2 万、要裁很多次才降下来。
+static void AILogTrim(void) {
+    if (!gLog) return;
+    [gLogLock lock];
+    while (gLog.length > 120000) {
+        NSRange r = [gLog rangeOfString:@"\n" options:0
+                                  range:NSMakeRange(0, MIN((NSUInteger)40000, gLog.length))];
+        NSUInteger cut = (r.location != NSNotFound) ? (r.location + 1) : 40000;
+        if (cut >= gLog.length) break;
+        [gLog deleteCharactersInRange:NSMakeRange(0, cut)];
+    }
+    [gLogLock unlock];
+}
+
 static void AILogv(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
@@ -62,18 +77,8 @@ static void AILogv(NSString *fmt, ...) {
     if (!gLog) { NSLog(@"[AI2] %@", s); return; }
     [gLogLock lock];
     [gLog appendString:s]; [gLog appendString:@"\n"];
-    // ★ v66 修：日志环形上限 —— 否则跑久了 gLog 涨到几 MB，log op 响应传输超时
-    if (gLog.length > 120000) {
-        NSRange r = [gLog rangeOfString:@"\n"
-                               options:0
-                                 range:NSMakeRange(0, 20000)];
-        if (r.location != NSNotFound) {
-            [gLog deleteCharactersInRange:NSMakeRange(0, r.location + 1)];
-        } else {
-            [gLog deleteCharactersInRange:NSMakeRange(0, 20000)];
-        }
-    }
     [gLogLock unlock];
+    AILogTrim();
     NSLog(@"[AI2] %@", s);
 }
 #define AILog(...) AILogv(__VA_ARGS__)
@@ -3576,6 +3581,25 @@ static NSString *AIIpAddr(void) {
     return res;
 }
 
+// ★ v66 修：原实现 [gLog copy] 全量拷贝 + componentsSeparatedByString 全量切分，
+//   日志涨到 MB 级后这一步极慢（几万个子串），且回执必然撑爆中继上限 → 双双超时。
+//   改为**在锁内从末尾倒扫**，只截取尾部 N 行，拷贝量 ≈ 目标体积。
+static NSString *AILogSnapshotTail(int tail) {
+    if (!gLog) return @"(no log)";
+    if (tail <= 0) tail = 120;
+    [gLogLock lock];
+    NSUInteger len = gLog.length;
+    NSUInteger i = len;
+    int seen = 0;
+    while (i > 0 && seen <= tail) {
+        i--;
+        if ([gLog characterAtIndex:i] == '\n') seen++;
+    }
+    NSString *t = (i > 0) ? [gLog substringFromIndex:i + 1] : [gLog copy];
+    [gLogLock unlock];
+    return t ?: @"";
+}
+
 static NSString *AILogSnapshot(void) {
     if (!gLog) return @"(no log)";
     [gLogLock lock];
@@ -4819,18 +4843,14 @@ static void AIExecCmd(NSDictionary *cmd) {
                        @"task": tsk,
                        @"ui":   ui});
     } else if ([op isEqualToString:@"log"]) {
-        NSString *t = AILogSnapshot();
-        // ★ v66：log 支持 tail=N（默认 120 行）—— 跑久了全量日志几 MB，
-        //   手机端拼 JSON + 传输都吃不消，是「log op 超时」的直接原因。
+        // ★ v66 修：只取尾部 N 行（设备侧倒扫截取，避免全量拷贝/切分）——
+        //   原实现 copy 全量 + split 全量，日志到 MB 级后极慢且回执必超中继上限。
         int tail = cmd[@"tail"] ? [cmd[@"tail"] intValue] : 120;
-        if (tail > 0) {
-            NSArray *lines = [t componentsSeparatedByString:@"\n"];
-            if ((int)lines.count > tail) {
-                NSRange r = NSMakeRange(lines.count - tail, tail);
-                t = [[lines subarrayWithRange:r] componentsJoinedByString:@"\n"];
-            }
-        }
-        AIReportDict(@{@"op": @"log", @"ok": @YES, @"text": t, @"lines": @(tail)});
+        NSString *t = AILogSnapshotTail(tail);
+        // 顺带把设备端日志也裁一次（自愈：老版本积累的巨量日志就此清掉）
+        AILogTrim();
+        AIReportDict(@{@"op": @"log", @"ok": @YES, @"text": t,
+                       @"lines": @(tail), @"len": @(t.length)});
     } else if ([op isEqualToString:@"toast"]) {
         // 我主动说话 -> 手机屏幕顶端弹出来。用户只要回一句「看到了」就够了。
         NSString *t = cmd[@"text"] ?: @"(空消息)";
