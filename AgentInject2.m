@@ -4823,6 +4823,8 @@ static void AIExecCmd(NSDictionary *cmd) {
                                @"back nav find rntap dismiss uioff uion gdtap wintap schemes open "
                                @"shot wins win gtap chain text dump update core ball overlay "
                                @"status log hud task macro autorun autorunstop autorunstatus "
+                                      // logtxt：`log` 的可用替身（log 被中继 BY_OP 排除）
+                               @"logtxt "
                                @"diag ocr vfind recapknow copysteps call",
                        @"proc": gProcName, @"bundle": gBundleId, @"pid": @(getpid()),
                        @"tap": @(gBestTap), @"shot": @(gBestShot),
@@ -4843,15 +4845,16 @@ static void AIExecCmd(NSDictionary *cmd) {
                                 @"mainLag": @((long long)gMainLag)},
                        @"task": tsk,
                        @"ui":   ui});
-    } else if ([op isEqualToString:@"log"]) {
-        // ★ v66 修：只取尾部 N 行（设备侧倒扫截取，避免全量拷贝/切分）——
-        //   原实现 copy 全量 + split 全量，日志到 MB 级后极慢且回执必超中继上限。
+    } else if ([op isEqualToString:@"log"] || [op isEqualToString:@"logtxt"]) {
+        // ★ v66：60+ pitfall —— `log` 是中继 BY_OP 的**保留名**（与 beat/hello 同批被
+        //   「单独存」，因此被排除在可查询集合之外，`/report?op=log` 结构性永远查不到，
+        //   与日志体量无关 —— 详见 pitfalls 第 24/29 号坑）。
+        //   ★ 绕法：回执改用未被占用的 op 名 `logtxt` 上报，中继自然入 BY_OP 可查。
         int tail = cmd[@"tail"] ? [cmd[@"tail"] intValue] : 120;
         NSString *t = AILogSnapshotTail(tail);
-        // 顺带把设备端日志也裁一次（自愈：老版本积累的巨量日志就此清掉）
         AILogTrim();
-        AIReportDict(@{@"op": @"log", @"ok": @YES, @"text": t,
-                       @"lines": @(tail), @"len": @(t.length)});
+        AIReportDict(@{@"op": @"logtxt", @"ok": @YES, @"text": t,
+                       @"lines": @(tail), @"len": @(t.length), @"asked": op});
     } else if ([op isEqualToString:@"toast"]) {
         // 我主动说话 -> 手机屏幕顶端弹出来。用户只要回一句「看到了」就够了。
         NSString *t = cmd[@"text"] ?: @"(空消息)";
