@@ -2213,8 +2213,6 @@ static void AIGrxInit(void) {
               @"(点赞|评论|收藏|分享)\\s*([\\d.]+[万亿]?)" options:0 error:nil];
 }
 
-// 从一行里取「屏内」的 x/y/w/h/text。不在屏内返回 NO。
-
 // 解析整屏文本 → 输出 fp（指纹字典）/作者名/是否在 feed。全部在调用线程跑。
 // shift：横向分页偏移（见 ks_brush.py 的 _visible_shift）——只统计屏内格。
 static double AIAutorunShift(NSString *text) {
@@ -2304,24 +2302,30 @@ static void AIAutorunParse(NSString *text, double shift,
     if (authorOut) *authorOut = a ?: b;
 }
 
-// 侧边栏专属文字（与 ks_brush.py 同）
+// 侧边栏专属文字（★ 只用「只在侧边栏出现」的词）。
+//   ⚠ 2026-10-05 实测踩坑：初版抄了 ks_brush.py 的 8 个词，其中
+//     **「更多」「系统消息」在普通 feed 页也会出现**（「更多」按钮、
+//     「系统消息」通知条）→ 侧边栏判据在正常 feed 上误命中 → 每轮都走
+//     「侧边栏开着」分支 continue → count 恒 0（第一次试跑就是这个现象）。
+//   现在只保留 6 个**侧边栏独有**的词，并提高门限到 3（更保险）。
 static NSArray *AIAutorunSiderKW(void) {
     static NSArray *kw = nil;
     if (!kw) kw = @[@"做任务兑好礼", @"扫一扫", @"快手小店", @"常用小程序",
-                    @"系统消息", @"支付助手", @"金币来了", @"更多"];
+                    @"支付助手", @"爆金掼蛋"];
     return kw;
 }
 
 // 读一次屏（主线程内），返回 text。这个函数本身不解析，只取原始文本。
+// ★ 必须与 text op 完全一致（w 起点 / depth 30 / budget 2500）——
+//   否则拿不到 window 上的兄弟视图（侧边栏 KSSideBarTKView 就挂在 window 上）。
 static NSString *AIAutorunReadText(void) {
     __block NSString *t = nil;
     AIMainSync(^{
         @try {
             UIWindow *w = AIHostWindow();
             if (!w) return;
-            UIView *root = w.rootViewController.view ?: w;
-            AIBudgetReset(6000);
-            t = AITextListD(root, 0, 14, nil);
+            AIBudgetReset(2500);
+            t = AITextList(w, 0, 30);
         } @catch (NSException *e) {}
     });
     return t ?: @"";
@@ -2379,7 +2383,12 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
             gPollTick = now;
 
             // ② 读屏
+            AILog(@"[autorun] #%ld 读屏前…", idx + 1);
+            double _t0 = [[NSDate date] timeIntervalSince1970];
             NSString *text = AIAutorunReadText();
+            double _t1 = [[NSDate date] timeIntervalSince1970];
+            AILog(@"[autorun] #%ld 读屏后：%lu 字符，耗时 %.1fs",
+                  idx + 1, (unsigned long)text.length, _t1 - _t0);
             if (!text.length) {
                 gAutorunErrors++;
                 AILog(@"[autorun] 读屏为空（连续 %d）", gAutorunErrors);
@@ -2390,6 +2399,9 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
             gAutorunErrors = 0;
 
             idx++;
+            // ★ 无论走哪个分支都先把「已处理轮次」记上 —— 否则门禁分支 continue
+            //   会让 count 恒 0，从外部看就像「没在跑」。
+            gAutorunCount = idx;
 
             // ③ 解析
             double shift = AIAutorunShift(text);
@@ -2398,13 +2410,16 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
             NSString *author = nil;
             AIAutorunParse(text, shift, fp, &author, vis);
 
-            // ④ 门禁：侧边栏开着 → 点左上角返回（仅屏内命中）
+            // ④ 门禁：侧边栏开着 → 点左上角返回（仅屏内命中，门限 3）
             int siderHits = 0;
             NSArray *skw = AIAutorunSiderKW();
-            for (NSString *w in skw)
-                for (NSString *l in vis) if ([l containsString:w]) { siderHits++; break; }
-            if (siderHits >= 2) {
-                AILog(@"[autorun] 侧边栏开着 → 点 (29,69) 回 feed");
+            for (NSString *w in skw) {
+                for (NSString *l in vis) {
+                    if ([l containsString:w]) { siderHits++; break; }
+                }
+            }
+            if (siderHits >= 3) {
+                AILog(@"[autorun] 侧边栏开着（命中 %d）→ 点 (29,69) 回 feed", siderHits);
                 AIAutorunTap(29, 69);
                 [NSThread sleepForTimeInterval:1.5];
                 continue;
