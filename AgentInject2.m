@@ -109,7 +109,7 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v65";   // v65 = 「回退进度条到 v42/v48 原版（用户拍板）」：v63/v64 的「本视频进度 N%」不被接受 → 恢复「共 N 步 · 当前第 M 步」+ idx/total 填充；脚本改为按时间切段推 idx（保留平滑推进动效，不改 UI）。显式 pct 通道保留但不再使用。v64 = v63 + 修「本视频进度」两条实测 bug（① pct 计算被 gTaskTotal>0 挡住 → 恒 0；② 脚本 step=10,total=0 命中 AITaskSet 的「清任务」分支 → 状态变 idle、pct 被撤。修法：pct 独立于 total；脚本改传 idx>=1,total=1，进度交给显式 pct）。v63 = 「罩子进度条改为视频停留时间进度」（2026-10-04 会话，用户需求）：
+static NSString * const kAIVer = @"v66";   // v66 = 新增 autorun / autorunstop / autorunstatus：「下发一次，设备自己跑完整个脚本」。养号循环下沉到设备端独立队列（不占轮询线程、睡眠不占主线程、双路喂狗 + 看门狗豁免），脱离云沙箱的会话切换限制。v65 = 「回退进度条到 v42/v48 原版（用户拍板）」：v63/v64 的「本视频进度 N%」不被接受 → 恢复「共 N 步 · 当前第 M 步」+ idx/total 填充；脚本改为按时间切段推 idx（保留平滑推进动效，不改 UI）。显式 pct 通道保留但不再使用。v64 = v63 + 修「本视频进度」两条实测 bug（① pct 计算被 gTaskTotal>0 挡住 → 恒 0；② 脚本 step=10,total=0 命中 AITaskSet 的「清任务」分支 → 状态变 idle、pct 被撤。修法：pct 独立于 total；脚本改传 idx>=1,total=1，进度交给显式 pct）。v63 = 「罩子进度条改为视频停留时间进度」（2026-10-04 会话，用户需求）：
    //       ① `task` op 新增 `pct`（0~100 显式进度）：脚本每秒发 `task{pct:已看/需看×100}`，
    //          罩子进度条**直接用这个值**填充，不再是「第几步/共几步」。未传 pct 时
    //          回落老的 idx/total 算法 —— **老调用方/老设备行为完全不变**。
@@ -366,6 +366,9 @@ static NSDictionary *AIPickTextViaGesture(NSString *kw);  // v23：按文字触�
 static NSDictionary *AIScrollAt(CGPoint pt, double dy, double dx, BOOL anim, int fire);  // v17（v29 定义加 fire，声明同步，治 conflicting types）
 static NSString *AIBack(void);                  // v18：AIRunMacro(~1057) 在它定义之前要调用
 static NSString *AINavInfo(void);               // v18
+// v66：autorun（~2157 行）在它们的定义之前要调用 —— 补前向声明，否则 implicit declaration
+static void AIReportDict(NSDictionary *d);
+static NSString *AITextListD(UIView *v, int depth, int maxDepth, NSString *parentTxt);
 // v20 自更新：AIInstall（~3060 行）在它们的定义之前要调用
 static NSString *AICoreDir(void);
 static BOOL  AIHandoffToNewer(void);
@@ -2151,6 +2154,364 @@ static NSArray *AIRunMacro(NSArray *steps, double gapMs) {
               idx, (unsigned long)steps.count, op, r[@"ok"], r[@"txt"] ?: r[@"err"] ?: @"");
     }
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// 7g-bis. v66：autorun —— 「下发一次，设备自己跑完整个脚本」（2026-10-05）
+//
+//   需求（用户口径）：养号脚本现在跑在云沙箱里，每次下发一条动作、等一条回执。
+//   但沙箱存在「会话切换」——切换时旧会话树的后台进程全被清掉（实测 13:49:03
+//   养号进程消失，13:49:35 沙箱起了新一代 sbx-106-3 进程）。所以养号跑不满、
+//   频繁中断。**解法：把养号循环整个下沉到设备端**，云端只发一次 autorun，
+//   设备自己 `while(1)` 刷视频，只有当用户点「停」或 App 被杀才结束。
+//
+//   ★ 关键设计三条（缺一不可）：
+//     ① **绝不能跑在轮询线程上**：macro 的教训（清单 645 红线）——macro 每步在
+//        轮询线程同步跑，gPollTick 被冻结，>150s 就触发看门狗换代。autorun 用
+//        **独立后台队列**，轮询线程照常转，status/stop/其他 op 全程可用。
+//     ② **睡眠必须在后台线程**：AIScrollAt/AITextListD 要主线程，但养号的
+//        「等 10~40 秒」绝不能占主线程 —— 那会把 App UI 冻住（视频卡死、
+//        gMainLag 报警）。做法：读屏/滑动用 AIMainSync 各占主线程 ~0.2s，
+//        睡眠在后台线程睡。
+//     ③ **双路喂狗**：循环每 200ms 把 gPollTick 和 gAutorunTick 都打上，
+//        保证看门狗永不误判换代；AIWatchdog 里再加 gAutorunActive 豁免兜底。
+//
+//   本版（一期）实现「与现脚本一致的完整养号」：
+//     · 随机观看时长（秒划/常规/看久/沉浸 四档，与 ks_brush.py 同分布）
+//     · 互动概率（赞/藏/评论/回滑，与 ks_brush.py 同概率）
+//     · 读屏解析指纹 + 作者名（移植 ks_brush.py 的解析逻辑）
+//     · in_feed / 侧边栏 / 异常提示条 三门禁（移植本轮修的 3 个 bug 逻辑）
+// ---------------------------------------------------------------------------
+
+// ---- autorun 全局状态 ----
+static volatile int32_t gAutorunActive  = 0;   // 1=养号循环在跑（看门狗据此豁免）
+static volatile int32_t gAutorunStop    = 0;   // 1=请求停止（循环在检查点退出）
+static volatile double  gAutorunTick    = 0;   // autorun 自己的喂狗时间戳
+static volatile long    gAutorunCount   = 0;   // 已刷条数
+static volatile long    gAutorunStart   = 0;   // 起始时间戳
+static volatile long    gAutorunEnd     = 0;   // 结束时间戳（0=未结束）
+static NSString        *gAutorunBrief   = nil; // 当前动作简述（悬浮球显示用）
+static volatile int32_t gAutorunErrors  = 0;   // 连续异常计数
+static dispatch_queue_t  gAutorunQueue  = nil;
+
+// ---- 正则（只编译一次；NSRegularExpression 线程安全，可跨线程共享）----
+// 解析 AITextListD 输出行：`(12) 27,54 32x32 | 文本`
+static NSRegularExpression *gRxRow   = nil;   // 行解析
+static NSRegularExpression *gRxNum   = nil;   // 纯数字串（倍速 2x 之类）
+static NSRegularExpression *gRxFp    = nil;   // "未点赞，点赞2792" / "评论74" 之类
+
+static void AIGrxInit(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    gRxRow = [NSRegularExpression regularExpressionWithPattern:
+              @"^\\((\\d+)\\)\\s+(-?[\\d.]+),(-?[\\d.]+)\\s+(\\d+)x(\\d+)\\s*\\|\\s*(.*)$"
+              options:0 error:nil];
+    gRxNum = [NSRegularExpression regularExpressionWithPattern:
+              @"^[\\d.万亿\\+x%]+$" options:0 error:nil];
+    gRxFp  = [NSRegularExpression regularExpressionWithPattern:
+              @"(点赞|评论|收藏|分享)\\s*([\\d.]+[万亿]?)" options:0 error:nil];
+}
+
+// 从一行里取「屏内」的 x/y/w/h/text。不在屏内返回 NO。
+
+// 解析整屏文本 → 输出 fp（指纹字典）/作者名/是否在 feed。全部在调用线程跑。
+// shift：横向分页偏移（见 ks_brush.py 的 _visible_shift）——只统计屏内格。
+static double AIAutorunShift(NSString *text) {
+    // 找 int(x/390)*390 的众数（视频元素加权，见 ks_brush.py 修复）
+    NSMutableDictionary *cnt = [NSMutableDictionary dictionary];
+    NSArray *lines = [text componentsSeparatedByString:@"\n"];
+    for (NSString *ln in lines) {
+        NSTextCheckingResult *m = [gRxRow firstMatchInString:ln options:0
+                                                       range:NSMakeRange(0, ln.length)];
+        if (!m || m.numberOfRanges < 7) continue;
+        double x = [[ln substringWithRange:[m rangeAtIndex:2]] doubleValue];
+        double w = [[ln substringWithRange:[m rangeAtIndex:4]] doubleValue];
+        NSString *c = [ln substringWithRange:[m rangeAtIndex:6]];
+        if (w <= 0 || w > 300) continue;
+        if (!c.length || [c hasPrefix:@"<"]) continue;
+        if ([gRxNum firstMatchInString:c options:0 range:NSMakeRange(0, c.length)]) continue;
+        int bucket = (int)(floor(x / 390.0)) * 390;
+        // 视频专属元素加权 ×10（只有当前可见 cell 才有）
+        BOOL hot = ([c containsString:@"点赞"] || [c containsString:@"评论"] ||
+                    [c containsString:@"收藏"] || [c containsString:@"分享"] ||
+                    [c containsString:@"作者头像"]);
+        int wgt = hot ? 10 : 1;
+        NSNumber *k = @(bucket);
+        cnt[k] = @([cnt[k] intValue] + wgt);
+    }
+    if (!cnt.count) return 0.0;
+    // 取最高分；若为 0 则返回 0
+    int bestK = 0, bestN = -1, zeroN = 0;
+    for (NSNumber *k in cnt) {
+        int n = [cnt[k] intValue];
+        if ([k intValue] == 0) zeroN = n;
+        if (n > bestN) { bestN = n; bestK = [k intValue]; }
+    }
+    if (bestK != 0 && bestN > zeroN) return (double)bestK;
+    return 0.0;
+}
+
+// 解析指纹 + 作者（移植 ks_brush.py）
+static void AIAutorunParse(NSString *text, double shift,
+                           NSMutableDictionary *fpOut, NSString **authorOut,
+                           NSMutableArray *visOut) {
+    NSArray *lines = [text componentsSeparatedByString:@"\n"];
+    NSString *a = nil, *b = nil;
+    for (NSString *ln in lines) {
+        NSTextCheckingResult *m = [gRxRow firstMatchInString:ln options:0
+                                                       range:NSMakeRange(0, ln.length)];
+        if (!m || m.numberOfRanges < 7) continue;
+        double x = [[ln substringWithRange:[m rangeAtIndex:2]] doubleValue] - shift;
+        double y = [[ln substringWithRange:[m rangeAtIndex:3]] doubleValue];
+        NSString *c = [ln substringWithRange:[m rangeAtIndex:6]];
+        if (!c.length || [c hasPrefix:@"<"]) continue;
+        if (visOut && x >= -20 && x <= 420) [visOut addObject:c];
+        // 指纹：点赞/评论/收藏/分享 后跟数字（屏内）
+        if (x >= -20 && x <= 420) {
+            NSArray *ms = [gRxFp matchesInString:c options:0 range:NSMakeRange(0, c.length)];
+            for (NSTextCheckingResult *r in ms) {
+                if (r.numberOfRanges < 3) continue;
+                NSString *k = [c substringWithRange:[r rangeAtIndex:1]];
+                NSString *v = [c substringWithRange:[r rangeAtIndex:2]];
+                if (k.length && v.length && !fpOut[k]) fpOut[k] = v;
+            }
+        }
+        // 作者锚点 A：`<名字>作者头像`（后缀即判据）
+        if (!a && [c hasSuffix:@"作者头像"] && c.length <= 34) {
+            a = [[c substringToIndex:c.length - 4]
+                 stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            continue;
+        }
+        // 作者锚点 B：`@` 右侧（y≈346 附近、x<=20）
+        if ([c isEqualToString:@"@"] && y >= 320 && y <= 390 && x <= 20) {
+            // 下一行可能是名字，交给后处理；这里先记位置
+            continue;
+        }
+    }
+    // 兜底：视觉上「@xxx」同一行
+    if (!a) {
+        for (NSString *ln in lines) {
+            NSTextCheckingResult *m = [gRxRow firstMatchInString:ln options:0
+                                                           range:NSMakeRange(0, ln.length)];
+            if (!m || m.numberOfRanges < 7) continue;
+            NSString *c = [ln substringWithRange:[m rangeAtIndex:6]];
+            if ([c hasPrefix:@"@"] && c.length > 1 && c.length < 26 && !b) {
+                b = [c substringFromIndex:1];
+            }
+        }
+    }
+    if (authorOut) *authorOut = a ?: b;
+}
+
+// 侧边栏专属文字（与 ks_brush.py 同）
+static NSArray *AIAutorunSiderKW(void) {
+    static NSArray *kw = nil;
+    if (!kw) kw = @[@"做任务兑好礼", @"扫一扫", @"快手小店", @"常用小程序",
+                    @"系统消息", @"支付助手", @"金币来了", @"更多"];
+    return kw;
+}
+
+// 读一次屏（主线程内），返回 text。这个函数本身不解析，只取原始文本。
+static NSString *AIAutorunReadText(void) {
+    __block NSString *t = nil;
+    AIMainSync(^{
+        @try {
+            UIWindow *w = AIHostWindow();
+            if (!w) return;
+            UIView *root = w.rootViewController.view ?: w;
+            AIBudgetReset(6000);
+            t = AITextListD(root, 0, 14, nil);
+        } @catch (NSException *e) {}
+    });
+    return t ?: @"";
+}
+
+// 滑一下（主线程内）——纵向往前一格
+static NSString *AIAutorunScroll(void) {
+    __block NSString *r = @"?";
+    AIMainSync(^{
+        @try {
+            NSDictionary *d = AIScrollAt(CGPointMake(195, 700), 675, 0, YES, 0);
+            r = d[@"sv"] ?: @"?";
+        } @catch (NSException *e) {}
+    });
+    return r;
+}
+
+// 点一下（主线程内）
+static BOOL AIAutorunTap(double x, double y) {
+    __block BOOL ok = NO;
+    AIMainSync(^{
+        @try {
+            NSString *desc = nil;
+            ok = AITapUIControlAt(CGPointMake(x, y), &desc);
+        } @catch (NSException *e) {}
+    });
+    return ok;
+}
+
+// ★ 养号主循环（跑在独立后台队列）
+static void AIAutorunYanghao(double minutes, uint32_t seed) {
+    if (!gRxRow) AIGrxInit();
+    srand(seed ? seed : (uint32_t)time(NULL));
+
+    gAutorunStop = 0;
+    gAutorunActive = 1;
+    gAutorunCount = 0;
+    gAutorunErrors = 0;
+    gAutorunStart = (long)[[NSDate date] timeIntervalSince1970];
+    gAutorunEnd = 0;
+    AILog(@"==== [autorun] 养号开始，时长 %.0f 分钟 seed=%u ====", minutes, seed);
+
+    double tEnd = [[NSDate date] timeIntervalSince1970] + minutes * 60.0;
+    long idx = 0;
+    int lostStreak = 0;
+    NSString *prevAuthor = nil;
+
+    while (!gAutorunStop) {
+        @autoreleasepool {
+            double now = [[NSDate date] timeIntervalSince1970];
+            if (now >= tEnd) { AILog(@"[autorun] 到点，正常结束"); break; }
+
+            // ① 喂狗（双路）
+            gAutorunTick = now;
+            gPollTick = now;
+
+            // ② 读屏
+            NSString *text = AIAutorunReadText();
+            if (!text.length) {
+                gAutorunErrors++;
+                AILog(@"[autorun] 读屏为空（连续 %d）", gAutorunErrors);
+                [NSThread sleepForTimeInterval:1.5];
+                if (gAutorunErrors >= 10) { AILog(@"[autorun] 连续读屏失败 → 退出"); break; }
+                continue;
+            }
+            gAutorunErrors = 0;
+
+            idx++;
+
+            // ③ 解析
+            double shift = AIAutorunShift(text);
+            NSMutableDictionary *fp = [NSMutableDictionary dictionary];
+            NSMutableArray *vis = [NSMutableArray array];
+            NSString *author = nil;
+            AIAutorunParse(text, shift, fp, &author, vis);
+
+            // ④ 门禁：侧边栏开着 → 点左上角返回（仅屏内命中）
+            int siderHits = 0;
+            NSArray *skw = AIAutorunSiderKW();
+            for (NSString *w in skw)
+                for (NSString *l in vis) if ([l containsString:w]) { siderHits++; break; }
+            if (siderHits >= 2) {
+                AILog(@"[autorun] 侧边栏开着 → 点 (29,69) 回 feed");
+                AIAutorunTap(29, 69);
+                [NSThread sleepForTimeInterval:1.5];
+                continue;
+            }
+
+            // ⑤ 门禁：异常提示条（点击重试 / 刷新重试）
+            BOOL hasRetry = NO;
+            for (NSString *l in vis)
+                if ([l containsString:@"点击重试"] || [l containsString:@"刷新重试"]) { hasRetry = YES; break; }
+            if (hasRetry) {
+                AILog(@"[autorun] 异常提示条 → 点重试 (312,23)");
+                AIAutorunTap(312, 23);
+                [NSThread sleepForTimeInterval:1.2];
+            }
+
+            // ⑥ 门禁：不在 feed（无指纹也无作者）→ 记落空，连 3 次回家
+            BOOL inFeed = (fp.count > 0) || (author.length > 0);
+            if (!inFeed) {
+                lostStreak++;
+                AILog(@"[autorun] #%ld 落空（连 %d）", idx, lostStreak);
+                if (lostStreak >= 3) {
+                    AIAutorunTap(29, 69);            // 侧边栏按钮
+                    [NSThread sleepForTimeInterval:1.2];
+                    AIAutorunTap(39, 786);           // 首页 tab
+                    [NSThread sleepForTimeInterval:1.2];
+                    lostStreak = 0;
+                }
+                AIAutorunScroll();
+                [NSThread sleepForTimeInterval:2.0];
+                continue;
+            }
+            lostStreak = 0;
+
+            NSString *authorStr = author ?: @"";
+            BOOL changed = (prevAuthor && ![prevAuthor isEqualToString:authorStr]);
+            prevAuthor = authorStr;
+
+            // ⑦ 随机观看时长（与 ks_brush.py 同分布）
+            double r = ((double)arc4random() / 4294967295.0);
+            double dur;
+            if      (r < 0.10) dur = 3  + (arc4random_uniform(401) / 100.0);   // 3-7s 秒划
+            else if (r < 0.70) dur = 9  + (arc4random_uniform(1301) / 100.0);  // 9-22s 常规
+            else if (r < 0.93) dur = 22 + (arc4random_uniform(1801) / 100.0);  // 22-40s 看久
+            else               dur = 40 + (arc4random_uniform(2501) / 100.0);  // 40-65s 沉浸
+
+            gAutorunBrief = [NSString stringWithFormat:@"看 %lds%@", (long)dur,
+                             fp.count ? [NSString stringWithFormat:@" 赞%@", fp[@"点赞"] ?: @"-"] : @""];
+            gAutorunCount = idx;
+
+            // 悬浮球：显示进度（复用现有 AITaskSet）
+            AITaskSet(@"养号模式", (int)(idx % 1000), 1000, @"exec", -1,
+                      [NSString stringWithFormat:@"#%ld %@", idx, authorStr.length ? authorStr : @"看视频"]);
+
+            // ⑧ 分段睡眠 + 喂狗（每 200ms 一次，绝不占主线程）
+            {
+                double slept = 0;
+                while (slept < dur && !gAutorunStop) {
+                    double step = MIN(0.2, dur - slept);
+                    [NSThread sleepForTimeInterval:step];
+                    slept += step;
+                    double n2 = [[NSDate date] timeIntervalSince1970];
+                    gAutorunTick = n2; gPollTick = n2;
+                }
+            }
+            if (gAutorunStop) break;
+
+            // ⑨ 互动（与 ks_brush.py 同概率）
+            NSMutableArray *acts = [NSMutableArray array];
+            double pz = ((double)arc4random() / 4294967295.0);
+            if (pz < 0.30) { AIAutorunTap(326, 371); [acts addObject:@"赞"]; }   // 点赞
+            double pc = ((double)arc4random() / 4294967295.0);
+            if (pc < 0.12) { AIAutorunTap(326, 441); [acts addObject:@"评"];      // 看评论
+                             [NSThread sleepForTimeInterval:2.0];
+                             AIAutorunTap(195, 100); }                            // 点空白关评论
+            double ps = ((double)arc4random() / 4294967295.0);
+            if (ps < 0.10) { AIAutorunTap(326, 511); [acts addObject:@"藏"]; }   // 收藏
+
+            // ⑩ 滑到下一个
+            AIAutorunScroll();
+
+            AILog(@"[autorun] #%ld %.0fs %@ | %@ | %@", idx, dur,
+                  acts.count ? [acts componentsJoinedByString:@","] : @"划走",
+                  authorStr.length ? authorStr : @"(无作者)",
+                  fp.count ? [NSString stringWithFormat:@"赞%@评%@", fp[@"点赞"] ?: @"-", fp[@"评论"] ?: @"-"] : @"(无指纹)");
+
+            [NSThread sleepForTimeInterval:0.3];
+        }
+    }
+
+    // 收尾
+    gAutorunActive = 0;
+    gAutorunEnd = (long)[[NSDate date] timeIntervalSince1970];
+    long used = gAutorunEnd - gAutorunStart;
+    AITaskSet(@"养号模式", 0, 0, @"idle", -1, nil);
+    AILog(@"==== [autorun] 养号结束：共 %ld 条，用时 %ld 分 %ld 秒 ====",
+          gAutorunCount, used / 60, used % 60);
+    AIReportDict(@{@"op": @"autorun", @"ok": @YES, @"phase": @"done",
+                   @"count": @(gAutorunCount), @"sec": @(used)});
+}
+
+// 启动 autorun（幂等：已在跑则拒绝）
+static BOOL AIAutorunStart(double minutes, uint32_t seed) {
+    if (gAutorunActive) return NO;
+    if (!gAutorunQueue)
+        gAutorunQueue = dispatch_queue_create("ai.autorun", DISPATCH_QUEUE_SERIAL);
+    dispatch_async(gAutorunQueue, ^{ AIAutorunYanghao(minutes, seed); });
+    return YES;
 }
 
 // ---------------------------------------------------------------------------
@@ -4414,7 +4775,8 @@ static void AIExecCmd(NSDictionary *cmd) {
                        @"ops": @"wait pick picktxt tapui tap scroll swipe rows tree toast probe http sigprobe "
                                @"back nav find rntap dismiss uioff uion gdtap wintap schemes open "
                                @"shot wins win gtap chain text dump update core ball overlay "
-                               @"status log hud task macro diag ocr vfind recapknow copysteps call",
+                               @"status log hud task macro autorun autorunstop autorunstatus "
+                               @"diag ocr vfind recapknow copysteps call",
                        @"proc": gProcName, @"bundle": gBundleId, @"pid": @(getpid()),
                        @"tap": @(gBestTap), @"shot": @(gBestShot),
                        @"mon": @(gMonHits), @"se": @(gSendEventHits),
@@ -4559,6 +4921,47 @@ static void AIExecCmd(NSDictionary *cmd) {
         NSArray *res = AIRunMacro(steps, gapMs);
         AIReportDict(@{@"op": @"macro", @"ok": @YES, @"n": @(res.count), @"results": res});
         AILog(@"  [cmd] macro %lu 步完成", (unsigned long)res.count);
+    } else if ([op isEqualToString:@"autorun"]) {
+        // v66：下发一次，设备自己跑完整个脚本（见 7g-bis 注释）。
+        // 参数：script=脚本名（当前只认 "yanghao"）/ minutes（默认 60）/ seed（可选）
+        NSString *script = cmd[@"script"] ?: @"yanghao";
+        double minutes = [cmd[@"minutes"] doubleValue];
+        if (minutes <= 0) minutes = 60.0;
+        if (minutes > 600) minutes = 600.0;      // 上限 10 小时，防手滑
+        uint32_t seed = [cmd[@"seed"] respondsToSelector:@selector(unsignedIntValue)]
+                      ? (uint32_t)[cmd[@"seed"] unsignedIntValue] : 0;
+        if (![script isEqualToString:@"yanghao"]) {
+            AIReportDict(@{@"op": @"autorun", @"ok": @NO, @"err": @"未知脚本（当前只支持 yanghao）"});
+            return;
+        }
+        if (gAutorunActive) {
+            AIReportDict(@{@"op": @"autorun", @"ok": @NO, @"err": @"已在运行",
+                           @"count": @(gAutorunCount)});
+            return;
+        }
+        // ★ 立即回执（不能让云端等整个养号跑完才收到回执）
+        AIReportDict(@{@"op": @"autorun", @"ok": @YES, @"phase": @"started",
+                       @"script": script, @"minutes": @(minutes),
+                       @"ver": kAIVer});
+        AIAutorunStart(minutes, seed);
+        AILog(@"  [cmd] autorun 已启动 script=%@ minutes=%.0f", script, minutes);
+    } else if ([op isEqualToString:@"autorunstop"]) {
+        // 请求停止：置标志，循环在检查点优雅退出（最多等一个 dur，通常 <1s）
+        BOOL was = (gAutorunActive != 0);
+        gAutorunStop = 1;
+        AIReportDict(@{@"op": @"autorunstop", @"ok": @YES, @"was": @(was),
+                       @"count": @(gAutorunCount)});
+        AILog(@"  [cmd] autorunstop was=%d count=%ld", (int)was, gAutorunCount);
+    } else if ([op isEqualToString:@"autorunstatus"]) {
+        long now = (long)[[NSDate date] timeIntervalSince1970];
+        long used = gAutorunStart ? ((gAutorunEnd ? gAutorunEnd : now) - gAutorunStart) : 0;
+        AIReportDict(@{@"op": @"autorunstatus", @"ok": @YES,
+                       @"active": @(gAutorunActive != 0),
+                       @"count": @(gAutorunCount),
+                       @"sec": @(used),
+                       @"brief": gAutorunBrief ?: @"",
+                       @"errors": @(gAutorunErrors),
+                       @"ver": kAIVer});
     } else if ([op isEqualToString:@"scroll"]) {
         // v17：伪触摸滑动无效，直接改 contentOffset
         CGPoint p = CGPointMake([cmd[@"x"] floatValue], [cmd[@"y"] floatValue]);
@@ -5451,6 +5854,15 @@ static void AIWatchdog(void) {
                     }
                 } @catch (NSException *e) {}
                 double age = (gPollTick > 0) ? (now - gPollTick) : 0.0;
+                // ★ v66：autorun 豁免 —— 养号循环在独立队列里跑，虽然它自己每 200ms
+                //   喂一次 gPollTick，但为防抖再加一道：只要 autorun 活着且它自己的
+                //   tick 是新的，就不换代（避免养号跑到一半被看门狗误判 hang 打断）。
+                BOOL autorunBusy = (gAutorunActive != 0) &&
+                                   (gAutorunTick > 0) && (now - gAutorunTick < 30.0);
+                if (autorunBusy && age > AI_WD_HANG_SEC) {
+                    gPollTick = now;   // 顺手喂一下，别让 age 无限涨
+                    age = 0.0;
+                }
                 if (gPollTick > 0 && age > AI_WD_HANG_SEC && gPollRst < AI_WD_MAX_RETRY) {
                     int n = __sync_add_and_fetch((int32_t *)&gPollRst, 1);
                     AILog(@"  🩺 G13 看门狗：轮询 %.0fs 没动静，判定 hang，起第 %d 代轮询线程",
