@@ -55,20 +55,8 @@
 static NSMutableString *gLog = nil;
 static NSLock          *gLogLock = nil;
 
-// ★ v66 修：日志环形裁剪（抽成公共函数，写日志时与 log op 时都能调）。
-//   一次贪心裁到 12 万字符以内 —— 否则每次只裁 2 万、要裁很多次才降下来。
-static void AILogTrim(void) {
-    if (!gLog) return;
-    [gLogLock lock];
-    while (gLog.length > 120000) {
-        NSRange r = [gLog rangeOfString:@"\n" options:0
-                                  range:NSMakeRange(0, MIN((NSUInteger)40000, gLog.length))];
-        NSUInteger cut = (r.location != NSNotFound) ? (r.location + 1) : 40000;
-        if (cut >= gLog.length) break;
-        [gLog deleteCharactersInRange:NSMakeRange(0, cut)];
-    }
-    [gLogLock unlock];
-}
+// ★ v66 修：日志裁剪 —— 定义见下方 AILogSnapshotTail 处（前置声明）
+static NSUInteger AILogTrim(void);
 
 static void AILogv(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
@@ -3600,12 +3588,25 @@ static NSString *AILogSnapshotTail(int tail) {
     return t ?: @"";
 }
 
-static NSString *AILogSnapshot(void) {
-    if (!gLog) return @"(no log)";
+// ★ v66 修：日志裁剪 —— 不用 deleteCharactersInRange（每次 O(n) 搬移，几 MB 要搬几十轮），
+//   改为**取尾部片段重建新串**（一次 O(n) 拷贝 + 一次赋值），彻底避开反复搬移。
+//   返回裁剪前的原始长度，便于诊断「日志到底多大」。
+static NSUInteger AILogTrim(void) {
+    if (!gLog) return 0;
     [gLogLock lock];
-    NSString *t = [gLog copy];
+    NSUInteger before = gLog.length;
+    if (before > 120000) {
+        NSUInteger i = gLog.length;
+        int seen = 0;
+        while (i > 0 && seen < 300) {   // 保留末尾 300 行
+            i--;
+            if ([gLog characterAtIndex:i] == '\n') seen++;
+        }
+        NSMutableString *nw = [[gLog substringFromIndex:i] mutableCopy];
+        if (nw) gLog = nw;
+    }
     [gLogLock unlock];
-    return t ?: @"";
+    return before;
 }
 
 static NSString *AIQv(NSString *q, NSString *k) {
@@ -3979,18 +3980,15 @@ static void AIServeFd(int fd) {
     }
     if ([path isEqualToString:@"/report"]) {
         AIResp(fd, 200, @"text/plain; charset=utf-8",
-               [AILogSnapshot() dataUsingEncoding:NSUTF8StringEncoding]);
+               [AILogSnapshotTail(300) dataUsingEncoding:NSUTF8StringEncoding]);
         return;
     }
     if ([path isEqualToString:@"/log"]) {
-        NSString *t = AILogSnapshot();
-        NSArray *ls = [t componentsSeparatedByString:@"\n"];
-        NSUInteger n = ls.count;
         NSUInteger want = (NSUInteger)[AIQv(q, @"n") integerValue];
         if (want == 0) want = 200;
-        NSArray *tail = (n > want) ? [ls subarrayWithRange:NSMakeRange(n - want, want)] : ls;
+        NSString *t = AILogSnapshotTail((int)want);
         AIResp(fd, 200, @"text/plain; charset=utf-8",
-               [[tail componentsJoinedByString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]);
+               [t dataUsingEncoding:NSUTF8StringEncoding]);
         return;
     }
     if ([path isEqualToString:@"/tree"]) {
@@ -4831,6 +4829,9 @@ static void AIExecCmd(NSDictionary *cmd) {
                        @"mon": @(gMonHits), @"se": @(gSendEventHits),
                        @"tvhits": @(gTargetHits), @"act": @(gActionHits),
                        @"mem": @(AIMemMB()),          // v24：常驻内存 MB，判断 OOM 用
+                       // ★ v66 诊断：gLog 长度（status 路能通，log 路不通 —— 借它看日志体积）
+                       @"loglen": @((long)[gLog length]),
+                       @"wd2": @{@"pollGen": @(gPollGen)},
                        @"overlay": (gOverlayWindow && !gOverlayWindow.hidden) ? @"on" : @"off",
                        // v30 UI 三层：task{}/ui{} 是唯一状态源（旧字段保留供诊断，不进屏）
                        @"busy": @(gBusy),
