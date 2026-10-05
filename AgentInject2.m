@@ -2335,13 +2335,58 @@ static NSString *AIAutorunReadText(void) {
     return t ?: @"";
 }
 
-// 滑一下（主线程内）——纵向往前一格
+// 滑到下一页（主线程内）——纵向往前一格
+//
+// ★★ v67 修（「作者两条一重复」= 一半时间白刷同一条视频）：
+//   原实现写死 AIScrollAt(195,700, dy=675)，2026-10-06 实测当场现形：
+//       scroll dy=675 -> KSGRBrowseTableView before={0,1436} after={0,1522} moved=86
+//   我要 675，实拿 86 —— 因为 AIScrollAt 里有 `MIN(maxY, before.y+dy)`，而这个 feed 是
+//   **惰性加载**的 UITableView：contentSize 只比可视区大一点点（limit=1522），
+//   dy 再大也会被夹成几十像素。等 5.5s 也不换视频。
+//   更致命的是**页高是 761，不是 675/844**：每次攒下的零头要两步才凑够一页，
+//   于是日志里出现「作者两两重复」的严格奇偶交替 —— 13 步只看了 7 条不同的视频。
+//
+//   正解 = 完整移植 ks_brush.py 的 page_info + flip（那套在设备上验证过几千轮）：
+//     ① 先 dy=0 探一次，拿 contentSize / bounds / before，算出 step = bounds 的高
+//     ② dy 用 step；到底/到头自动反向（ks_brush.flip 的 `cur+d > limit+1 → d=-step`）
+//     ③ 落点多候选 (195,700)→(195,520)→(195,300)，避开「剧集横滑 KSThanosPagesView」
+//     ④ 探不到容器也要滑一次兜底（长按菜单那类遮罩会把 page_info 的问询吞掉）
 static NSString *AIAutorunScroll(void) {
-    __block NSString *r = @"?";
+    __block NSString *r = @"(未滑)";
     AIMainSync(^{
         @try {
-            NSDictionary *d = AIScrollAt(CGPointMake(195, 700), 675, 0, YES, 0);
-            r = d[@"sv"] ?: @"?";
+            // ③ 多候选落点（照抄 ks_brush.flip 的顺序）
+            static double pts[3][2] = {{195, 700}, {195, 520}, {195, 300}};
+            BOOL done = NO;
+            for (int i = 0; i < 3 && !done; i++) {
+                NSDictionary *p = AIScrollAt(CGPointMake(pts[i][0], pts[i][1]), 0, 0, NO, 0);
+                if (![p[@"ok"] boolValue]) continue;
+                // ① 算动态页尺寸（注意 AIScrollAt 的 "frame" 字段其实是 sv.bounds）
+                CGSize  cs = CGSizeFromString(p[@"contentSize"] ?: @"");
+                CGRect  bd = CGRectFromString(p[@"frame"] ?: @"");
+                CGPoint be = CGPointFromString(p[@"before"] ?: @"");
+                if (bd.size.height <= 0 && bd.size.width <= 0) continue;
+                BOOL   horiz = (cs.width > bd.size.width + 10.0);
+                double step  = horiz ? bd.size.width  : bd.size.height;
+                double limit = MAX(0.0, horiz ? (cs.width  - bd.size.width)
+                                             : (cs.height - bd.size.height));
+                double cur   = horiz ? be.x : be.y;
+                // ② 到底往回翻、到头往前翻 —— 惰性列表靠这条才不会卡在末尾空转
+                double d = step;
+                if (cur + d > limit + 1.0) d = -step;
+                else if (cur + d < -1.0)   d = step;
+                NSDictionary *s2 = AIScrollAt(CGPointMake(pts[i][0], pts[i][1]),
+                                              horiz ? 0 : d, horiz ? d : 0, YES, 0);
+                r = [NSString stringWithFormat:@"%@ %@ dy=%.0f moved=%@ (limit=%.0f)",
+                     s2[@"sv"] ?: p[@"sv"] ?: @"?",
+                     horiz ? @"横向" : @"纵向", d, s2[@"moved"] ?: @"?", limit];
+                done = YES;
+            }
+            if (!done) {
+                // ④ 兜底：至少滑一次，绝不原地空转
+                AIScrollAt(CGPointMake(195, 520), 761, 0, YES, 0);
+                r = @"兜底 dy=761";
+            }
         } @catch (NSException *e) {}
     });
     return r;
@@ -2384,6 +2429,7 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
     long idx = 0;
     int lostStreak = 0;
     NSString *prevAuthor = nil;
+    BOOL haveFirst = NO;          // v67：第一轮还没「上一个作者」可比，不能算「没换」
 
     while (!gAutorunStop) {
         @autoreleasepool {
@@ -2489,14 +2535,17 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
                     [NSThread sleepForTimeInterval:1.5];
                     lostStreak = 0;
                 }
-                AIAutorunScroll();
+                // v67：滚动结果进日志 —— 「作者没换」时靠它一眼看出是 step 没算对
+                //   还是压根没翻动（moved=0 说明卡在 limit 上）。
+                AILog(@"[autorun] #%ld 落空滑走 [%@]", idx, AIAutorunScroll());
                 [NSThread sleepForTimeInterval:2.0];
                 continue;
             }
             lostStreak = 0;
 
             NSString *authorStr = author ?: @"";
-            BOOL changed = (prevAuthor && ![prevAuthor isEqualToString:authorStr]);
+            BOOL changed = (!haveFirst) || (prevAuthor && ![prevAuthor isEqualToString:authorStr]);
+            haveFirst = YES;
             prevAuthor = authorStr;
 
             // ⑦ 随机观看时长（与 ks_brush.py 同分布）
@@ -2539,14 +2588,18 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
             if (ps < 0.10) { AIAutorunTap(326, 511); [acts addObject:@"藏"]; }   // 收藏
 
             // ⑩ 滑到下一个
-            AIAutorunScroll();
+            NSString *scr = AIAutorunScroll();
 
-            AILog(@"[autorun] #%ld %.0fs %@ | %@ | %@", idx, dur,
+            AILog(@"[autorun] #%ld %.0fs %@ | %@ | %@ | 滑[%@]%@", idx, dur,
                   acts.count ? [acts componentsJoinedByString:@","] : @"划走",
                   authorStr.length ? authorStr : @"(无作者)",
-                  fp.count ? [NSString stringWithFormat:@"赞%@评%@", fp[@"点赞"] ?: @"-", fp[@"评论"] ?: @"-"] : @"(无指纹)");
+                  fp.count ? [NSString stringWithFormat:@"赞%@评%@", fp[@"点赞"] ?: @"-", fp[@"评论"] ?: @"-"] : @"(无指纹)",
+                  scr, changed ? @"" : @" ⚠作者没换");
 
-            [NSThread sleepForTimeInterval:0.3];
+            // ★ v67：滑动后给足 settle 时间。原 0.3s 不够 —— setContentOffset:animated:
+            //   是异步动画，读屏时动画还在跑、播放器还没换源，读回来的就是上一条。
+            //   ks_brush 客户端版实测下来要 1.5~3.5s，这里取 1.8s。
+            [NSThread sleepForTimeInterval:1.8];
         }
     }
 
