@@ -62,6 +62,17 @@ static void AILogv(NSString *fmt, ...) {
     if (!gLog) { NSLog(@"[AI2] %@", s); return; }
     [gLogLock lock];
     [gLog appendString:s]; [gLog appendString:@"\n"];
+    // ★ v66 修：日志环形上限 —— 否则跑久了 gLog 涨到几 MB，log op 响应传输超时
+    if (gLog.length > 120000) {
+        NSRange r = [gLog rangeOfString:@"\n"
+                               options:0
+                                 range:NSMakeRange(0, 20000)];
+        if (r.location != NSNotFound) {
+            [gLog deleteCharactersInRange:NSMakeRange(0, r.location + 1)];
+        } else {
+            [gLog deleteCharactersInRange:NSMakeRange(0, 20000)];
+        }
+    }
     [gLogLock unlock];
     NSLog(@"[AI2] %@", s);
 }
@@ -2467,7 +2478,6 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
 
             gAutorunBrief = [NSString stringWithFormat:@"看 %lds%@", (long)dur,
                              fp.count ? [NSString stringWithFormat:@" 赞%@", fp[@"点赞"] ?: @"-"] : @""];
-            gAutorunCount = idx;
 
             // 悬浮球：显示进度（复用现有 AITaskSet）
             AITaskSet(@"养号模式", (int)(idx % 1000), 1000, @"exec", -1,
@@ -4810,7 +4820,17 @@ static void AIExecCmd(NSDictionary *cmd) {
                        @"ui":   ui});
     } else if ([op isEqualToString:@"log"]) {
         NSString *t = AILogSnapshot();
-        AIReportDict(@{@"op": @"log", @"ok": @YES, @"text": t});
+        // ★ v66：log 支持 tail=N（默认 120 行）—— 跑久了全量日志几 MB，
+        //   手机端拼 JSON + 传输都吃不消，是「log op 超时」的直接原因。
+        int tail = cmd[@"tail"] ? [cmd[@"tail"] intValue] : 120;
+        if (tail > 0) {
+            NSArray *lines = [t componentsSeparatedByString:@"\n"];
+            if ((int)lines.count > tail) {
+                NSRange r = NSMakeRange(lines.count - tail, tail);
+                t = [[lines subarrayWithRange:r] componentsJoinedByString:@"\n"];
+            }
+        }
+        AIReportDict(@{@"op": @"log", @"ok": @YES, @"text": t, @"lines": @(tail)});
     } else if ([op isEqualToString:@"toast"]) {
         // 我主动说话 -> 手机屏幕顶端弹出来。用户只要回一句「看到了」就够了。
         NSString *t = cmd[@"text"] ?: @"(空消息)";
