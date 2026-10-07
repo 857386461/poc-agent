@@ -2487,38 +2487,85 @@ static CGPoint AIAutorunFindLiveExit(NSString *text, int rank) {
 
 // 退出直播间（后台线程可调；内部自己切主线程）。返回「是否已回到非直播间」。
 // ★ 每一步都用**结果侧**（再读一次屏看 KSLive* 消失没有）复验，不信回执。
+//
+// ★★ v128 重做：砸掉 v127 的「rntap 唯一通路」。
+//   两次直播间的 UI 完全不同，谁都不是通用解：
+//     · 第 1 次（v126）：出口是 RCTTextView(tag=87)，**只有 rntap 管用**
+//     · 第 2 次（v127）：出口是 KSExtensionButton（原生 UIControl），
+//       rntap 拿到 tag=0 全废；改 tapui 也只回
+//       `ok=True act=21 sendAction+3` —— **动作发了，业务纹丝不动**
+//   真相是当时**上面压着一个 KSAlertController**：`nav` 显示每一个 VC 都
+//   `present=KSAlertController`，按钮和手势全被它吞掉。真出口其实是导航栈：
+//       [2] KSNavigationController NAV(栈深2) top=KSSLiveSlideWrapContainerViewController
+//   先 `dismiss` 弹窗再 `pop`，一次就出来了。
+//
+//   所以正确顺序是「**先看结构，再点东西**」：导航栈 → UIControl → 手势 → RN，
+//   四条路逐个试，每条都用结果侧复验。**别再拿单次成功经验当唯一通路。**
 static BOOL AIAutorunExitLive(void) {
-    for (int attempt = 0; attempt < 3; attempt++) {
+    for (int attempt = 0; attempt < 4; attempt++) {
         NSString *t = AIAutorunReadText();
         if (!t.length) break;
         if (!AIAutorunInLive(t)) return YES;          // 已经出来了
 
+        // —— 通道 1（最优先）：导航栈返回 —— dismiss 弹窗 + pop 页面
+        //   AIBack 内部就是这个顺序（先 presentedViewController 再 nav），
+        //   正好把「挡路的 KSAlertController」和「push 进来的直播间」一起办了。
+        __block NSString *bk = nil;
+        AIMainSync(^{ @try { bk = AIBack(); } @catch (NSException *e) {} });
+        AILog(@"[autorun]   退直播 back -> %@", bk ?: @"-");
+        if (bk.length && [bk rangeOfString:@"act=none"].length == 0) {
+            [NSThread sleepForTimeInterval:1.8];
+            NSString *t2 = AIAutorunReadText();
+            if (t2.length && !AIAutorunInLive(t2)) {
+                AILog(@"[autorun]   ✅ back 已退出直播间（%@）", bk);
+                return YES;
+            }
+            AILog(@"[autorun]   back 执行了但仍在直播间（ok 不作数）");
+        }
+
+        // —— 通道 2：点出口。3 个候选坐标 × 3 种点击方式，逐个试。
         NSMutableArray *cands = [NSMutableArray array];
         CGPoint p = AIAutorunFindLiveExit(t, 0);      // ① 读屏里找到的出口文字
         if (p.x > 0 && p.y > 0) [cands addObject:[NSValue valueWithCGPoint:p]];
-        // ② 实测坐标兜底：底部面板「退出直播间」(195,562)、右上「退出直播」(367,66)
-        [cands addObject:[NSValue valueWithCGPoint:CGPointMake(195, 562)]];
+        // ② 实测坐标兜底：右上「退出直播」(367,66)、底部面板「退出直播间」(195,562)
         [cands addObject:[NSValue valueWithCGPoint:CGPointMake(367, 66)]];
+        [cands addObject:[NSValue valueWithCGPoint:CGPointMake(195, 562)]];
 
         for (NSValue *vv in cands) {
             CGPoint q = [vv CGPointValue];
-            __block BOOL fired = NO;
-            AIMainSync(^{
-                @try {
-                    NSDictionary *r = AIRNTap(q, 0, 0, 60);
-                    fired = [r[@"ok"] boolValue];
-                    AILog(@"[autorun]   退直播 rntap(%.0f,%.0f) tv=%@ tag=%@ grs=%@",
-                          q.x, q.y, r[@"tv"] ?: @"-", r[@"tag"] ?: @"-", r[@"grs"] ?: @"-");
-                } @catch (NSException *e) {}
-            });
-            if (!fired) continue;
-            [NSThread sleepForTimeInterval:1.6];
-            NSString *t2 = AIAutorunReadText();
-            if (t2.length && !AIAutorunInLive(t2)) {
-                AILog(@"[autorun]   ✅ rntap(%.0f,%.0f) 已退出直播间", q.x, q.y);
-                return YES;
+            // ★ 三条点击通路全试：不知道对面是原生还是 RN，就别猜
+            //   how0=UIControl（原生按钮）  how1=手势（自绘/拦击视图）  how2=rntap（RN）
+            for (int h = 0; h < 3; h++) {
+                __block BOOL fired = NO; __block NSString *info = @"-";
+                AIMainSync(^{
+                    @try {
+                        if (h == 0) {
+                            NSString *desc = nil;
+                            fired = AITapUIControlAt(q, &desc);
+                            info = desc ?: @"-";
+                        } else if (h == 1) {
+                            NSDictionary *g = AIGestureTapAt(q);
+                            fired = [g[@"ok"] boolValue];
+                            info = [NSString stringWithFormat:@"grs=%@", g[@"grs"] ?: @"-"];
+                        } else {
+                            NSDictionary *r = AIRNTap(q, 0, 0, 60);
+                            fired = [r[@"ok"] boolValue];
+                            info = [NSString stringWithFormat:@"tv=%@ tag=%@",
+                                    r[@"tv"] ?: @"-", r[@"tag"] ?: @"-"];
+                        }
+                    } @catch (NSException *e) {}
+                });
+                if (!fired) continue;
+                [NSThread sleepForTimeInterval:1.6];
+                NSString *t2 = AIAutorunReadText();
+                if (t2.length && !AIAutorunInLive(t2)) {
+                    AILog(@"[autorun]   ✅ how%d (%.0f,%.0f) 已退出直播间 [%@]",
+                          h, q.x, q.y, info);
+                    return YES;
+                }
+                AILog(@"[autorun]   how%d (%.0f,%.0f) 回执成功但仍在直播间 [%@]",
+                      h, q.x, q.y, info);
             }
-            AILog(@"[autorun]   rntap(%.0f,%.0f) 回执成功但仍在直播间（ok 不作数）", q.x, q.y);
         }
         [NSThread sleepForTimeInterval:1.0];
     }
@@ -2885,7 +2932,23 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
             if (gAutorunStop) break;
 
             // ⑨ 互动（与 ks_brush.py 同概率）
+            //
+            // ★★ v128 预防层（治本）：**读不到赞/评指纹 = 不是普通视频** → 不互动。
+            //
+            //   2026-10-08 长跑实测，进直播间的就是这一步：
+            //       #5  9s 赞,藏 | 捕鱼大作战 | (无指纹) | 滑[… moved=0 (limit=1 step=844)]
+            //                      ↑作者读得到，但**赞/评数一个都没有**
+            //   那张卡片的「赞」位置其实是「进入直播间」的按钮 —— 一次互动就把自己
+            //   送进去了。对比同轮的 `#3 划走 | 捕鱼大咖 | (无指纹)` 平安无事。
+            //
+            //   与其进去再爬出来，**不如压根不碰身份不明的目标**。用户的原话：
+            //   「遇见直播间不进行互动可以不」—— 可以，而且这才是正解。
+            //   代价只是广告类视频不再点赞（养号本就该绕开广告），收益是根掉一类事故。
             NSMutableArray *acts = [NSMutableArray array];
+            if (fp.count == 0) {
+                AILog(@"[autorun] #%ld 无指纹（非普通视频）→ 跳过全部互动，直接划走", idx);
+                [acts addObject:@"避互动"];
+            } else {
             double pz = ((double)arc4random() / 4294967295.0);
             if (pz < 0.30) { AIAutorunTap(326, 371); [acts addObject:@"赞"]; }   // 点赞
             double pc = ((double)arc4random() / 4294967295.0);
@@ -2894,6 +2957,7 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
                              AIAutorunTap(195, 100); }                            // 点空白关评论
             double ps = ((double)arc4random() / 4294967295.0);
             if (ps < 0.10) { AIAutorunTap(326, 511); [acts addObject:@"藏"]; }   // 收藏
+            }
 
             // ⑩ 滑到下一个
             NSString *scr = AIAutorunScroll();
