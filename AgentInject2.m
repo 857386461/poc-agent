@@ -2351,16 +2351,28 @@ static NSString *AIAutorunReadText(void) {
 //     ② dy 用 step；到底/到头自动反向（ks_brush.flip 的 `cur+d > limit+1 → d=-step`）
 //     ③ 落点多候选 (195,700)→(195,520)→(195,300)，避开「剧集横滑 KSThanosPagesView」
 //     ④ 探不到容器也要滑一次兜底（长按菜单那类遮罩会把 page_info 的问询吞掉）
+static BOOL AIAutorunTap(double x, double y);   // v124：下面要拿它关面板，定义在后面
+
 static NSString *AIAutorunScroll(void) {
     __block NSString *r = @"(未滑)";
     AIMainSync(^{
         @try {
             // ③ 多候选落点（照抄 ks_brush.flip 的顺序）
             static double pts[3][2] = {{195, 700}, {195, 520}, {195, 300}};
-            BOOL done = NO;
-            for (int i = 0; i < 3 && !done; i++) {
+            // ★ v124：两轮。第一轮挑不到合格容器，多半是**有面板盖在 feed 上**
+            //   （评论区 / 收藏夹，实测「赞,藏」之后就会带出来），先点空白关掉再探一轮。
+            for (int round = 0; round < 2; round++) {
+            for (int i = 0; i < 3; i++) {
                 NSDictionary *p = AIScrollAt(CGPointMake(pts[i][0], pts[i][1]), 0, 0, NO, 0);
                 if (![p[@"ok"] boolValue]) continue;
+                NSString *svName = p[@"sv"] ?: @"";
+                // ★★ v124 修（卡死在评论区）：AIScrollAt 只要「父链 25 层内有任意
+                //   UIScrollView」就 ok=YES —— 评论区 KSCommentTableView、收藏夹面板
+                //   全都合格，于是落点 (195,700) 命中的是评论列表，之后每一步都在
+                //   评论里上下滑，feed 一动不动（实测 #3~#9 全卡在同一个作者，7 条白跑）。
+                //   两条硬筛：① 面板类容器直接跳过；② 不能真滑 / 页高不像 feed 的也跳过。
+                if ([svName rangeOfString:@"Comment" options:NSCaseInsensitiveSearch].length)
+                    continue;
                 // ① 算动态页尺寸（注意 AIScrollAt 的 "frame" 字段其实是 sv.bounds）
                 CGSize  cs = CGSizeFromString(p[@"contentSize"] ?: @"");
                 CGRect  bd = CGRectFromString(p[@"frame"] ?: @"");
@@ -2371,6 +2383,9 @@ static NSString *AIAutorunScroll(void) {
                 double limit = MAX(0.0, horiz ? (cs.width  - bd.size.width)
                                              : (cs.height - bd.size.height));
                 double cur   = horiz ? be.x : be.y;
+                // ② 筛掉「不能真滑」(limit<=0，实测撞到过 UIScrollView moved=0)
+                //    和「页高不像 feed」的容器（feed 是全屏分页，页高 ≥600）
+                if (limit <= 0 || step < 600.0) continue;
                 // ② 到底往回翻、到头往前翻 —— 惰性列表靠这条才不会卡在末尾空转
                 double d = step;
                 if (cur + d > limit + 1.0) d = -step;
@@ -2380,13 +2395,17 @@ static NSString *AIAutorunScroll(void) {
                 r = [NSString stringWithFormat:@"%@ %@ dy=%.0f moved=%@ (limit=%.0f)",
                      s2[@"sv"] ?: p[@"sv"] ?: @"?",
                      horiz ? @"横向" : @"纵向", d, s2[@"moved"] ?: @"?", limit];
-                done = YES;
+                return;                       // 翻到了，收工
             }
-            if (!done) {
-                // ④ 兜底：至少滑一次，绝不原地空转
-                AIScrollAt(CGPointMake(195, 520), 761, 0, YES, 0);
-                r = @"兜底 dy=761";
+                // 三个落点都挑不出合格容器 → 大概率有面板盖着 feed，
+                // 点上方空白关掉它，再探一轮（只探两轮，绝不无限循环）
+                AILog(@"[autorun] 三落点都不像 feed → 点空白 (195,100) 关面板，再探一轮");
+                AIAutorunTap(195, 100);
+                [NSThread sleepForTimeInterval:1.2];
             }
+            // ④ 兜底：两轮都不行也得滑一次，绝不原地空转
+            AIScrollAt(CGPointMake(195, 520), 761, 0, YES, 0);
+            r = @"兜底 dy=761（两轮都没找到 feed 容器）";
         } @catch (NSException *e) {}
     });
     return r;
@@ -2430,6 +2449,7 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
     int lostStreak = 0;
     NSString *prevAuthor = nil;
     BOOL haveFirst = NO;          // v67：第一轮还没「上一个作者」可比，不能算「没换」
+    int  sameStreak = 0;          // v124：连续「作者没换」次数（卡死兜底用）
 
     while (!gAutorunStop) {
         @autoreleasepool {
@@ -2600,6 +2620,24 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
             //   是异步动画，读屏时动画还在跑、播放器还没换源，读回来的就是上一条。
             //   ks_brush 客户端版实测下来要 1.5~3.5s，这里取 1.8s。
             [NSThread sleepForTimeInterval:1.8];
+
+            // ★ v124 兜底（治「卡死还看不出来」）：连续两次作者没换，说明**已经不在
+            //   feed 上了**（实测：评论区盖住时作者仍能读到 feed 的作者，所以 ⑥ 门禁
+            //   判不出来，会一直空转）。此时关面板 + 点首页 tab 强制回家。
+            if (!changed) {
+                sameStreak++;
+                if (sameStreak >= 2) {
+                    AILog(@"[autorun] ⚠️ 连 %d 次作者没换 → 关面板 + 点首页 tab 回家", sameStreak);
+                    AIAutorunTap(195, 100);      // 关掉可能开着的评论区/收藏夹
+                    [NSThread sleepForTimeInterval:1.2];
+                    AIAutorunTap(39, 786);       // 首页 tab（唯一安全的回家通道）
+                    [NSThread sleepForTimeInterval:1.5];
+                    sameStreak = 0;
+                    prevAuthor = nil;            // 回家后重新比，别把旧作者带过来
+                }
+            } else {
+                sameStreak = 0;
+            }
         }
     }
 
