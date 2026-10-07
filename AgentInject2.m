@@ -2319,6 +2319,57 @@ static NSArray *AIAutorunSiderKW(void) {
     return kw;
 }
 
+// 侧边栏到底开没开？（★ v125：换成与内容无关的硬判据）
+//
+//   ⚠ 2026-10-07 实测（v124 跑出来的日志当场自证）：那一版里「侧边栏开着」隔一步
+//     出现一次，点 (29,69) 有时一击奏效、有时连续三次都关不掉 —— **同一个点，
+//     两种结果**。跑到最后用 state_probe 读屏，真相是**抽屉从头到尾都没开过**：
+//         (6) -291,0 390x844 | <KSSideBarTKView: 0x13937d6b0; frame = (-291 0; 390 844)
+//     x = -291，整块在屏幕左侧外，用户肉眼根本看不见；feed (`KSTBrowseTableViewCell`
+//     x=0) 一切正常。
+//
+//     但抽屉**始终挂在 window 上**（ks_brush 早就写过：抽屉滑出时 frame.x 变负，
+//     子树节点仍在树里、text 照样读得到），所以那 6 个词**永远会被读到**。
+//
+//     那为什么旧的「vis 里 x ∈ [-20,420]」没把它们滤掉？因为 AIAutorunParse 里
+//     过滤用的是 **x - shift**，而 AIAutorunShift 把 -291 归进了 -390 桶；一旦它
+//     判定 bestK = -390，shift 就是 -390，于是：
+//         侧边栏 -291 -(-390) =  99 → 落进 [-20,420]，被当成「屏内」  ← 误判
+//         feed    338 -(-390) = 728 → 被当成「屏外」                  ← 整个判定反转
+//     shift 会随着每次读屏的内容漂移，于是隔一步翻一次，看着就像抽屉在反复开合。
+//
+//   正解：**别用「文字 + 平移后的坐标」做判据**。容器自己的 frame 是客观的、
+//   跟内容无关的 —— 位置在屏幕外就是没开，不需要讨论。
+static BOOL AIAutorunSiderOpen(NSString *text) {
+    if (!text.length) return NO;
+    BOOL hasContainer = NO, containerVisible = NO;
+    NSMutableSet *hitWords = [NSMutableSet set];
+    NSArray *skw = AIAutorunSiderKW();
+    for (NSString *ln in [text componentsSeparatedByString:@"\n"]) {
+        NSTextCheckingResult *m = [gRxRow firstMatchInString:ln options:0
+                                    range:NSMakeRange(0, ln.length)];
+        if (!m || m.numberOfRanges < 7) continue;
+        double x = [[ln substringWithRange:[m rangeAtIndex:2]] doubleValue];   // ★ 不减 shift
+        NSString *c = [ln substringWithRange:[m rangeAtIndex:6]];
+        if ([ln rangeOfString:@"KSSideBar"].length) {
+            hasContainer = YES;
+            if (x > -80.0) containerVisible = YES;
+        }
+        // 兜底用的文字判据也改用**原始坐标**，不再受 shift 污染
+        if (x >= -20 && x <= 420 && c.length) {
+            for (NSString *w in skw) if ([c containsString:w]) { [hitWords addObject:w]; break; }
+        }
+    }
+    int rawHits = (int)hitWords.count;
+    if (hasContainer) {
+        AILog(@"[autorun] 侧边栏容器x=%@（原始坐标文字命中%d）→ 判%@",
+              containerVisible ? @"可见" : @"已滑出", rawHits,
+              containerVisible ? @"开着" : @"关着");
+        return containerVisible;
+    }
+    return rawHits >= 3;      // 类名万一改了，还有文字兜底（但已不受 shift 影响）
+}
+
 // 读一次屏（主线程内），返回 text。这个函数本身不解析，只取原始文本。
 // ★ 必须与 text op 完全一致（w 起点 / depth 30 / budget 2500）——
 //   否则拿不到 window 上的兄弟视图（侧边栏 KSSideBarTKView 就挂在 window 上）。
@@ -2397,11 +2448,14 @@ static NSString *AIAutorunScroll(void) {
                      horiz ? @"横向" : @"纵向", d, s2[@"moved"] ?: @"?", limit];
                 return;                       // 翻到了，收工
             }
-                // 三个落点都挑不出合格容器 → 大概率有面板盖着 feed，
-                // 点上方空白关掉它，再探一轮（只探两轮，绝不无限循环）
-                AILog(@"[autorun] 三落点都不像 feed → 点空白 (195,100) 关面板，再探一轮");
-                AIAutorunTap(195, 100);
-                [NSThread sleepForTimeInterval:1.2];
+                // 三个落点都挑不出合格容器 → 大概率有浮层盖着 feed，
+                // 点上方空白收起它，再探一轮（★ 只在第一轮之后点一次，
+                // 别每步都在 feed 上乱点两次 —— 那本身就是扰动）
+                if (round == 0) {
+                    AILog(@"[autorun] 三落点都不像 feed → 点上方空白收起浮层，再探一轮");
+                    AIAutorunTap(195, 100);
+                    [NSThread sleepForTimeInterval:1.2];
+                }
             }
             // ④ 兜底：两轮都不行也得滑一次，绝不原地空转
             AIScrollAt(CGPointMake(195, 520), 761, 0, YES, 0);
@@ -2488,20 +2542,16 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
             NSString *author = nil;
             AIAutorunParse(text, shift, fp, &author, vis);
 
-            // ④ 门禁：侧边栏开着 → 点左上角返回（仅屏内命中，门限 3）
-            int siderHits = 0;
-            NSArray *skw = AIAutorunSiderKW();
-            for (NSString *w in skw) {
-                for (NSString *l in vis) {
-                    if ([l containsString:w]) { siderHits++; break; }
-                }
-            }
-            if (siderHits >= 3) {
+            // ④ 门禁：侧边栏真的开着？——★ v125 起改用 AIAutorunSiderOpen（容器 frame
+            //   硬判据）。旧实现拿「vis 里的文字」判，而 vis 的坐标减过 shift，
+            //   shift 一漂就把滑出屏幕的抽屉算回屏内，出现「每两步侧边栏开一次、
+            //   同一个点有时有用有时没用」的假开合（详见 AIAutorunSiderOpen 注释）。
+            if (AIAutorunSiderOpen(text)) {
                 // ★ v66 修：原实现只点 (29,69) 一次就 continue，从不复验。
                 //   侧边栏是**自绘抽屉**（TKView），ks_brush 的成熟做法是**多候选逐个试**：
                 //   ① (29,69) toggle  ② 外侧空白 (350,420)/(350,700)  ③ 首页 tab
                 //   且**每步都用结果侧（siderHits）复验**，不再信 ok=true。
-                AILog(@"[autorun] 侧边栏开着（命中 %d）→ 逐个试关闭", siderHits);
+                AILog(@"[autorun] 侧边栏真开着 → 逐个试关闭");
                 static double pts[4][2] = {{29,69}, {350,420}, {350,700}, {39,786}};
                 BOOL closed = NO;
                 for (int k = 0; k < 4 && !closed; k++) {
@@ -2509,18 +2559,10 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
                     [NSThread sleepForTimeInterval:1.6];
                     NSString *t2 = AIAutorunReadText();
                     if (!t2.length) break;
-                    NSMutableDictionary *fp2 = [NSMutableDictionary dictionary];
-                    NSMutableArray *vis2 = [NSMutableArray array];
-                    NSString *a2 = nil;
-                    double sh2 = AIAutorunShift(t2);
-                    AIAutorunParse(t2, sh2, fp2, &a2, vis2);
-                    int h2 = 0;
-                    for (NSString *w in skw) {
-                        for (NSString *l in vis2) { if ([l containsString:w]) { h2++; break; } }
-                    }
-                    AILog(@"[autorun]   候选%d (%.0f,%.0f) → 侧边栏命中 %d",
-                          k + 1, pts[k][0], pts[k][1], h2);
-                    if (h2 < 3) closed = YES;
+                    // ★ v125：复验也用同一个硬判据（原来这里也算 shift 后的命中数）
+                    closed = !AIAutorunSiderOpen(t2);
+                    AILog(@"[autorun]   候选%d (%.0f,%.0f) → %@",
+                          k + 1, pts[k][0], pts[k][1], closed ? @"已关掉" : @"还开着");
                 }
                 if (!closed) {
                     AILog(@"[autorun] ⚠️ 侧边栏 4 个候选都没关掉，退出养号（避免死循环）");
