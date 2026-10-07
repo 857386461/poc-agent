@@ -2386,6 +2386,145 @@ static NSString *AIAutorunReadText(void) {
     return t ?: @"";
 }
 
+// ---------------------------------------------------------------------------
+// ★ v127：直播间门禁 —— 治「进直播间出不来了」
+//
+//   2026-10-08 实测事故（v126 长跑）：跑到 #113 / 25 分 40 秒卡死，日志全是
+//       #109 落空（连1）… 落空滑走 [KSGRBrowseTableView 纵向 直查
+//                                  moved=844 (limit=60768 step=844)]
+//   limit 从正常的 761~1522 暴涨到 60768 / 64144，step 也从 761 变成 844。
+//   读屏一看全是 KSLiveAnchorInfoCycleCollectionView / KSLiveLeakCatchView /
+//   KSLiveAudienceRankView / KSLiveCommentCell×6 / KSLiveRCTRootView —— 人在直播间。
+//
+//   为什么出不来（两个坑叠在一起）：
+//     ① 快手直播间是**全屏页**，底部「首页」tab 被盖住 —— v124 那套回家兜底
+//        只会点 (39,786)，点了等于没点。
+//     ② 直播间里上下滑 = **切主播**，承载它的还是同一个 feed tableView
+//        （contentSize 76 屏）。于是 AIFindFeedSV 一路判定「我在 feed 上」，
+//        继续滑，越滑越深（#109→#113 全是落空）。
+//
+//   三条对策：
+//     ① 硬判据识别直播间（类名 + 出口文字），**优先级高于一切**，先退出来再说
+//     ② 出口必须走 **RN 手势通道 AIRNTap**：实测 `gtap`(ok=1 how=UIControl) 和
+//        `picktxt 退出直播`(ok=True how=gesture) **都回成功但没退出来**，只有
+//        `rntap`（拿精确命中 view 的 reactTag 喂 RCTTouchHandler，
+//         grs=RCTTouchHandler|state=3）真退出来了 —— 又一次印证
+//        「ok=true 不是判据，要看结果侧的客观变化」。
+//     ③ 给 feed 容器加 **limit 上限**：普通 feed 的 limit 是 761~1522，
+//        出现 6 万这种量级 = 不在普通 feed，不许继续滑。
+//
+//   ⚠️ 千万别把 KSLivePreview* 当成直播间：那是 **feed 里混排的直播预览卡片**
+//      （KSLivePreviewRootView / KSLivePreviewLandscapeSkinView /
+//      KSLivePreviewFollowButton），正常刷 feed 每几屏就会遇到一张。判成直播间
+//      会导致「每滑到一张直播卡片就误退出一次」，养号直接废掉。
+// ---------------------------------------------------------------------------
+
+// 只在**真正的直播间**里出现的类名（feed 里的直播预览卡片不算）
+//
+//   ⚠️ 2026-10-08 实测剔词：初版还放了 KSLiveGiftStickerWidgetView 和
+//     KSLiveOrderCommodityItemView —— 结果退出直播间后回 feed 一读屏，这两个
+//     就挂在 **KSLivePreviewRootView（feed 里的直播预览卡片）** 下面：
+//         (17) 0,0 390x761 | <KSLivePreviewRootView …>
+//         (20) 0,93 293x180 | <KSLiveGiftStickerWidgetView …>
+//         (21) 19,861 58x58 | <KSLiveOrderCommodityItemView …>
+//     也就是说它们**正常刷 feed 就会出现**。留着的话门限 2 会被一张直播卡片
+//     凑满 → 每滑到一张卡片就误判「在直播间」→ 疯狂点退出，养号直接废掉。
+//     判断某个词能不能放进来的唯一标准：**退出直播间后回 feed 读屏里有没有它**。
+static NSArray *AIAutorunLiveKW(void) {
+    static NSArray *kw = nil;
+    if (!kw) kw = @[@"KSLiveLeakCatchView",       @"KSLiveAudienceRankView",
+                    @"KSLiveCommentCell",         @"KSLiveAnchorInfoContainerView",
+                    @"KSLiveAnchorInfoCycleCollectionView",
+                    @"KSLiveBottomBarCommentStrengthenView",
+                    @"KSLiveAttachGiftButton",    @"KSLiveAudienceListAvatorView",
+                    @"KSLiveWatchCountView",      @"KSLiveBackgroundMaskView",
+                    @"KSLivePanGesturePendantContainer",
+                    @"KSLiveRightBottomRevenueContainer"];
+    return kw;
+}
+
+// 是不是掉进直播间了？
+static BOOL AIAutorunInLive(NSString *text) {
+    if (!text.length) return NO;
+    int hits = 0; BOOL exitTxt = NO;
+    NSArray *lkw = AIAutorunLiveKW();
+    for (NSString *ln in [text componentsSeparatedByString:@"\n"]) {
+        // ★ feed 里的直播预览卡片不是直播间，直接跳过这一行
+        if ([ln rangeOfString:@"KSLivePreview"].length) continue;
+        for (NSString *k in lkw) if ([ln rangeOfString:k].length) { hits++; break; }
+        NSTextCheckingResult *m = [gRxRow firstMatchInString:ln options:0
+                                    range:NSMakeRange(0, ln.length)];
+        if (m && m.numberOfRanges >= 7) {
+            NSString *c = [ln substringWithRange:[m rangeAtIndex:6]];
+            if ([c isEqualToString:@"退出直播"] || [c isEqualToString:@"退出直播间"])
+                exitTxt = YES;
+        }
+    }
+    return (hits >= 2) || exitTxt;   // 「退出直播间」这几个字本身就是铁证
+}
+
+// 从读屏里找「退出直播间 / 退出直播」这类出口文字的中心点（找不到返回 x<0）
+static CGPoint AIAutorunFindLiveExit(NSString *text, int rank) {
+    NSMutableArray *pts = [NSMutableArray array];
+    for (NSString *ln in [text componentsSeparatedByString:@"\n"]) {
+        NSTextCheckingResult *m = [gRxRow firstMatchInString:ln options:0
+                                    range:NSMakeRange(0, ln.length)];
+        if (!m || m.numberOfRanges < 7) continue;
+        NSString *c = [ln substringWithRange:[m rangeAtIndex:6]];
+        if (!([c isEqualToString:@"退出直播间"] || [c isEqualToString:@"退出直播"])) continue;
+        double x = [[ln substringWithRange:[m rangeAtIndex:2]] doubleValue];
+        double y = [[ln substringWithRange:[m rangeAtIndex:3]] doubleValue];
+        NSArray *ab = [[ln substringWithRange:[m rangeAtIndex:4]]
+                       componentsSeparatedByString:@"x"];
+        double w = ab.count > 1 ? [ab[0] doubleValue] : 0.0;
+        double h = ab.count > 1 ? [ab[1] doubleValue] : 0.0;
+        [pts addObject:[NSValue valueWithCGPoint:CGPointMake(x + w / 2.0, y + h / 2.0)]];
+    }
+    if (!pts.count) return CGPointMake(-1, -1);
+    if (rank >= (int)pts.count) rank = (int)pts.count - 1;
+    return [pts[rank] CGPointValue];
+}
+
+// 退出直播间（后台线程可调；内部自己切主线程）。返回「是否已回到非直播间」。
+// ★ 每一步都用**结果侧**（再读一次屏看 KSLive* 消失没有）复验，不信回执。
+static BOOL AIAutorunExitLive(void) {
+    for (int attempt = 0; attempt < 3; attempt++) {
+        NSString *t = AIAutorunReadText();
+        if (!t.length) break;
+        if (!AIAutorunInLive(t)) return YES;          // 已经出来了
+
+        NSMutableArray *cands = [NSMutableArray array];
+        CGPoint p = AIAutorunFindLiveExit(t, 0);      // ① 读屏里找到的出口文字
+        if (p.x > 0 && p.y > 0) [cands addObject:[NSValue valueWithCGPoint:p]];
+        // ② 实测坐标兜底：底部面板「退出直播间」(195,562)、右上「退出直播」(367,66)
+        [cands addObject:[NSValue valueWithCGPoint:CGPointMake(195, 562)]];
+        [cands addObject:[NSValue valueWithCGPoint:CGPointMake(367, 66)]];
+
+        for (NSValue *vv in cands) {
+            CGPoint q = [vv CGPointValue];
+            __block BOOL fired = NO;
+            AIMainSync(^{
+                @try {
+                    NSDictionary *r = AIRNTap(q, 0, 0, 60);
+                    fired = [r[@"ok"] boolValue];
+                    AILog(@"[autorun]   退直播 rntap(%.0f,%.0f) tv=%@ tag=%@ grs=%@",
+                          q.x, q.y, r[@"tv"] ?: @"-", r[@"tag"] ?: @"-", r[@"grs"] ?: @"-");
+                } @catch (NSException *e) {}
+            });
+            if (!fired) continue;
+            [NSThread sleepForTimeInterval:1.6];
+            NSString *t2 = AIAutorunReadText();
+            if (t2.length && !AIAutorunInLive(t2)) {
+                AILog(@"[autorun]   ✅ rntap(%.0f,%.0f) 已退出直播间", q.x, q.y);
+                return YES;
+            }
+            AILog(@"[autorun]   rntap(%.0f,%.0f) 回执成功但仍在直播间（ok 不作数）", q.x, q.y);
+        }
+        [NSThread sleepForTimeInterval:1.0];
+    }
+    return NO;
+}
+
 // 滑到下一页（主线程内）——纵向往前一格
 //
 // ★★ v67 修（「作者两条一重复」= 一半时间白刷同一条视频）：
@@ -2415,6 +2554,12 @@ static NSString *AIAutorunReadText(void) {
 //   另外实测 feed 容器名会变（v123/v124 是 KSGRBrowseTableView，这次是
 //   KSTBrowseTableViewCell），**依赖类名筛选注定不牢靠**。所以用「纯粹几何」判：
 //   竖向、可视高 ≥600（全屏分页）、contentSize 比可视高还高（能真滑）、没隐藏。
+//
+// ★ v127：再加一条 **limit 上限**。普通 feed 是惰性加载的，limit 撑死 1522
+//   （两屏）；而直播间里上下滑切主播时，同一个 tableView 的 contentSize 会涨到
+//   60768 / 64144（≈76 屏）。v126 就栽在这：它把 76 屏的直播间流当成 feed 一路
+//   猛滑，越滑越深。所以 limit 超过 AI_FEED_LIMIT_MAX 的一律不算 feed 容器。
+#define AI_FEED_LIMIT_MAX  5000.0
 static UIScrollView *AIFindFeedSV(UIWindow *w) {
     if (!w) return nil;
     UIScrollView *best = nil; CGFloat bestH = 0;
@@ -2426,7 +2571,8 @@ static UIScrollView *AIFindFeedSV(UIWindow *w) {
             UIScrollView *sv = (UIScrollView *)v;
             CGFloat h = sv.bounds.size.height;
             CGFloat lim = sv.contentSize.height - h;
-            if (!sv.hidden && sv.alpha > 0.05 && h >= 600.0 && lim > 0 && h > bestH) {
+            if (!sv.hidden && sv.alpha > 0.05 && h >= 600.0 &&
+                lim > 0 && lim < AI_FEED_LIMIT_MAX && h > bestH) {
                 best = sv; bestH = h;
             }
         }
@@ -2473,6 +2619,7 @@ static NSString *AIAutorunScroll(void) {
             // 退回通道：还是走 AIScrollAt 的多落点探测（万一连直查都没找到容器）
             // ★ v124：两轮。第一轮挑不到合格容器，多半是**有面板盖在 feed 上**
             //   （评论区 / 收藏夹，实测「赞,藏」之后就会带出来），先点空白关掉再探一轮。
+            double maxSeenLimit = 0;      // v127：记下探到的最大 limit，兜底要用
             for (int round = 0; round < 2; round++) {
             for (int i = 0; i < 3; i++) {
                 NSDictionary *p = AIScrollAt(CGPointMake(pts[i][0], pts[i][1]), 0, 0, NO, 0);
@@ -2495,9 +2642,11 @@ static NSString *AIAutorunScroll(void) {
                 double limit = MAX(0.0, horiz ? (cs.width  - bd.size.width)
                                              : (cs.height - bd.size.height));
                 double cur   = horiz ? be.x : be.y;
+                if (limit > maxSeenLimit) maxSeenLimit = limit;
                 // ② 筛掉「不能真滑」(limit<=0，实测撞到过 UIScrollView moved=0)
                 //    和「页高不像 feed」的容器（feed 是全屏分页，页高 ≥600）
-                if (limit <= 0 || step < 600.0) continue;
+                // ★ v127：再加 limit 上限（直播间流 6 万屏，滑了就是切主播）
+                if (limit <= 0 || limit > AI_FEED_LIMIT_MAX || step < 600.0) continue;
                 // ② 到底往回翻、到头往前翻 —— 惰性列表靠这条才不会卡在末尾空转
                 double d = step;
                 if (cur + d > limit + 1.0) d = -step;
@@ -2519,6 +2668,15 @@ static NSString *AIAutorunScroll(void) {
                 }
             }
             // ④ 兜底：两轮都不行也得滑一次，绝不原地空转
+            //   ★ v127 例外：要是探到的容器 limit 大得离谱（直播间流实测 60768 /
+            //     64144 ≈ 76 屏），这一滑就是在直播间里**切主播** —— 越滑越出不来。
+            //     这种时候**不滑**，把「不在普通 feed 上」如实报上去，交给主循环
+            //     的直播间门禁处理。「绝不空转」不能凌驾于「别把局面搞更糟」。
+            if (maxSeenLimit > AI_FEED_LIMIT_MAX) {
+                r = [NSString stringWithFormat:
+                     @"⚠拒绝滑动（容器 limit=%.0f 异常，非普通 feed）", maxSeenLimit];
+                return;
+            }
             AIScrollAt(CGPointMake(195, 520), 761, 0, YES, 0);
             r = @"兜底 dy=761（两轮都没找到 feed 容器）";
         } @catch (NSException *e) {}
@@ -2565,6 +2723,7 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
     NSString *prevAuthor = nil;
     BOOL haveFirst = NO;          // v67：第一轮还没「上一个作者」可比，不能算「没换」
     int  sameStreak = 0;          // v124：连续「作者没换」次数（卡死兜底用）
+    int  liveStreak = 0;          // v127：连续「掉进直播间」轮数（退不出去就停）
 
     while (!gAutorunStop) {
         @autoreleasepool {
@@ -2602,6 +2761,32 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
             NSMutableArray *vis = [NSMutableArray array];
             NSString *author = nil;
             AIAutorunParse(text, shift, fp, &author, vis);
+
+            // ★ ③b v127 门禁：是不是掉进直播间了？（优先级最高，压过后面一切）
+            //
+            //   为什么必须放最前：快手直播间是**全屏页**，底部「首页」tab 被盖住，
+            //   所以在里面做任何「回家 / 关面板 / 点赞 / 滑动」都是错的 —— 滑动更是
+            //   直接变成「切主播」（v126 实测 #109→#113 连滑 5 次，越陷越深）。
+            //   所以先判、先退，退出来再谈别的。
+            if (AIAutorunInLive(text)) {
+                liveStreak++;
+                AILog(@"[autorun] ⚠️ 在直播间（#%ld，连 %d）→ 走 RN 手势通道退出",
+                      idx, liveStreak);
+                BOOL out = AIAutorunExitLive();
+                if (out) {
+                    AILog(@"[autorun] ✅ 已回到 feed，重置作者比较重来");
+                    prevAuthor = nil; haveFirst = NO;
+                    sameStreak = 0; lostStreak = 0; liveStreak = 0;
+                } else if (liveStreak >= 2) {
+                    // 连两轮都退不出去 → 继续待着只会空转甚至乱点，**停掉**更安全
+                    AILog(@"[autorun] ❌ 连 %d 轮退不出直播间 → 停止养号（避免在里面乱点）",
+                          liveStreak);
+                    gAutorunStop = 1;
+                }
+                [NSThread sleepForTimeInterval:1.2];
+                continue;
+            }
+            liveStreak = 0;
 
             // ④ 门禁：侧边栏真的开着？——★ v125 起改用 AIAutorunSiderOpen（容器 frame
             //   硬判据）。旧实现拿「vis 里的文字」判，而 vis 的坐标减过 shift，
