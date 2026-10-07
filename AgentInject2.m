@@ -2402,6 +2402,53 @@ static NSString *AIAutorunReadText(void) {
 //     ② dy 用 step；到底/到头自动反向（ks_brush.flip 的 `cur+d > limit+1 → d=-step`）
 //     ③ 落点多候选 (195,700)→(195,520)→(195,300)，避开「剧集横滑 KSThanosPagesView」
 //     ④ 探不到容器也要滑一次兜底（长按菜单那类遮罩会把 page_info 的问询吞掉）
+// ★ v126：绕开 hitTest 直接找 feed 容器。
+//
+//   为什么必须绕开：快手的部分浮层是 **React Native** 渲染的。2026-10-08 实测
+//   三个落点全部失败，回执是：
+//       (195,700) -> {"err":"父链 25 层内无 UIScrollView","hit":"RCTView"}
+//       (195,400) -> {"err":"父链 25 层内无 UIScrollView","hit":"RCTTextView"}
+//   整个屏幕被 RN 浮层盖着，而 AIScrollAt 是 `hitTest → 沿父链找 UIScrollView`
+//   的老路，浮层一来就全线失效，日志表现是「三落点都不像 feed」；更糟的是我的
+//   「兜底」走的还是同一个 AIScrollAt —— 等于没滑，白等一次。
+//
+//   另外实测 feed 容器名会变（v123/v124 是 KSGRBrowseTableView，这次是
+//   KSTBrowseTableViewCell），**依赖类名筛选注定不牢靠**。所以用「纯粹几何」判：
+//   竖向、可视高 ≥600（全屏分页）、contentSize 比可视高还高（能真滑）、没隐藏。
+static UIScrollView *AIFindFeedSV(UIWindow *w) {
+    if (!w) return nil;
+    UIScrollView *best = nil; CGFloat bestH = 0;
+    NSMutableArray *q = [NSMutableArray arrayWithObject:w];
+    int guard = 0;
+    while (q.count && guard++ < 8000) {
+        UIView *v = q[0]; [q removeObjectAtIndex:0];
+        if ([v isKindOfClass:[UIScrollView class]]) {
+            UIScrollView *sv = (UIScrollView *)v;
+            CGFloat h = sv.bounds.size.height;
+            CGFloat lim = sv.contentSize.height - h;
+            if (!sv.hidden && sv.alpha > 0.05 && h >= 600.0 && lim > 0 && h > bestH) {
+                best = sv; bestH = h;
+            }
+        }
+        for (UIView *s in v.subviews) [q addObject:s];
+    }
+    return best;
+}
+
+// 对一个已经确认的 UIScrollView 翻一页（dy 给正数即可，内部处理边界反向）
+static NSDictionary *AIScrollFeedPage(UIScrollView *sv) {
+    double step = sv.bounds.size.height;
+    CGPoint before = sv.contentOffset;
+    CGFloat maxY = MAX(0, sv.contentSize.height - sv.bounds.size.height);
+    double d = step;
+    if (before.y + d > maxY + 1.0) d = -step;      // 到底了往回翻
+    else if (before.y + d < -1.0)  d = step;
+    CGPoint after = CGPointMake(before.x, MIN(maxY, MAX(0, before.y + d)));
+    [sv setContentOffset:after animated:YES];
+    return @{@"sv": NSStringFromClass([sv class]), @"moved": @(after.y - before.y),
+             @"limit": @(maxY), @"step": @(step), @"d": @(d)};
+}
+
 static BOOL AIAutorunTap(double x, double y);   // v124：下面要拿它关面板，定义在后面
 
 static NSString *AIAutorunScroll(void) {
@@ -2410,6 +2457,20 @@ static NSString *AIAutorunScroll(void) {
         @try {
             // ③ 多候选落点（照抄 ks_brush.flip 的顺序）
             static double pts[3][2] = {{195, 700}, {195, 520}, {195, 300}};
+
+            // ★ v126 首选通道：**不经过 hitTest**，直接从 window 树里按几何条件
+            //   捞出 feed 容器。RN 浮层盖屏时（hitTest 只回 RCTView）这条照样通，
+            //   也不用猜容器叫什么名字。
+            UIScrollView *feed = AIFindFeedSV(AIHostWindow());
+            if (feed) {
+                NSDictionary *r0 = AIScrollFeedPage(feed);
+                r = [NSString stringWithFormat:@"%@ 纵向 直查 moved=%@ (limit=%.0f step=%.0f)",
+                     r0[@"sv"] ?: @"?", r0[@"moved"] ?: @"?",
+                     [r0[@"limit"] doubleValue], [r0[@"step"] doubleValue]];
+                return;
+            }
+
+            // 退回通道：还是走 AIScrollAt 的多落点探测（万一连直查都没找到容器）
             // ★ v124：两轮。第一轮挑不到合格容器，多半是**有面板盖在 feed 上**
             //   （评论区 / 收藏夹，实测「赞,藏」之后就会带出来），先点空白关掉再探一轮。
             for (int round = 0; round < 2; round++) {
