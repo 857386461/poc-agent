@@ -2572,6 +2572,139 @@ static BOOL AIAutorunExitLive(void) {
     return NO;
 }
 
+// ---------------------------------------------------------------------------
+// ★ v129：强制回主 feed —— 治「陷进沉浸页（短剧/剧集）出不来」
+//
+//   2026-10-22 长跑（123 条跑满了，但**质量掉了**）：#79 起连着 **45 步**卡在
+//   「新势剧社」这一个作者上，回执清一色
+//       moved=844 (limit=1688 step=844)
+//   step=844 = **屏幕全高**（正常 feed 是 761 —— 底部 tab 栏占掉 83），
+//   作者不变、赞数 8675→2023→1318→727→513 一路递减。nav 一查：
+//       KSTabBarNewSlideFeedViewController ×3 + KSAdFeedViewController
+//   是**短剧剧集沉浸页**，在里面上下滑是**切集数**，不是换视频。
+//   结果：121 步只刷出 56 个不同作者（上一轮 111 步有 96 个）。
+//
+//   跟直播间同一个毛病：**沉浸页没有底部 tab 栏**，所以 v124 那套
+//   「点 (39,786) 首页 tab 回家」点了等于没点 —— 日志里那条
+//   `⚠️ 连 2 次作者没换 → 关面板 + 点首页 tab 回家` 确实触发了，但没救回来。
+//
+//   出口是三步才试出来的（前两步都白费）：
+//     ① `back`(pop)       —— ❌ pop 掉的居然是主 feed 自己的 VC，越帮越忙
+//     ② `swipe` 三个方向  —— ❌ 剧集页里滑动只是切集
+//     ③ **点左上角 (31,69) 唤出面板 → 面板里出现「返回」→ 按文字点它** —— ✅
+//        可见文字当场变成：返回 / 选集 · 深山有锦鲤1 / 合集 / 拍同款
+//
+//   所以顺序是：**先看有没有「返回」这类出口文字；没有就点 (31,69) 把面板唤出来再找。**
+// ---------------------------------------------------------------------------
+
+// 在不在主 feed？硬判据：**底部「首页」tab 在不在**（y > 740 的那颗）。
+// 与内容无关、与页面类型无关 —— 沉浸页/直播间一律没有它。
+static BOOL AIAutorunOnFeed(NSString *text) {
+    if (!text.length) return NO;
+    for (NSString *ln in [text componentsSeparatedByString:@"\n"]) {
+        NSTextCheckingResult *m = [gRxRow firstMatchInString:ln options:0
+                                    range:NSMakeRange(0, ln.length)];
+        if (!m || m.numberOfRanges < 7) continue;
+        NSString *c = [ln substringWithRange:[m rangeAtIndex:6]];
+        double y = [[ln substringWithRange:[m rangeAtIndex:3]] doubleValue];
+        if ([c isEqualToString:@"首页"] && y > 740.0) return YES;
+    }
+    return NO;
+}
+
+// 在读屏里找某段文字的中心点（找不到返回 x<0）。只认短文本 —— 太长的不是按钮。
+static CGPoint AIAutorunFindText(NSString *text, NSString *kw) {
+    for (NSString *ln in [text componentsSeparatedByString:@"\n"]) {
+        NSTextCheckingResult *m = [gRxRow firstMatchInString:ln options:0
+                                    range:NSMakeRange(0, ln.length)];
+        if (!m || m.numberOfRanges < 7) continue;
+        NSString *c = [ln substringWithRange:[m rangeAtIndex:6]];
+        if (![c containsString:kw] || c.length > 8) continue;
+        double x = [[ln substringWithRange:[m rangeAtIndex:2]] doubleValue];
+        double y = [[ln substringWithRange:[m rangeAtIndex:3]] doubleValue];
+        NSArray *ab = [[ln substringWithRange:[m rangeAtIndex:4]]
+                       componentsSeparatedByString:@"x"];
+        double w = ab.count > 1 ? [ab[0] doubleValue] : 0.0;
+        double h = ab.count > 1 ? [ab[1] doubleValue] : 0.0;
+        return CGPointMake(x + w / 2.0, y + h / 2.0);
+    }
+    return CGPointMake(-1, -1);
+}
+
+// 三条点击通路依次试：UIControl(原生) → 手势(自绘) → rntap(RN)。
+// ★ 与 AIAutorunExitLive 同一套：**不知道对面是哪种 UI，就别猜**。
+static BOOL AIAutorunTapAny(CGPoint q) {
+    for (int h = 0; h < 3; h++) {
+        __block BOOL fired = NO;
+        AIMainSync(^{
+            @try {
+                if (h == 0)      { NSString *d = nil; fired = AITapUIControlAt(q, &d); }
+                else if (h == 1) { fired = [AIGestureTapAt(q)[@"ok"] boolValue]; }
+                else             { fired = [AIRNTap(q, 0, 0, 60)[@"ok"] boolValue]; }
+            } @catch (NSException *e) {}
+        });
+        if (fired) return YES;
+    }
+    return NO;
+}
+
+// 强制回主 feed。返回「是否已在主 feed」。
+// ★ 每一步都用**结果侧**（AIAutorunOnFeed：底部「首页」tab 回来了没有）复验。
+static BOOL AIAutorunGoHome(void) {
+    NSArray *kws = @[@"返回", @"退出", @"关闭"];
+    for (int attempt = 0; attempt < 3; attempt++) {
+        NSString *t = AIAutorunReadText();
+        if (t.length && AIAutorunOnFeed(t)) return YES;      // 已经在家了
+
+        // ① 屏幕上看得见「返回 / 退出 / 关闭」→ 直接按文字点
+        for (NSString *kw in kws) {
+            CGPoint p = AIAutorunFindText(t, kw);
+            if (p.x < 0) continue;
+            if (!AIAutorunTapAny(p)) continue;
+            [NSThread sleepForTimeInterval:1.6];
+            NSString *t2 = AIAutorunReadText();
+            AILog(@"[autorun]   回家 按文字「%@」(%.0f,%.0f)", kw, p.x, p.y);
+            if (t2.length && AIAutorunOnFeed(t2)) {
+                AILog(@"[autorun]   ✅ 已回主 feed（点「%@」）", kw);
+                return YES;
+            }
+        }
+
+        // ② 看不见出口 → 点左上角 (31,69) 把面板唤出来（剧集页实测：这一下
+        //    才会带出「返回 / 选集 / 合集」）
+        AILog(@"[autorun]   回家 点左上角 (31,69) 唤面板");
+        AIAutorunTapAny(CGPointMake(31, 69));
+        [NSThread sleepForTimeInterval:1.5];
+        NSString *t3 = AIAutorunReadText();
+        if (t3.length) {
+            for (NSString *kw in kws) {
+                CGPoint p = AIAutorunFindText(t3, kw);
+                if (p.x < 0) continue;
+                if (!AIAutorunTapAny(p)) continue;
+                [NSThread sleepForTimeInterval:1.6];
+                NSString *t4 = AIAutorunReadText();
+                AILog(@"[autorun]   回家 唤面板后点「%@」(%.0f,%.0f)", kw, p.x, p.y);
+                if (t4.length && AIAutorunOnFeed(t4)) {
+                    AILog(@"[autorun]   ✅ 已回主 feed（唤面板 → 点「%@」）", kw);
+                    return YES;
+                }
+            }
+            // 唤出来的若是侧边栏（在主 feed 上点 (31,69) 的副作用）→ 点外侧空白收掉
+            if (AIAutorunSiderOpen(t3)) {
+                AILog(@"[autorun]   (31,69) 唤出的是侧边栏 → 点外侧空白收掉");
+                AIAutorunTapAny(CGPointMake(350, 420));
+                [NSThread sleepForTimeInterval:1.2];
+            }
+        }
+
+        // ③ 兜底：还是不行就点底部首页 tab（万一 tab 其实在，只是没读出来）
+        AIAutorunTapAny(CGPointMake(39, 786));
+        [NSThread sleepForTimeInterval:1.5];
+    }
+    NSString *tf = AIAutorunReadText();
+    return (tf.length && AIAutorunOnFeed(tf));
+}
+
 // 滑到下一页（主线程内）——纵向往前一格
 //
 // ★★ v67 修（「作者两条一重复」= 一半时间白刷同一条视频）：
@@ -2884,10 +3017,13 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
                     //   当「回家路」，但 (29,69) 在 feed 页就是 KSCubeTopBarNavigationButton
                     //   —— **打开侧边栏的按钮**（tapui 实测 desc 印证）。
                     //   语义完全用反了：本想回家，实际把侧边栏捅开。
-                    //   改为只用底部「首页 tab」，它是唯一安全的回家通道。
-                    AILog(@"[autorun] 连落空 3 次 → 点首页 tab 回家（不再点 (29,69)：那是侧边栏开关）");
-                    AIAutorunTap(39, 786);           // 首页 tab
-                    [NSThread sleepForTimeInterval:1.5];
+                    //   改为只用底部「首页 tab」—— 它是主 feed 里唯一安全的回家通道。
+                    // ★ v129：但**沉浸页里压根没有底部 tab**（短剧剧集页实测 step=844
+                    //   = 屏幕全高，tab 栏被藏了），只点 tab 救不回来。改用 AIAutorunGoHome
+                    //   多通路（按文字找「返回」→ 点 (31,69) 唤面板 → 兜底点 tab），
+                    //   每一步都用「底部首页 tab 回来了没有」复验。
+                    AILog(@"[autorun] 连落空 3 次 → 强制回主 feed");
+                    AIAutorunGoHome();
                     lostStreak = 0;
                 }
                 // v67：滚动结果进日志 —— 「作者没换」时靠它一眼看出是 step 没算对
@@ -2979,11 +3115,17 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
             if (!changed) {
                 sameStreak++;
                 if (sameStreak >= 2) {
-                    AILog(@"[autorun] ⚠️ 连 %d 次作者没换 → 关面板 + 点首页 tab 回家", sameStreak);
-                    AIAutorunTap(195, 100);      // 关掉可能开着的评论区/收藏夹
-                    [NSThread sleepForTimeInterval:1.2];
-                    AIAutorunTap(39, 786);       // 首页 tab（唯一安全的回家通道）
-                    [NSThread sleepForTimeInterval:1.5];
+                    // ★ v129：不再只点首页 tab —— 沉浸页（短剧/剧集）**没有底部 tab**，
+                    //   点 (39,786) 等于没点，实测 45 步都爬不出来。改用 AIAutorunGoHome：
+                    //   按文字找「返回」→ 点 (31,69) 唤面板再找 → 最后才点 tab，
+                    //   每一步都用「底部首页 tab 回来了没有」复验。
+                    AILog(@"[autorun] ⚠️ 连 %d 次作者没换 → 强制回主 feed", sameStreak);
+                    BOOL home = AIAutorunGoHome();
+                    AILog(@"[autorun] 回家结果：%@", home ? @"✅ 已回主 feed" : @"❌ 没回去");
+                    if (!home) {
+                        AIAutorunTap(195, 100);  // 最后再补一刀：关掉可能开着的面板
+                        [NSThread sleepForTimeInterval:1.2];
+                    }
                     sameStreak = 0;
                     prevAuthor = nil;            // 回家后重新比，别把旧作者带过来
                 }
