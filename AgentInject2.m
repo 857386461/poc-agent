@@ -2612,14 +2612,19 @@ static BOOL AIAutorunOnFeed(NSString *text) {
     return NO;
 }
 
-// 在读屏里找某段文字的中心点（找不到返回 x<0）。只认短文本 —— 太长的不是按钮。
+// 在读屏里找某段文字的中心点（找不到返回 x<0）。
+// ★ v130：必须**精确匹配**，不能用 containsString —— v129 实测在这里翻车：
+//   候选词「退出」用子串匹配到了直播间的「退出直播」，于是 GoHome 一直去点
+//   (355,54) 那个**上次已证明点了没反应**的 X 按钮，空转 3 轮也没回去；
+//   直到下一步被直播间门禁认出来，`back` 一次才退掉。
+//   **模糊匹配会把「看着像」的无关按钮拉进来，而它偏偏是条死路。**
 static CGPoint AIAutorunFindText(NSString *text, NSString *kw) {
     for (NSString *ln in [text componentsSeparatedByString:@"\n"]) {
         NSTextCheckingResult *m = [gRxRow firstMatchInString:ln options:0
                                     range:NSMakeRange(0, ln.length)];
         if (!m || m.numberOfRanges < 7) continue;
         NSString *c = [ln substringWithRange:[m rangeAtIndex:6]];
-        if (![c containsString:kw] || c.length > 8) continue;
+        if (![c isEqualToString:kw]) continue;
         double x = [[ln substringWithRange:[m rangeAtIndex:2]] doubleValue];
         double y = [[ln substringWithRange:[m rangeAtIndex:3]] doubleValue];
         NSArray *ab = [[ln substringWithRange:[m rangeAtIndex:4]]
@@ -2655,6 +2660,22 @@ static BOOL AIAutorunGoHome(void) {
     for (int attempt = 0; attempt < 3; attempt++) {
         NSString *t = AIAutorunReadText();
         if (t.length && AIAutorunOnFeed(t)) return YES;      // 已经在家了
+
+        // ★ v130：在直播间就别自己摸索了 —— 交给专门那套。
+        //   v129 实测：这里没做分流，GoHome 拿「退出」子串匹配到直播间的
+        //   「退出直播」，一头撞进 (355,54) 这条死路，白转 3 轮；
+        //   而 AIAutorunExitLive 的 back+pop 实测**一次就能退出来**。
+        if (AIAutorunInLive(t)) {
+            AILog(@"[autorun]   回家时发现人在直播间 → 交给 AIAutorunExitLive");
+            if (AIAutorunExitLive()) {
+                NSString *tv = AIAutorunReadText();
+                if (tv.length && AIAutorunOnFeed(tv)) {
+                    AILog(@"[autorun]   ✅ 已回主 feed（退直播间）");
+                    return YES;
+                }
+                AILog(@"[autorun]   直播间退了，但仍不在主 feed → 继续找路");
+            }
+        }
 
         // ① 屏幕上看得见「返回 / 退出 / 关闭」→ 直接按文字点
         for (NSString *kw in kws) {
@@ -2904,6 +2925,7 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
     BOOL haveFirst = NO;          // v67：第一轮还没「上一个作者」可比，不能算「没换」
     int  sameStreak = 0;          // v124：连续「作者没换」次数（卡死兜底用）
     int  liveStreak = 0;          // v127：连续「掉进直播间」轮数（退不出去就停）
+    int  offFeedStreak = 0;       // v130：连续「不在主 feed」轮数（看不到底部首页 tab）
 
     while (!gAutorunStop) {
         @autoreleasepool {
@@ -2954,7 +2976,14 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
                       idx, liveStreak);
                 BOOL out = AIAutorunExitLive();
                 if (out) {
-                    AILog(@"[autorun] ✅ 已回到 feed，重置作者比较重来");
+                    // ★ v130：别急着宣布「已回到 feed」。
+                    //   v129 实测：back 成功 pop 掉直播间之后，下一步的滑动回执仍然是
+                    //       moved=844 (limit=1688 step=844)
+                    //   也就是**还在某个全屏页里**。我验的是「不在直播间了」
+                    //   （KSLive* 消失），可 **「不是 X」不等于「在 Y」** —— 直播间
+                    //   和主 feed 之间还隔着剧集沉浸页、广告落地页一整片全屏页。
+                    //   到底在不在家，交给下面 ③c 的 AIAutorunOnFeed 说了算。
+                    AILog(@"[autorun] 直播间已退出；是否真在主 feed 由下一道门禁确认");
                     prevAuthor = nil; haveFirst = NO;
                     sameStreak = 0; lostStreak = 0; liveStreak = 0;
                 } else if (liveStreak >= 2) {
@@ -2967,6 +2996,36 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
                 continue;
             }
             liveStreak = 0;
+
+            // ★ ③c v130 门禁：**在不在主 feed** —— 这才是真正该问的问题。
+            //
+            //   以前的做法是逐个识别「是不是掉进了某某坑」（评论区 → 侧边栏 →
+            //   直播间 → 短剧剧集页），每来一个新页面就补一条规则，**永远补不完**。
+            //   而它们有一个共同点：**全屏页都没有底部 tab 栏**。
+            //   所以判据收敛成一句话 —— **底部「首页」tab 在不在**（AIAutorunOnFeed）。
+            //   与内容无关、与页面类型无关，谁没有 tab 谁就不是主 feed。
+            //
+            //   连续 2 步看不到 tab 才动手（留一步容错，避开瞬时状态），
+            //   并且**不在主 feed 时不互动** —— 在身份不明的页面上乱点，
+            //   就是把 v126/v127 送进直播间的老路。
+            BOOL onFeed = AIAutorunOnFeed(text);
+            if (!onFeed) {
+                offFeedStreak++;
+                AILog(@"[autorun] ⚠️ 不在主 feed（连 %d）", offFeedStreak);
+                if (offFeedStreak >= 2) {
+                    AILog(@"[autorun] → 强制回主 feed");
+                    BOOL home = AIAutorunGoHome();
+                    AILog(@"[autorun] 回家结果：%@", home ? @"✅ 已回主 feed" : @"❌ 没回去");
+                    if (home) {
+                        offFeedStreak = 0;
+                        prevAuthor = nil; haveFirst = NO;
+                        sameStreak = 0; lostStreak = 0;
+                    }
+                    // 回不去也别卡死：继续走一轮（滑一下当探索），下轮还会再试
+                }
+            } else {
+                offFeedStreak = 0;
+            }
 
             // ④ 门禁：侧边栏真的开着？——★ v125 起改用 AIAutorunSiderOpen（容器 frame
             //   硬判据）。旧实现拿「vis 里的文字」判，而 vis 的坐标减过 shift，
@@ -3081,7 +3140,13 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
             //   「遇见直播间不进行互动可以不」—— 可以，而且这才是正解。
             //   代价只是广告类视频不再点赞（养号本就该绕开广告），收益是根掉一类事故。
             NSMutableArray *acts = [NSMutableArray array];
-            if (fp.count == 0) {
+            // ★ v130：再加一道 `onFeed` —— 不在主 feed 时**一律不互动**。
+            //   在身份不明的全屏页上按 (326,371) 点赞，跟当年把自己送进直播间
+            //   是同一回事（「渔歌」「豆宝耶」都是在 step=844 的页面上挨的互动）。
+            if (!onFeed) {
+                AILog(@"[autorun] #%ld 不在主 feed → 跳过互动，滑走", idx);
+                [acts addObject:@"不在feed"];
+            } else if (fp.count == 0) {
                 AILog(@"[autorun] #%ld 无指纹（非普通视频）→ 跳过全部互动，直接划走", idx);
                 [acts addObject:@"避互动"];
             } else {
