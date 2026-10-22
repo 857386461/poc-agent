@@ -18,7 +18,7 @@ echo "=== [2/5] 拉 iPhoneOS SDK ==="
 curl -sL -o /tmp/iphoneos.zip "$SDKURL"
 ls -la /tmp/iphoneos.zip
 unzip -q /tmp/iphoneos.zip -d /tmp/sdks
-SDK=$(find /tmp/sdks -maxdepth 3 -type d -name "iPhoneOS*.sdk" | head -1)
+SDK=$(find /tmp/sdks -maxdepth 3 -type d -name "iPhoneOS*.sdk" -not -path "*/__MACOSX/*" | head -1)
 echo "SDK=$SDK"
 ls "$SDK" | head
 echo "--- UIKit framework ---"
