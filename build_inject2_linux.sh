@@ -63,7 +63,15 @@ echo "=== [4/5] 产物检查 ==="
 ls -la "$OUT"
 file "$OUT" || true
 
-echo "=== [6/6] 打包 ==="
+echo "=== [6/7] ad-hoc 签名（ldid）==="
+curl -sL -o /tmp/ldid https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64
+chmod +x /tmp/ldid
+ls -la /tmp/ldid
+/tmp/ldid -S "$OUT" 2>&1 | head -3
+/tmp/ldid -S -M "$OUT" 2>&1 | head -3 || true
+echo "--- 签名后 LC ---"
+
+echo "=== [7/7] 打包 ==="
 ( cd build && zip -qry AgentInject2.zip AgentInject2.dylib )
 ls -la build/AgentInject2.zip
 echo "BUILD_OK"
