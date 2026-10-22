@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 
 SRC=AgentInject2.m
 OUT=build/AgentInject2.dylib
-SDKURL="${SDKURL:-https://github.com/xybp888/iOS-SDKs/releases/download/iOS26.5-SDKs/iPhoneOS26.5.sdk.zip}"
+SDKURL="${SDKURL:-https://github.com/xybp888/iOS-SDKs/releases/download/iOS17.0-SDKs/iPhoneOS17.0.sdk.zip}"
 
 echo "=== [1/5] 工具链 ==="
 clang --version | head -2
@@ -23,6 +23,8 @@ echo "SDK=$SDK"
 ls "$SDK" | head
 echo "--- UIKit framework ---"
 ls "$SDK/System/Library/Frameworks/UIKit.framework" | head
+echo "--- 找 UIUtilities ---"
+find "$SDK" -maxdepth 4 -name "UIUtilities.framework" -o -maxdepth 4 -name "UIDefines.h" | head -5
 echo "--- usr/lib tbd 样例 ---"
 ls "$SDK/usr/lib" | head -5
 
