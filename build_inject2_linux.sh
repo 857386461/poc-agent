@@ -28,19 +28,26 @@ find "$SDK" -maxdepth 4 -name "UIUtilities.framework" -o -maxdepth 4 -name "UIDe
 echo "--- usr/lib tbd 样例 ---"
 ls "$SDK/usr/lib" | head -5
 
-echo "=== [3/5] 编译 arm64 dynamiclib ==="
+echo "=== [3/6] 找 Mach-O 链接器（ld64.lld）==="
+LD64=$(ls /usr/lib/llvm-*/bin/ld64.lld /usr/bin/ld64.lld 2>/dev/null | head -1)
+echo "ld64=$LD64"
+test -n "$LD64" || { echo "NO_LD64"; exit 1; }
+
+echo "=== [4/6] 编译（只到 .o）==="
 CLANG=${CLANG:-clang}
-LDLLD=$(ls /usr/lib/llvm-*/bin/ld.lld /usr/bin/ld.lld 2>/dev/null | head -1)
-echo "lld=$LDLLD"
 $CLANG -target arm64-apple-ios15.0 -miphoneos-version-min=15.0 \
-  -isysroot "$SDK" \
-  -arch arm64 \
-  -dynamiclib \
-  -fobjc-arc \
-  -O0 \
-  -fuse-ld="$LDLLD" \
-  -Wl,-undefined,dynamic_lookup \
-  -Wl,-platform_version,ios,15.0,15.0 \
+  -isysroot "$SDK" -arch arm64 -fobjc-arc -O0 -c \
+  -o build/AgentInject2.o "$SRC" 2>&1 | tee /tmp/build.txt | grep -E "error|fatal" | head -40 || true
+test -f build/AgentInject2.o || { echo "COMPILE_FAILED"; tail -40 /tmp/build.txt; exit 1; }
+ls -la build/AgentInject2.o
+file build/AgentInject2.o || true
+
+echo "=== [5/6] 链接（ld64.lld，Darwin 风格参数）==="
+"$LD64" -arch arm64 \
+  -platform_version ios 15.0 15.0 \
+  -syslibroot "$SDK" \
+  -dylib \
+  -install_name @executable_path/AgentInject2.dylib \
   -lobjc -lSystem \
   -framework UIKit \
   -framework Foundation \
@@ -49,16 +56,14 @@ $CLANG -target arm64-apple-ios15.0 -miphoneos-version-min=15.0 \
   -framework Vision \
   -framework CoreImage \
   -framework ImageIO \
-  -install_name @executable_path/AgentInject2.dylib \
-  -o "$OUT" \
-  "$SRC" 2>&1 | tee /tmp/build.txt | grep -E "error|fatal" | head -40 || true
-test -f "$OUT" || { echo "COMPILE_FAILED"; tail -40 /tmp/build.txt; exit 1; }
+  -o "$OUT" build/AgentInject2.o 2>&1 | tee /tmp/link.txt | head -40
+test -f "$OUT" || { echo "LINK_FAILED"; tail -60 /tmp/link.txt; exit 1; }
 
 echo "=== [4/5] 产物检查 ==="
 ls -la "$OUT"
 file "$OUT" || true
 
-echo "=== [5/5] 打包 ==="
+echo "=== [6/6] 打包 ==="
 ( cd build && zip -qry AgentInject2.zip AgentInject2.dylib )
 ls -la build/AgentInject2.zip
 echo "BUILD_OK"
