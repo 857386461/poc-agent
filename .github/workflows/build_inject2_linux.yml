@@ -1,0 +1,41 @@
+name: Build AgentInject2 dylib (Linux cross)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build dylib (Linux → iOS arm64)
+        id: b
+        run: |
+          set -o pipefail
+          chmod +x build_inject2_linux.sh
+          bash build_inject2_linux.sh 2>&1 | tee /tmp/dylib_build.txt
+          echo "BUILD_OK_MARK=$(grep -c BUILD_OK /tmp/dylib_build.txt)" >> $GITHUB_OUTPUT
+
+      - name: Publish release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="inject2lin-${{ github.run_number }}"
+          gh release create "$TAG" build/AgentInject2.zip build/AgentInject2.dylib \
+            --title "AgentInject2 dylib (linux cross) $TAG" \
+            --notes "Linux 交叉编译产物"
+
+      - name: Upload build log on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="inject2linlog-${{ github.run_number }}"
+          gh release delete "$TAG" -y 2>/dev/null || true
+          cp /tmp/dylib_build.txt /tmp/log.txt 2>/dev/null || true
+          gh release create "$TAG" --title "log $TAG" --notes "$(grep -nE 'error|fatal|ld:|clang:' /tmp/log.txt | head -40; echo '--- TAIL ---'; tail -c 1500 /tmp/log.txt)" || true
