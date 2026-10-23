@@ -2790,7 +2790,7 @@ static UIScrollView *AIFindFeedSV(UIWindow *w) {
             CGFloat lim = sv.contentSize.height - h;
             // ① 竖向才行：横向容器的 contentSize.width 远大于 bounds.width
             CGFloat vLim = sv.contentSize.height - h;
-            CGFloat hLim = sv.contentSize.width - sv.bounds.width;
+            CGFloat hLim = sv.contentSize.width - sv.bounds.size.width;
             BOOL horizontal = (hLim > vLim * 1.5 && hLim > 8.0);
             if (!sv.hidden && sv.alpha > 0.05 && h >= 600.0 && !horizontal &&
                 lim > 0 && lim < AI_FEED_LIMIT_MAX && h > bestH) {
