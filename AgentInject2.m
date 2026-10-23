@@ -266,6 +266,7 @@ static NSString *gTaskBrief  = nil;       // 一句话（给悬浮球/防护罩�
 static NSString *gGuardMode  = @"privacy";// privacy（毛玻璃+暗化）| verify（露出 App，仍吃触摸）
 static BOOL      gGuardPinned = NO;       // 手动 pin：任务结束也不落下
 static volatile int32_t gOpBusy = 0;      // v34：AI 操作期标志（不只是有任务才遮挡）
+static volatile int32_t gReadQuiet = 0;   // v132：读屏静默计数 >0 时不因操作命令升罩
 static CFTimeInterval   gLastOpTs = 0;    // v34：最后一次真实操作的时刻，用于空闲自动落下
 static volatile int32_t gBusy = 0;        // 任务期标志：1 = 有任务在跑 → 防护罩自动升起
 static NSMutableArray *gSteps = nil;      // L3 步骤列表：@{@"s":状态,@"act":动作,@"obj":目标,@"ev":证据}
@@ -5160,9 +5161,14 @@ static void AIExecCmd(NSDictionary *cmd) {
     static NSSet *kTouchOps = nil;
     if (!kTouchOps) kTouchOps = [NSSet setWithObjects:
         @"tapui", @"gtap", @"rntap", @"gdtap", @"wintap", @"tap", @"swipe",
-        @"scroll", @"pick", @"picktxt", @"back", @"nav", @"dismiss", @"open",
+        @"scroll", @"pick", @"picktxt", @"back", @"dismiss", @"open",
+        //   ↑ v132：`nav` 已移出（只读，见下方守卫）。留在这里会让人以为它是触摸类。
         @"chain", @"macro", @"task", @"uioff", @"uion", nil];
-    if ([kTouchOps containsObject:op]) AIOpMark();
+    // v132：`nav` 从触摸类里摘掉了 —— 它只读 viewControllers，什么也不改。
+    //   坑（2026-10-23 用户实报「你的遮罩层挡着我操作了」）：我在用户自己玩手机时
+    //   每 2 秒采样一次 nav，每次采样都被判成「AI 动手了」→ 罩层升起 → gOpBusy 8 秒
+    //   才由 AIOpIdleCheck 放下 → 用户屏幕上等于常驻一层黑纱。读屏不该打扰人。
+    if ([kTouchOps containsObject:op] && ![op isEqualToString:@"nav"]) AIOpMark();
     // v38：ocr —— 整屏识字（会话A 加）。s=只留含该关键词的(可选)，n=最多几条(默认60)
     if ([op isEqualToString:@"ocr"]) {
         NSString *kw = cmd[@"s"] ?: @"";
@@ -5487,7 +5493,20 @@ static void AIExecCmd(NSDictionary *cmd) {
         id ov = cmd[@"on"];
         BOOL vis = ov ? ([ov intValue] != 0) : NO;
         AISetOverlayVisible(vis);
-        AIReportDict(@{@"op": @"overlay", @"ok": @YES, @"visible": @(vis)});
+        // v132：回执要回**实际**可见性，不是回我要求的那个值。
+        //   坑（2026-10-23）：vis=0 时回执 ok=true，日志也打「已落下」，但罩其实还挂着
+        //   （真源里 gRecapShown/gBusy 仍为真，AIGuardSync 又把它升了回去）。
+        //   回执说谎 = 我把「成功」当成了判据。现在隔 0.4s 回读真值，并附上四个真源位。
+        __block NSDictionary *rp = nil;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            BOOL actual = (gOverlayWindow && !gOverlayWindow.hidden);
+            rp = @{@"op": @"overlay", @"ok": @YES, @"wantVis": @(vis), @"visible": @(actual),
+                   @"guard": gGuardMode ?: @"privacy",
+                   @"pin": @(gGuardPinned), @"busy": @(gBusy), @"op": @(gOpBusy),
+                   @"recap": @(gRecapShown)};
+            AIReportDict(rp);
+        });
     } else if ([op isEqualToString:@"wininfo"]) {
         // v33：三个自建窗口的体检报告。悬浮球「看不见」时先打这一条，
         // 一眼分清是「没建」「没挂 scene」「被藏了」还是「跑到屏外」。
@@ -7469,10 +7488,18 @@ static BOOL AIGuardShouldShow(void) {
 #define AI_GUARD_OP_IDLE 8.0
 static void AIOpMark(void) {
     if (!AIFlag(@"guardAuto", YES)) return;    // 嫌挡眼可以关掉这个开关
+    if (gReadQuiet > 0) return;                // v132：读屏静默期，别为了取数去糊人屏幕
     gOpBusy = 1;
     gLastOpTs = CFAbsoluteTimeGetCurrent();
     AIGuardSync();
 }
+// v132：批量只读（text/tree/rows/probe/…）不该点亮罩层。
+//   原来只有 AIOpMark 一处入口，但它被 `nav` 这类读屏命令蹭到了。现在加一道
+//   「读屏期间豁免」的闸：AIOpReadBegin/End 包住的区间里，即使来了触摸类命令也不升罩。
+//   （这一版只落地 nav 修复；闸门先建好，下一版把 text/tree 也纳入，避免又一次
+//     「我采样你被挡」。）
+static void AIOpReadBegin(void) { gReadQuiet++; }
+static void AIOpReadEnd(void)   { if (gReadQuiet > 0) gReadQuiet--; }
 static void AIOpIdleCheck(void) {
     if (gOpBusy && (CFAbsoluteTimeGetCurrent() - gLastOpTs) > AI_GUARD_OP_IDLE) {
         gOpBusy = 0;
@@ -7494,6 +7521,11 @@ static void AIGuardSync(void) {
             // 把 key 交还宿主窗口，否则 App 收不到按键/触摸链
             @try { UIWindow *h = AIHostWindow(); if (h && h != gOverlayWindow) [h makeKeyAndVisible]; }
             @catch (id e) {}
+            // v132：这句日志以前无条件打（在调用方），于是「日志说落下了、屏上还在」
+            //   这种反直觉现象把我自己骗过一次。改成**只在实际执行隐藏的这条分支里**、
+            //   并且带上真源快照，让日志从此可核对。
+            AILog(@"  [guard] 防护罩已落下 pin=%d busy=%d op=%d recap=%d",
+                  gGuardPinned, gBusy, gOpBusy, gRecapShown);
         }
         return;
     }
