@@ -369,7 +369,9 @@ static BOOL AITapUIControlAt(CGPoint pt, NSString **outDesc);  // v28：AIDismis
 static NSArray   *AIFindViewsAt(CGPoint pt, int maxN);   // v27：按坐标精确命中（躲开 hitTest）
 static NSDictionary *AIPickTextViaGesture(NSString *kw);  // v23：按文字触发手势，定义在 ~1339 行
 static NSDictionary *AIScrollAt(CGPoint pt, double dy, double dx, BOOL anim, int fire);  // v17（v29 定义加 fire，声明同步，治 conflicting types）
-static NSString *AIBack(void);                  // v18：AIRunMacro(~1057) 在它定义之前要调用
+// v18：AIRunMacro(~1057) 在它定义之前要调用。v132 加 mode=2 保持老行为（.m 不是 C，
+//   `AIBack()` 等价 `AIBack(2)` 说不清意图，所以**不留无参版本**，调用点全写显式 mode）
+static NSString *AIBack(int mode);
 static NSString *AINavInfo(void);               // v18
 // v66：autorun（~2157 行）在它们的定义之前要调用 —— 补前向声明，否则 implicit declaration
 static void AIReportDict(NSDictionary *d);
@@ -2140,7 +2142,8 @@ static NSArray *AIRunMacro(NSArray *steps, double gapMs) {
                     r[@"ok"] = @YES; r[@"txt"] = [NSString stringWithFormat:@"%@ / %@",
                                                   d[@"hit"] ?: @"?", d[@"ctrl"] ?: @"?"];
                 } else if ([op isEqualToString:@"back"]) {
-                    NSString *t = AIBack();
+                    NSString *t = AIBack([s[@"mode"] respondsToSelector:@selector(intValue)]
+                                         ? [s[@"mode"] intValue] : 2);
                     r[@"ok"] = @(![t hasPrefix:@"act=none"]);
                     r[@"txt"] = t;
                 } else if ([op isEqualToString:@"nav"]) {
@@ -2512,7 +2515,7 @@ static BOOL AIAutorunExitLive(void) {
         //   AIBack 内部就是这个顺序（先 presentedViewController 再 nav），
         //   正好把「挡路的 KSAlertController」和「push 进来的直播间」一起办了。
         __block NSString *bk = nil;
-        AIMainSync(^{ @try { bk = AIBack(); } @catch (NSException *e) {} });
+        AIMainSync(^{ @try { bk = AIBack(2); } @catch (NSException *e) {} });
         AILog(@"[autorun]   退直播 back -> %@", bk ?: @"-");
         if (bk.length && [bk rangeOfString:@"act=none"].length == 0) {
             [NSThread sleepForTimeInterval:1.8];
@@ -3324,7 +3327,12 @@ static NSString *AINavInfo(void) {
     return [s copy];
 }
 
-static NSString *AIBack(void) {
+// ★ v132：mode = 0 只 pop（不 dismiss）/ 1 只 dismiss / 2 两者都行（老行为）。
+//   坑（2026-10-23 实测）：广告页 KSAdNeoMixViewController 是**被 present 出来**的，
+//   而「任务中心」那层也在同一个 nav 栈里（栈深 2）。老 AIBack 一律优先 dismiss，
+//   结果「退出广告」= 连任务中心一起关掉，直接掉回主 feed，用户还得重新点进去。
+//   用户的操作是「关掉这一页广告、留在任务中心」——语义是 pop，不是 dismiss。
+static NSString *AIBack(int mode) {
     __block NSMutableString *s = [NSMutableString string];
     AIMainSync(^{
         NSArray *vcs = AIVCsOnScreen();
@@ -3346,6 +3354,9 @@ static NSString *AIBack(void) {
             }
         }
 
+        if (mode == 0) presTarget = nil;          // 只 pop
+        if (mode == 1) navToPop  = nil;           // 只 dismiss
+
         if (presTarget) {
             [s appendFormat:@"act=dismiss 目标=%@ ", NSStringFromClass([presTarget class])];
             [presTarget.presentingViewController dismissViewControllerAnimated:YES completion:nil];
@@ -3355,7 +3366,7 @@ static NSString *AIBack(void) {
                 NSStringFromClass([navToPop.topViewController class])];
             [navToPop popViewControllerAnimated:YES];
         } else {
-            [s appendString:@"act=none(没找到可见的导航栈，先跑 nav 看结构)"];
+            [s appendFormat:@"act=none(模式%d 下没找到可退的层，先跑 nav 看结构)", mode];
         }
     });
     return [s copy];
@@ -5160,10 +5171,12 @@ static void AIExecCmd(NSDictionary *cmd) {
     // 只读类（text/tree/probe/find/rows/status/wins/log/wininfo…）不算，不然读屏也糊一层。
     static NSSet *kTouchOps = nil;
     if (!kTouchOps) kTouchOps = [NSSet setWithObjects:
-        @"tapui", @"gtap", @"rntap", @"gdtap", @"wintap", @"tap", @"swipe",
+        @"tapui", @"gtap", @"gdtap", @"wintap", @"tap", @"swipe",
         @"scroll", @"pick", @"picktxt", @"back", @"dismiss", @"open",
-        //   ↑ v132：`nav` 已移出（只读，见下方守卫）。留在这里会让人以为它是触摸类。
-        @"chain", @"macro", @"task", @"uioff", @"uion", nil];
+        //   ↑ v132：`nav` 已移出（只读，见下方守卫）。
+        // v132：`rntap` 移进来 —— 它真的会点（RN 卡片/自绘 UI 只有它能点动），
+        //   以前漏在这里，于是「AI 点了屏幕却没提示」，人只看到画面自己跳了。
+        @"chain", @"macro", @"task", @"uioff", @"uion", @"rntap", nil];
     // v132：`nav` 从触摸类里摘掉了 —— 它只读 viewControllers，什么也不改。
     //   坑（2026-10-23 用户实报「你的遮罩层挡着我操作了」）：我在用户自己玩手机时
     //   每 2 秒采样一次 nav，每次采样都被判成「AI 动手了」→ 罩层升起 → gOpBusy 8 秒
@@ -6531,7 +6544,10 @@ static void AIExecCmd(NSDictionary *cmd) {
         }
     } else if ([op isEqualToString:@"back"]) {
         // v18：绕开 UI，直接命令导航栈返回（治 Flutter/游戏这类"看得见点不着"的返回键）
-        NSString *t = AIBack();
+        // v132：mode 参数。0=只 pop（留在上一页）/ 1=只 dismiss / 省略=老行为两者都行。
+        //   为什么需要：广告页是 present 出来的，老逻辑优先 dismiss，会把「任务中心」一起关掉。
+        int bmode = cmd[@"mode"] ? [cmd[@"mode"] intValue] : 2;
+        NSString *t = AIBack(bmode);
         AILog(@"  [cmd] back -> %@", t);
         AIReportDict(@{@"op": @"back", @"ok": @(![t hasPrefix:@"act=none"]), @"txt": t});
     } else if ([op isEqualToString:@"nav"]) {
