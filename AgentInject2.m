@@ -2761,6 +2761,22 @@ static BOOL AIAutorunGoHome(void) {
 //   60768 / 64144（≈76 屏）。v126 就栽在这：它把 76 屏的直播间流当成 feed 一路
 //   猛滑，越滑越深。所以 limit 超过 AI_FEED_LIMIT_MAX 的一律不算 feed 容器。
 #define AI_FEED_LIMIT_MAX  5000.0
+
+// ★★ v131：还要再加两条 —— **「能滑」不等于「能竖着滑」**。
+//
+//   2026-10-23 第三轮实测卡死在「燕云十六声」这一条：日志每步都是
+//       `滑[UIScrollView 纵向 直查 moved=0 (limit=326 step=844)]`
+//   页面一动不动，`onFeed` 却又判「在主 feed」（底部首页 tab 读得到），
+//   于是门禁也不管，白转 8 轮。视图树一查，凶手是 **`KSCubeScrollView`**——
+//   那个**横向**翻页容器（子视图 x=1950），contentSize.h 只比可视高 326，
+//   竖向滑当然 moved=0。
+//
+//   旧判据「竖向 / 页高≥600 / limit>0 / 未隐藏」它**样样合格**，
+//   而且它和 feed 一样高（844 > 761），`h > bestH` 还让它**赢过真 feed**。
+//   真 feed（`KSGRBrowseTableView` / `KSTBrowseTableViewCell`）当时**根本没在这棵树里**
+//   （被 cube 横向页藏到屏外），所以正确答案不是「挑得再准一点」，
+//   而是 **一个都挑不出来时，就用坐标 `scroll(x=195,y=700,dy=761)` 兜底**
+//   —— 项目铁律第 2/3 条：scroll 有效、swipe 失效，`dy=761` 是实测页高。
 static UIScrollView *AIFindFeedSV(UIWindow *w) {
     if (!w) return nil;
     UIScrollView *best = nil; CGFloat bestH = 0;
@@ -2772,7 +2788,11 @@ static UIScrollView *AIFindFeedSV(UIWindow *w) {
             UIScrollView *sv = (UIScrollView *)v;
             CGFloat h = sv.bounds.size.height;
             CGFloat lim = sv.contentSize.height - h;
-            if (!sv.hidden && sv.alpha > 0.05 && h >= 600.0 &&
+            // ① 竖向才行：横向容器的 contentSize.width 远大于 bounds.width
+            CGFloat vLim = sv.contentSize.height - h;
+            CGFloat hLim = sv.contentSize.width - sv.bounds.width;
+            BOOL horizontal = (hLim > vLim * 1.5 && hLim > 8.0);
+            if (!sv.hidden && sv.alpha > 0.05 && h >= 600.0 && !horizontal &&
                 lim > 0 && lim < AI_FEED_LIMIT_MAX && h > bestH) {
                 best = sv; bestH = h;
             }
@@ -2811,10 +2831,19 @@ static NSString *AIAutorunScroll(void) {
             UIScrollView *feed = AIFindFeedSV(AIHostWindow());
             if (feed) {
                 NSDictionary *r0 = AIScrollFeedPage(feed);
-                r = [NSString stringWithFormat:@"%@ 纵向 直查 moved=%@ (limit=%.0f step=%.0f)",
-                     r0[@"sv"] ?: @"?", r0[@"moved"] ?: @"?",
-                     [r0[@"limit"] doubleValue], [r0[@"step"] doubleValue]];
-                return;
+                // ★ v131：**滑了不等于动了**。实测挑中 KSCubeScrollView（横向容器）
+                //   时回执是 `moved=0 (limit=326 step=844)` —— 每一步空滑，
+                //   画面永远停在那一条视频，8 轮白跑。
+                //   所以这里必须验 `moved`：搬不动就直接降级到坐标通道，
+                //   不能把「找到容器」当成「翻页成功」。
+                if ([r0[@"moved"] doubleValue] != 0.0) {
+                    r = [NSString stringWithFormat:@"%@ 纵向 直查 moved=%@ (limit=%.0f step=%.0f)",
+                         r0[@"sv"] ?: @"?", r0[@"moved"] ?: @"?",
+                         [r0[@"limit"] doubleValue], [r0[@"step"] doubleValue]];
+                    return;
+                }
+                AILog(@"[autorun] 直查容器 %@ moved=0（竖着滑不动）→ 降级坐标通道",
+                      r0[@"sv"] ?: @"?");
             }
 
             // 退回通道：还是走 AIScrollAt 的多落点探测（万一连直查都没找到容器）
@@ -2880,6 +2909,20 @@ static NSString *AIAutorunScroll(void) {
             }
             AIScrollAt(CGPointMake(195, 520), 761, 0, YES, 0);
             r = @"兜底 dy=761（两轮都没找到 feed 容器）";
+
+            // ★ v131 最后一道保险：**兜底滑完再看一眼 moved**。
+            //   实测卡死那次，两轮探测挑不出合格容器，就是这个兜底在跑，
+            //   但回执只写了「兜底 dy=761」，没人知道它到底动了没有 ——
+            //   结果 8 轮全是原地不动，而我以为在翻页。
+            //   判据取结果侧：moved=0 就如实报「原地没动」，让主循环的
+            //   「作者没换」兜底（连 2 次 → 回家）接得住，而不是一直装正常。
+            //   （探针只读 contentOffset 前后差，不带 dy → 不产生副作用）
+            NSDictionary *bc = AIScrollAt(CGPointMake(195, 520), 0, 0, NO, 0);
+            double bmoved = [bc[@"moved"] doubleValue];
+            if (bc[@"ok"] && bmoved == 0.0) {
+                r = [NSString stringWithFormat:
+                     @"⚠兜底滑了但没动（命中 %@）", bc[@"sv"] ?: @"?"];
+            }
         } @catch (NSException *e) {}
     });
     return r;
