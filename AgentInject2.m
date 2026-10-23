@@ -3018,6 +3018,13 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
                     AILog(@"[autorun] 回家结果：%@", home ? @"✅ 已回主 feed" : @"❌ 没回去");
                     if (home) {
                         offFeedStreak = 0;
+                        // ★ v131：`onFeed` 是**循环开头读屏时算的一次性布尔量**，整轮复用。
+                        //   实测 #82：`回家结果：✅ 已回主 feed` 之后紧接着又是
+                        //   `#82 不在主 feed → 跳过互动` —— 因为只清了 offFeedStreak，
+                        //   没回写 onFeed，下面互动门禁仍按旧值走。
+                        //   行为上偏保守（宁愿少互动，不算事故），但日志自相矛盾会误导复盘。
+                        //   **逃生函数成功后必须回写所有相关状态变量**（见踩坑 55）。
+                        onFeed = YES;
                         prevAuthor = nil; haveFirst = NO;
                         sameStreak = 0; lostStreak = 0;
                     }
