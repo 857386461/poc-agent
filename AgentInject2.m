@@ -113,7 +113,18 @@ static NSString *gBootSrc  = @"?";  // 记录自检是被哪条路径触发的�
 // 之前所有版本都只能靠用户「复制日志再粘贴回来」才能知道网络到底怎么了，
 // 而用户明确说过「我传话传不清楚」。所以 v10 把这些数字直接画在手机屏幕顶端：
 // 一眼就能看到是没网(-1009)、DNS 挂了(-1003)、超时(-1001) 还是 TLS(-1200)。
-static NSString * const kAIVer = @"v137";  // v137（2026-10-24，G144）= 修「养号跑着跑着全变 (无作者)」。三条：① 作者锚点 A 加屏内判据（x-shift∈[-20,420]）+ 长度下限 >4 —— 旧版只判后缀和 `length<=34`，先撞上横滑预加载留在树里的独立 `作者头像` 节点（x=728，长度 4，戳后缀=空串），真作者（x=338）被 `!a` 短路；② `AIAutorunShift` 平票/优势不足 1.5 倍时显式返回 0 —— 旧版「平票=没有主屏」，实测主屏 102 分 vs 预加载 85 分，稍有风吹草动就退化成 shift=0；③ 「换没换视频」加指纹兜底 —— 旧版 `authorStr` 空对空恒等 → changed 恒 NO → 63/98 轮误判「作者没换」→ 连续 2 次强制回主 feed → 反复刷同一批视频，而 errors 一直是 0 外部看不出来。v66 = 新增 autorun / autorunstop / autorunstatus：「下发一次，设备自己跑完整个脚本」。养号循环下沉到设备端独立队列（不占轮询线程、睡眠不占主线程、双路喂狗 + 看门狗豁免），脱离云沙箱的会话切换限制。v65 = 「回退进度条到 v42/v48 原版（用户拍板）」：v63/v64 的「本视频进度 N%」不被接受 → 恢复「共 N 步 · 当前第 M 步」+ idx/total 填充；脚本改为按时间切段推 idx（保留平滑推进动效，不改 UI）。显式 pct 通道保留但不再使用。v64 = v63 + 修「本视频进度」两条实测 bug（① pct 计算被 gTaskTotal>0 挡住 → 恒 0；② 脚本 step=10,total=0 命中 AITaskSet 的「清任务」分支 → 状态变 idle、pct 被撤。修法：pct 独立于 total；脚本改传 idx>=1,total=1，进度交给显式 pct）。v63 = 「罩子进度条改为视频停留时间进度」（2026-10-04 会话，用户需求）：
+static NSString * const kAIVer = @"v145";  // v145（2026-10-24，G145/G146）= 三件事：
+//   ① 面板点「结束」现在真的会置 gAutorunStop。旧版 endTask: 只清了任务显示
+//      （AITaskSet(nil,...)），面板/浮球看着变 idle「待命」，但后台养号队列照跑满
+//      下发时长 —— 用户亲历「我在设备上点结束，又自动开了」（实测停 2 分钟后 count=18）。
+//   ② 广告页识别，浮球显示「广告」而不是「看视频」。广告位的作者区是**裸「作者头像」
+//      节点**（无名字前缀），被 v137 的 length>4 滤掉 → authorStr 空 → 回落「看视频」，
+//      会让人以为在刷普通视频。判据只留「屏内裸作者头像」一条：AD 角标 / KSAd 类名 /
+//      NoNetworkView 三种**普通视频页也都有**（实测 n=1 对比，全废）。
+//   ③ 异常提示条改为按文字定位。旧版写死 AIAutorunTap(312,23)，probe 实测
+//      「命中 UIScrollView，父链 12 层内无 UIControl」—— 那一点从来就是空的；
+//      真身「点击重试」在 (139,384) 112x40。
+// 历史：v137（2026-10-24，G144）= 修「养号跑着跑着全变 (无作者)」。三条：① 作者锚点 A 加屏内判据（x-shift∈[-20,420]）+ 长度下限 >4 —— 旧版只判后缀和 `length<=34`，先撞上横滑预加载留在树里的独立 `作者头像` 节点（x=728，长度 4，戳后缀=空串），真作者（x=338）被 `!a` 短路；② `AIAutorunShift` 平票/优势不足 1.5 倍时显式返回 0 —— 旧版「平票=没有主屏」，实测主屏 102 分 vs 预加载 85 分，稍有风吹草动就退化成 shift=0；③ 「换没换视频」加指纹兜底 —— 旧版 `authorStr` 空对空恒等 → changed 恒 NO → 63/98 轮误判「作者没换」→ 连续 2 次强制回主 feed → 反复刷同一批视频，而 errors 一直是 0 外部看不出来。v66 = 新增 autorun / autorunstop / autorunstatus：「下发一次，设备自己跑完整个脚本」。养号循环下沉到设备端独立队列（不占轮询线程、睡眠不占主线程、双路喂狗 + 看门狗豁免），脱离云沙箱的会话切换限制。v65 = 「回退进度条到 v42/v48 原版（用户拍板）」：v63/v64 的「本视频进度 N%」不被接受 → 恢复「共 N 步 · 当前第 M 步」+ idx/total 填充；脚本改为按时间切段推 idx（保留平滑推进动效，不改 UI）。显式 pct 通道保留但不再使用。v64 = v63 + 修「本视频进度」两条实测 bug（① pct 计算被 gTaskTotal>0 挡住 → 恒 0；② 脚本 step=10,total=0 命中 AITaskSet 的「清任务」分支 → 状态变 idle、pct 被撤。修法：pct 独立于 total；脚本改传 idx>=1,total=1，进度交给显式 pct）。v63 = 「罩子进度条改为视频停留时间进度」（2026-10-04 会话，用户需求）：
    //       ① `task` op 新增 `pct`（0~100 显式进度）：脚本每秒发 `task{pct:已看/需看×100}`，
    //          罩子进度条**直接用这个值**填充，不再是「第几步/共几步」。未传 pct 时
    //          回落老的 idx/total 算法 —— **老调用方/老设备行为完全不变**。
@@ -2270,6 +2281,42 @@ static double AIAutorunShift(NSString *text) {
     return (double)bestK;
 }
 
+// ★ G145（2026-10-24）：这一屏是不是**广告**
+//
+//   为什么需要它：广告页的作者区是一个**没有名字前缀的裸「作者头像」节点**，
+//   而普通视频是 `<名字>作者头像`（如 `陈先生•24号辛选超级双十一作者头像`）。
+//   G144 给锚点加了 `length > 4` 之后，广告页正好被滤掉 → `authorStr` 空
+//   → 浮球回落成「看视频」。用户看到「看视频」会以为在刷普通视频，其实在看广告。
+//
+//   ★ 判据只留一条，因为实测只有它两页有区分度（2026-10-24，各 n=1 对比）：
+//
+//     | 判据                      | 广告页 | 普通视频页 |
+//     |---------------------------|--------|-----------|
+//     | AD 角标（屏内 x=12）      | 有     | **也有**  |  ← 废，普通视频里也有
+//     | AD 角标（任意 x）         | 有     | **也有**  |  ← 废
+//     | 类名含 KSAd               | 有     | **也有**  |  ← 废（KSAdRToolBarHitTableView 是通用工具栏）
+//     | 裸「作者头像」节点        | **有** | 无        |  ← ✅ 唯一可用
+//     | 有 `@名字` 行             | 无     | 无        |  ← 两边都没有，无区分度
+//
+//   ⚠ 另外别用 `KSThanosFeedNoNetworkView` 当判据：**两页都有**，普通视频那屏的
+//     挂在 x=390（屏外预加载），广告那屏挂在 x=0。它是模板自带的兜底层，
+//     不代表真加载失败 —— 用户亲眼确认那屏广告「能正常看」。
+static BOOL AIAutorunIsAd(NSString *text, double shift, BOOL gotAuthor) {
+    if (!text.length) return NO;
+    // 已经解析出作者名 → 绝不可能是广告位（广告位没有名字）。这一条先挡住大部分误判。
+    if (gotAuthor) return NO;
+    for (NSString *ln in [text componentsSeparatedByString:@"\n"]) {
+        NSTextCheckingResult *m = [gRxRow firstMatchInString:ln options:0
+                                    range:NSMakeRange(0, ln.length)];
+        if (!m || m.numberOfRanges < 7) continue;
+        double x = [[ln substringWithRange:[m rangeAtIndex:2]] doubleValue] - shift;
+        NSString *c = [ln substringWithRange:[m rangeAtIndex:6]];
+        if (x < -20 || x > 420) continue;                  // 只认屏内
+        if ([c isEqualToString:@"作者头像"]) return YES;   // 裸头像 = 广告位
+    }
+    return NO;
+}
+
 // 解析指纹 + 作者（移植 ks_brush.py）
 static void AIAutorunParse(NSString *text, double shift,
                            NSMutableDictionary *fpOut, NSString **authorOut,
@@ -3137,12 +3184,45 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
             }
 
             // ⑤ 门禁：异常提示条（点击重试 / 刷新重试）
+            //
+            //   ⚠ G146 2026-10-24 实测踩坑：旧版写死 `AIAutorunTap(312, 23)`。
+            //     实测 `probe(312,23) -> 命中:UIScrollView，父链 12 层内无 UIControl`
+            //     —— **这一点本来就是空的**，点了等于没点。
+            //     而真正的「点击重试」在 `(139,384) 112x40`（屏中央）。
+            //     之所以一直没被发现：#10/#13 那条视频本身还有指纹，循环照样往下走，
+            //     只有作者名是空的 → 被 G144 的「无作者」表象盖住了。
+            //
+            //   修法：**按文字找中心点**，找不到就不点（别瞎点，feed 里乱点会开面板）。
             BOOL hasRetry = NO;
             for (NSString *l in vis)
                 if ([l containsString:@"点击重试"] || [l containsString:@"刷新重试"]) { hasRetry = YES; break; }
             if (hasRetry) {
-                AILog(@"[autorun] 异常提示条 → 点重试 (312,23)");
-                AIAutorunTap(312, 23);
+                CGPoint rp = CGPointMake(-1, -1);
+                // 优先「点击重试」（是按钮），其次「刷新重试」（可能是标题）
+                NSArray *want = @[@"点击重试", @"刷新重试"];
+                for (NSString *w in want) {
+                    if (rp.x >= 0) break;
+                    for (NSString *ln in [text componentsSeparatedByString:@"\n"]) {
+                        NSTextCheckingResult *m = [gRxRow firstMatchInString:ln options:0
+                                                       range:NSMakeRange(0, ln.length)];
+                        if (!m || m.numberOfRanges < 7) continue;
+                        double x = [[ln substringWithRange:[m rangeAtIndex:2]] doubleValue] - shift;
+                        double y = [[ln substringWithRange:[m rangeAtIndex:3]] doubleValue];
+                        double w2 = [[ln substringWithRange:[m rangeAtIndex:4]] doubleValue];
+                        double h2 = [[ln substringWithRange:[m rangeAtIndex:5]] doubleValue];
+                        NSString *c = [ln substringWithRange:[m rangeAtIndex:6]];
+                        if (![c isEqualToString:w]) continue;      // 精确匹配，别命中长句
+                        if (x < -20 || x > 420) continue;           // 屏内
+                        rp = CGPointMake(x + w2 / 2.0, y + h2 / 2.0);
+                        break;
+                    }
+                }
+                if (rp.x >= 0) {
+                    AILog(@"[autorun] 异常提示条 → 点「重试」(%.0f,%.0f)", rp.x, rp.y);
+                    AIAutorunTap(rp.x, rp.y);
+                } else {
+                    AILog(@"[autorun] ⚠ 异常提示条在屏上但没定位到重试按钮，不瞎点");
+                }
                 [NSThread sleepForTimeInterval:1.2];
             }
 
@@ -3212,9 +3292,16 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
             gAutorunBrief = [NSString stringWithFormat:@"看 %lds%@", (long)dur,
                              fp.count ? [NSString stringWithFormat:@" 赞%@", fp[@"点赞"] ?: @"-"] : @""];
 
+            // ★ G145：这一屏是不是广告？（用户要求：广告就明说「广告」，别回落成「看视频」）
+            BOOL isAd = AIAutorunIsAd(text, shift, authorStr.length > 0);
+
             // 悬浮球：显示进度（复用现有 AITaskSet）
+            //   文案优先级：作者名 > 广告 > 看视频
+            //   为什么「看视频」要留在最后：它是**兜底**，看见它就说明这一屏既没作者名
+            //   也不是广告 —— 那才是真异常，值得排查。
+            NSString *floatTag = authorStr.length ? authorStr : (isAd ? @"广告" : @"看视频");
             AITaskSet(@"养号模式", (int)(idx % 1000), 1000, @"exec", -1,
-                      [NSString stringWithFormat:@"#%ld %@", idx, authorStr.length ? authorStr : @"看视频"]);
+                      [NSString stringWithFormat:@"#%ld %@", idx, floatTag]);
 
             // ⑧ 分段睡眠 + 喂狗（每 200ms 一次，绝不占主线程）
             {
@@ -3268,7 +3355,7 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
 
             AILog(@"[autorun] #%ld %.0fs %@ | %@ | %@ | 滑[%@]%@", idx, dur,
                   acts.count ? [acts componentsJoinedByString:@","] : @"划走",
-                  authorStr.length ? authorStr : @"(无作者)",
+                  authorStr.length ? authorStr : (isAd ? @"[广告]" : @"(无作者)"),
                   fp.count ? [NSString stringWithFormat:@"赞%@评%@", fp[@"点赞"] ?: @"-", fp[@"评论"] ?: @"-"] : @"(无指纹)",
                   scr, changed ? @"" : @" ⚠作者没换");
 
@@ -7971,7 +8058,24 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
 - (void)endTask:(id)sender {
     AITaskSet(nil, 0, 0, @"idle", -1, nil);
     gGuardPinned = NO;
-    AIToast(@"任务已结束");
+    //
+    //   ⚠ G145 2026-10-24 实测踩坑（用户亲历）：
+    //     「我在设备上点结束，又自动开了」。
+    //     旧版这里只清了**任务显示**（AITaskSet nil），**根本没置 gAutorunStop**。
+    //     于是面板/浮球看着停了（idle / 待命），后台养号队列照跑不误，
+    //     一直跑满下发时的 minutes（实测停了 2 分钟后又报 count=18）。
+    //     用户从界面上完全看不出「其实还在刷」，这是最坏的一种假性停止。
+    //
+    //   修法：结束必须同时置停止标志，并如实告知「后台还在退出中」。
+    //     循环在下一个检查点（最多一个观看时长）响应，不会立刻停，
+    //     所以文案不能说「已结束」骗人。
+    if (gAutorunActive) {
+        gAutorunStop = 1;
+        AILog(@"  [ui] 用户点「结束」→ 置 gAutorunStop，等循环在检查点退出");
+        AIToast(@"养号已请求停止（后台收尾中）");
+    } else {
+        AIToast(@"任务已结束");
+    }
 }
 // v42：复制步骤全文（规划 §2 L3 控件）。给人拿去贴给 AI 或留痕。
 - (void)copySteps:(id)sender {
