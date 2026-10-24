@@ -2247,15 +2247,27 @@ static double AIAutorunShift(NSString *text) {
         cnt[k] = @([cnt[k] intValue] + wgt);
     }
     if (!cnt.count) return 0.0;
-    // 取最高分；若为 0 则返回 0
+    // 取最高分。
+    //
+    //   ⚠ G144 2026-10-24：旧版是
+    //         if (bestK != 0 && bestN > zeroN) return bestK;
+    //     也就是**主屏得分和并列就算"没有主屏"** → 返回 0。
+    //     实测这太脆：当前 feed 桶得分 `{0:102, 390:85, -390:55, 780:2}`，
+    //     主屏 102 只比横滑预加载的 85 高 17 分。横滑多挂几个 cell 就追平了，
+    //     追平即退化成 shift=0 → 所有屏内判据（作者/指纹/vis）全歪。
+    //
+    //   修法：① 平票时**显式**选择 0（主屏就是 0 桶，平票等价于主屏仍占优）
+    //         ② 加 1.5 倍优势门限：非 0 桶必须**明显**赢才认，稍有风吹草动就信 0
     int bestK = 0, bestN = -1, zeroN = 0;
     for (NSNumber *k in cnt) {
         int n = [cnt[k] intValue];
         if ([k intValue] == 0) zeroN = n;
         if (n > bestN) { bestN = n; bestK = [k intValue]; }
     }
-    if (bestK != 0 && bestN > zeroN) return (double)bestK;
-    return 0.0;
+    if (bestK == 0) return 0.0;                       // 主屏本来就是最高，直接用 0
+    if (bestN <= zeroN) return 0.0;                   // 平票 / 输了 → 认主屏
+    if ((double)bestN < (double)zeroN * 1.5) return 0.0;  // 赢得不够明显 → 也认主屏
+    return (double)bestK;
 }
 
 // 解析指纹 + 作者（移植 ks_brush.py）
@@ -2284,9 +2296,22 @@ static void AIAutorunParse(NSString *text, double shift,
             }
         }
         // 作者锚点 A：`<名字>作者头像`（后缀即判据）
-        if (!a && [c hasSuffix:@"作者头像"] && c.length <= 34) {
-            a = [[c substringToIndex:c.length - 4]
+        //
+        //   ⚠ G144 2026-10-24 实测踩坑（用户截图「怎么又不显示作者名了」）：
+        //     旧版只判 `hasSuffix` + `length <= 34`，**不判 x 是否在屏内**。
+        //     而横滑预加载会把上一屏的 avatar 留在树里，且它是一条**独立节点**：
+        //         (23) 728,346 44x44 | 作者头像            ← 长度 4，戳掉后缀 = 空串
+        //         (20) 338,346 44x44 | 陈先生•...作者头像  ← 真作者，x=338
+        //     遍历按树序，x=728 那条**先到** → 提取出 `@""` → `!a` 短路，
+        //     真作者再也拿不到。日志表现：#47 起连续 55 条 `(无作者)`。
+        //
+        //   修法：① 加屏内判据（与 vis 同一套 `[-20,420]`）
+        //         ② 加长度下限 > 4 —— 独立 `作者头像` 节点截完就是空，别让它占位
+        if (!a && [c hasSuffix:@"作者头像"] && c.length <= 34 && c.length > 4
+            && x >= -20 && x <= 420) {
+            NSString *name = [[c substringToIndex:c.length - 4]
                  stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            if (name.length) a = name;   // 截完还空就继续找，不 break
             continue;
         }
         // 作者锚点 B：`@` 右侧（y≈346 附近、x<=20）
@@ -2969,6 +2994,7 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
     long idx = 0;
     int lostStreak = 0;
     NSString *prevAuthor = nil;
+    NSString *prevFpSig  = nil;   // ★ G144：作者名解析不出时，用指纹串兜底判「换没换」
     BOOL haveFirst = NO;          // v67：第一轮还没「上一个作者」可比，不能算「没换」
     int  sameStreak = 0;          // v124：连续「作者没换」次数（卡死兜底用）
     int  liveStreak = 0;          // v127：连续「掉进直播间」轮数（退不出去就停）
@@ -3031,7 +3057,7 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
                     //   和主 feed 之间还隔着剧集沉浸页、广告落地页一整片全屏页。
                     //   到底在不在家，交给下面 ③c 的 AIAutorunOnFeed 说了算。
                     AILog(@"[autorun] 直播间已退出；是否真在主 feed 由下一道门禁确认");
-                    prevAuthor = nil; haveFirst = NO;
+                    prevAuthor = nil; prevFpSig = nil; haveFirst = NO;
                     sameStreak = 0; lostStreak = 0; liveStreak = 0;
                 } else if (liveStreak >= 2) {
                     // 连两轮都退不出去 → 继续待着只会空转甚至乱点，**停掉**更安全
@@ -3072,7 +3098,7 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
                         //   行为上偏保守（宁愿少互动，不算事故），但日志自相矛盾会误导复盘。
                         //   **逃生函数成功后必须回写所有相关状态变量**（见踩坑 55）。
                         onFeed = YES;
-                        prevAuthor = nil; haveFirst = NO;
+                        prevAuthor = nil; prevFpSig = nil; haveFirst = NO;
                         sameStreak = 0; lostStreak = 0;
                     }
                     // 回不去也别卡死：继续走一轮（滑一下当探索），下轮还会再试
@@ -3148,9 +3174,32 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
             lostStreak = 0;
 
             NSString *authorStr = author ?: @"";
-            BOOL changed = (!haveFirst) || (prevAuthor && ![prevAuthor isEqualToString:authorStr]);
+            //
+            //   ⚠ G144 2026-10-24：旧版判据是
+            //         changed = (!haveFirst) || (prevAuthor && prevAuthor != authorStr)
+            //     作者名一空，就是**空对空判等** → changed 恒 NO → 每轮都打
+            //     `⚠作者没换` → `连 2 次强制回主 feed` → 反复刷同一批视频。
+            //     实测 63/98 轮触发，而 `errors` 一直是 0，外部完全看不出来。
+            //
+            //   修法：作者名不可用时，退到**指纹串**（点赞/评论/收藏/分享的数字）比。
+            //   指纹是本条视频自己的计数，换视频必变，而且 `fp` 本来就算好了。
+            //   两者都空才判「没换」—— 那种情况确实是读屏异常。
+            NSString *fpSig = [NSString stringWithFormat:@"%@|%@|%@|%@",
+                     fp[@"点赞"] ?: @"", fp[@"评论"] ?: @"",
+                     fp[@"收藏"] ?: @"", fp[@"分享"] ?: @""];
+            BOOL changed;
+            if (!haveFirst) {
+                changed = YES;                                  // 第一轮，不判
+            } else if (authorStr.length && prevAuthor.length) {
+                changed = ![prevAuthor isEqualToString:authorStr];   // 双方都有名字，比名字
+            } else if (fpSig.length && ![fpSig isEqualToString:@"|||"]) {
+                changed = ![prevFpSig isEqualToString:fpSig];        // ★ 兜底比指纹
+            } else {
+                changed = NO;                                   // 两条线索都空 → 才认"没换"
+            }
             haveFirst = YES;
             prevAuthor = authorStr;
+            prevFpSig  = fpSig;
 
             // ⑦ 随机观看时长（与 ks_brush.py 同分布）
             double r = ((double)arc4random() / 4294967295.0);
@@ -3247,6 +3296,7 @@ static void AIAutorunYanghao(double minutes, uint32_t seed) {
                     }
                     sameStreak = 0;
                     prevAuthor = nil;            // 回家后重新比，别把旧作者带过来
+                    prevFpSig  = nil;            // ★ G144：签名也要清，否则拿旧签比新页
                 }
             } else {
                 sameStreak = 0;
